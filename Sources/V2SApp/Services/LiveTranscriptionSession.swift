@@ -50,6 +50,9 @@ final class LiveTranscriptionSession: NSObject {
     private var speechRecognizer: SFSpeechRecognizer?
     private var recognitionRequest: SFSpeechAudioBufferRecognitionRequest?
     private var recognitionTask: SFSpeechRecognitionTask?
+    /// Incremented on every restart. Handlers capture their generation at creation time
+    /// and discard callbacks that arrive after a newer generation has started.
+    private var recognitionGeneration: Int = 0
     private var audioConverter: AVAudioConverter?
     private var audioConverterInputSignature: AudioFormatSignature?
     private var committedSegmentCount = 0
@@ -58,15 +61,38 @@ final class LiveTranscriptionSession: NSObject {
     private var applicationAudioCapture: ApplicationAudioCapture?
 
     private var transcriptHandler: (@MainActor (RecognizedSentence) -> Void)?
+    private var partialHandler: (@MainActor (DraftSegment?) -> Void)?
     private var errorHandler: (@MainActor (String) -> Void)?
+
+    // MARK: Draft state (accessed only on captureQueue)
+    private var modeConfig: ModeConfig = .balanced
+    private var currentDraftId = UUID()
+    private var lastDraftText = ""
+    private var lastDraftTextChangeTime = Date.distantPast
+    private var draftChangeHistory: [(text: String, time: Date)] = []
+    private var draftPrefixCandidate = ""
+    private var draftPrefixCandidateTime = Date.distantPast
+    private var confirmedStablePrefixLength = 0
+
+    // MARK: Silence-commit timer (captureQueue)
+    // Fires when the ASR stops delivering new results — i.e. the user has paused.
+    // This is more reliable than measuring inter-word gaps because the last word in
+    // a sentence has no "next segment" and therefore never triggers a pause boundary.
+    private var silenceCommitTimer: DispatchSourceTimer?
+    private var latestSegments: [SFTranscriptionSegment] = []
+    private var latestFormattedText: NSString = ""
 
     func start(
         source: InputSource,
         localeIdentifier: String,
+        modeConfig: ModeConfig = .balanced,
         transcriptHandler: @escaping @MainActor (RecognizedSentence) -> Void,
+        partialHandler: @escaping @MainActor (DraftSegment?) -> Void,
         errorHandler: @escaping @MainActor (String) -> Void
     ) async throws {
         self.transcriptHandler = transcriptHandler
+        self.partialHandler = partialHandler
+        self.modeConfig = modeConfig
         self.errorHandler = errorHandler
 
         try await requestRequiredPermissions(for: source)
@@ -81,6 +107,8 @@ final class LiveTranscriptionSession: NSObject {
     }
 
     func stop() {
+        cancelSilenceTimer()
+
         microphoneCaptureSession?.stopRunning()
         microphoneCaptureSession = nil
 
@@ -95,6 +123,11 @@ final class LiveTranscriptionSession: NSObject {
         audioConverter = nil
         audioConverterInputSignature = nil
         committedSegmentCount = 0
+
+        latestSegments = []
+        latestFormattedText = ""
+        partialHandler = nil
+        resetDraftState()
     }
 
     private func requestRequiredPermissions(for source: InputSource) async throws {
@@ -150,22 +183,7 @@ final class LiveTranscriptionSession: NSObject {
         request.shouldReportPartialResults = true
         request.taskHint = .dictation
 
-        let task = recognizer.recognitionTask(with: request) { [weak self] result, error in
-            if let error {
-                Task {
-                    await self?.emitError("Speech recognition failed: \(error.localizedDescription)")
-                }
-                return
-            }
-
-            guard let result else {
-                return
-            }
-
-            self?.captureQueue.async { [weak self] in
-                self?.processRecognitionResult(result)
-            }
-        }
+        let task = recognizer.recognitionTask(with: request, resultHandler: makeRecognitionHandler())
 
         speechRecognizer = recognizer
         recognitionRequest = request
@@ -173,6 +191,10 @@ final class LiveTranscriptionSession: NSObject {
         audioConverter = nil
         audioConverterInputSignature = nil
         committedSegmentCount = 0
+        latestSegments = []
+        latestFormattedText = ""
+        cancelSilenceTimer()
+        resetDraftState()
     }
 
     private func startMicrophoneCapture(deviceUniqueID: String) throws {
@@ -297,7 +319,37 @@ final class LiveTranscriptionSession: NSObject {
             return
         }
 
-        recognitionRequest?.appendAudioSampleBuffer(sampleBuffer)
+        // Convert to PCMBuffer so gain processing can be applied (same path as app audio).
+        // Fall back to direct append if conversion fails.
+        if let pcmBuffer = pcmBuffer(from: sampleBuffer) {
+            append(audioBuffer: pcmBuffer)
+        } else {
+            recognitionRequest?.appendAudioSampleBuffer(sampleBuffer)
+        }
+    }
+
+    /// Converts a CMSampleBuffer from AVCaptureSession into an AVAudioPCMBuffer so it can
+    /// share the format-conversion and gain-boost pipeline in append(audioBuffer:).
+    private func pcmBuffer(from sampleBuffer: CMSampleBuffer) -> AVAudioPCMBuffer? {
+        guard let formatDesc = CMSampleBufferGetFormatDescription(sampleBuffer),
+              let asbd = CMAudioFormatDescriptionGetStreamBasicDescription(formatDesc) else {
+            return nil
+        }
+
+        var mutableASBD = asbd.pointee
+        guard let format = AVAudioFormat(streamDescription: &mutableASBD) else { return nil }
+
+        let frameCount = CMSampleBufferGetNumSamples(sampleBuffer)
+        guard frameCount > 0,
+              let pcm = AVAudioPCMBuffer(pcmFormat: format, frameCapacity: AVAudioFrameCount(frameCount)) else {
+            return nil
+        }
+
+        pcm.frameLength = AVAudioFrameCount(frameCount)
+        let status = CMSampleBufferCopyPCMDataIntoAudioBufferList(
+            sampleBuffer, at: 0, frameCount: Int32(frameCount), into: pcm.mutableAudioBufferList
+        )
+        return status == noErr ? pcm : nil
     }
 
     private func append(audioBuffer: AVAudioPCMBuffer) {
@@ -362,6 +414,9 @@ final class LiveTranscriptionSession: NSObject {
         switch status {
         case .haveData, .inputRanDry, .endOfStream:
             if convertedBuffer.frameLength > 0 {
+                // Boost quiet audio before the recognizer's VAD sees it.
+                // convertedBuffer is always Float32 (nativeFormat) and owned by us.
+                boostIfQuiet(buffer: convertedBuffer)
                 recognitionRequest.append(convertedBuffer)
             }
         case .error:
@@ -373,9 +428,52 @@ final class LiveTranscriptionSession: NSObject {
         }
     }
 
+    // MARK: - Audio gain boost
+
+    /// Amplifies a Float32 PCM buffer when the signal is too quiet for the ASR's VAD to
+    /// detect reliably. Only applies when the peak is in the "quiet speech" range
+    /// (0.002–0.30); leaves silence and normal-to-loud audio untouched.
+    ///
+    /// - Quiet speech range: peak 0.002 – 0.30 → boost toward target peak 0.35 (up to 4×)
+    /// - Silence (< 0.002): no boost (would just amplify noise floor)
+    /// - Normal/loud (≥ 0.30): no boost (already loud enough; avoid clipping)
+    private func boostIfQuiet(buffer: AVAudioPCMBuffer) {
+        guard let channelData = buffer.floatChannelData else { return }
+        let frameCount = Int(buffer.frameLength)
+        let channelCount = Int(buffer.format.channelCount)
+        guard frameCount > 0, channelCount > 0 else { return }
+
+        var peak: Float = 0
+        for ch in 0..<channelCount {
+            let ptr = channelData[ch]
+            for i in 0..<frameCount {
+                let abs = ptr[i] < 0 ? -ptr[i] : ptr[i]
+                if abs > peak { peak = abs }
+            }
+        }
+
+        let targetPeak: Float = 0.35
+        guard peak > 0.002, peak < targetPeak else { return }
+
+        let gain = min(targetPeak / peak, 4.0)
+        for ch in 0..<channelCount {
+            let ptr = channelData[ch]
+            for i in 0..<frameCount {
+                var v = ptr[i] * gain
+                if v > 1.0 { v = 1.0 } else if v < -1.0 { v = -1.0 }
+                ptr[i] = v
+            }
+        }
+    }
+
     @MainActor
     private func emitRecognizedSentence(_ sentence: RecognizedSentence) {
         transcriptHandler?(sentence)
+    }
+
+    @MainActor
+    private func emitPartialDraft(_ draft: DraftSegment?) {
+        partialHandler?(draft)
     }
 
     @MainActor
@@ -394,16 +492,24 @@ final class LiveTranscriptionSession: NSObject {
     private func processRecognitionResult(_ result: SFSpeechRecognitionResult) {
         let transcription = result.bestTranscription
         let segments = transcription.segments
+        let formattedText = transcription.formattedString as NSString
+
+        // Always save the latest transcript so the silence timer can commit it
+        latestSegments = segments
+        latestFormattedText = formattedText
 
         if committedSegmentCount > segments.count {
             committedSegmentCount = 0
+            resetDraftState()
         }
 
         guard committedSegmentCount < segments.count else {
+            cancelSilenceTimer()
+            // The task has no more pending text. If it just finished, restart it.
+            if result.isFinal { restartRecognitionTask() }
             return
         }
 
-        let formattedText = transcription.formattedString as NSString
         var sentenceStartIndex = committedSegmentCount
 
         for index in committedSegmentCount..<segments.count {
@@ -424,37 +530,349 @@ final class LiveTranscriptionSession: NSObject {
             let sentenceEndTimestamp = segment.timestamp + segment.duration
             let currentSentenceDuration = max(sentenceEndTimestamp - sentenceStartTimestamp, 0)
 
+            // Boundaries that fire mid-loop (require a gap to a *next* word, or explicit cues)
             let punctuationBoundary = segment.substring.containsSentenceTerminator
-            let strongPauseBoundary = (nextPauseDuration ?? 0) >= 0.55
-            let softPauseBoundary = (nextPauseDuration ?? 0) >= 0.28
-                && (currentSegmentCount >= 5 || currentTextLength >= 24 || currentSentenceDuration >= 2.0)
-            let forcedBoundary = currentSegmentCount >= 14
-                || currentTextLength >= 72
-                || currentSentenceDuration >= 5.5
+            // 0.65 s: above typical ASR timestamp-reporting noise and natural within-sentence
+            // clause pauses (200–450 ms), below genuine mid-sentence breath pauses.
+            let strongPauseBoundary = (nextPauseDuration ?? 0) >= 0.65
+            // Char-length limit removed: 40 chars is only ~6 English words and caused
+            // false mid-sentence cuts. Segment count + audio duration are sufficient.
+            let forcedBoundary = currentSegmentCount >= 18
+                || currentSentenceDuration >= modeConfig.maxChunkAudioSec
             let finalBoundary = result.isFinal && index == segments.count - 1
 
-            guard punctuationBoundary
-                || strongPauseBoundary
-                || softPauseBoundary
-                || forcedBoundary
-                || finalBoundary else {
+            guard punctuationBoundary || strongPauseBoundary || forcedBoundary || finalBoundary else {
                 continue
             }
 
-            let sentenceText = formattedText.substring(with: currentRange)
+            // When a purely forced cut lands close to the end of available segments,
+            // absorb the tiny tail rather than leaving a 1–2 word orphan that would
+            // be emitted as a meaningless standalone sentence by the silence timer.
+            var commitEndIndex = index
+            if forcedBoundary && !punctuationBoundary && !strongPauseBoundary && !finalBoundary {
+                let tailCount = (segments.count - 1) - index
+                if tailCount > 0 && tailCount <= 2 {
+                    commitEndIndex = segments.count - 1
+                }
+            }
+
+            let commitRange = commitEndIndex == index
+                ? currentRange
+                : combinedRange(for: segments, from: sentenceStartIndex, to: commitEndIndex)
+
+            let sentenceText = formattedText.substring(with: commitRange)
                 .replacingOccurrences(of: "\n", with: " ")
                 .trimmingCharacters(in: .whitespacesAndNewlines)
 
             if sentenceText.isEmpty == false {
                 let recognizedSentence = RecognizedSentence(text: sentenceText)
-                Task {
-                    await emitRecognizedSentence(recognizedSentence)
-                }
+                Task { await emitRecognizedSentence(recognizedSentence) }
             }
 
-            sentenceStartIndex = index + 1
+            sentenceStartIndex = commitEndIndex + 1
             committedSegmentCount = sentenceStartIndex
+            resetDraftState()
+
+            // If we consumed all remaining segments (tail absorption or final boundary),
+            // stop iterating to avoid referencing segments beyond the committed range.
+            if commitEndIndex >= segments.count - 1 { break }
         }
+
+        // Emit draft update for the uncommitted tail
+        if committedSegmentCount < segments.count {
+            emitDraftUpdate(
+                draftRange: committedSegmentCount..<segments.count,
+                allSegments: segments,
+                formattedText: formattedText
+            )
+            // Schedule a silence-based commit: if no new ASR result arrives within
+            // silenceCommitDeadlineMs, the user has paused → commit whatever we have.
+            scheduleSilenceCommit()
+        } else {
+            cancelSilenceTimer()
+            Task { await emitPartialDraft(nil) }
+        }
+
+        // SFSpeechRecognizer marks isFinal = true when its internal session ends
+        // (after a long pause or utterance limit). Once final, the task delivers no
+        // more callbacks — new audio is silently ignored. Restart immediately so
+        // recognition continues without interruption.
+        if result.isFinal {
+            restartRecognitionTask()
+        }
+    }
+
+    /// Replaces the spent recognition task with a fresh one so recording continues
+    /// indefinitely. Called on captureQueue whenever isFinal is received or on error recovery.
+    private func restartRecognitionTask() {
+        guard let recognizer = speechRecognizer else { return }
+
+        // Cleanly end the old request before discarding it.
+        recognitionRequest?.endAudio()
+        recognitionTask?.cancel()
+        cancelSilenceTimer()
+
+        // Bump generation BEFORE creating the new handler so any late callbacks
+        // dispatched by the cancelled task are silently ignored.
+        recognitionGeneration &+= 1
+
+        let request = SFSpeechAudioBufferRecognitionRequest()
+        request.shouldReportPartialResults = true
+        request.taskHint = .dictation
+
+        let task = recognizer.recognitionTask(with: request, resultHandler: makeRecognitionHandler())
+
+        recognitionRequest = request
+        recognitionTask = task
+        // Reset the converter — new request may have a different nativeAudioFormat.
+        audioConverter = nil
+        audioConverterInputSignature = nil
+        committedSegmentCount = 0
+        latestSegments = []
+        latestFormattedText = ""
+        resetDraftState()
+        Task { await emitPartialDraft(nil) }
+    }
+
+    /// Builds the result/error handler used by every recognition task.
+    ///
+    /// On transient errors (no speech detected, internal failure, etc.) the handler
+    /// automatically restarts recognition so the pipeline never goes silent.
+    /// Fatal configuration errors (permission denied, unsupported locale) propagate
+    /// to the UI so the user knows why things stopped.
+    private func makeRecognitionHandler() -> (SFSpeechRecognitionResult?, Error?) -> Void {
+        // Capture the generation at handler-creation time. Any callback arriving
+        // after a restart (which bumps recognitionGeneration) will be discarded,
+        // preventing stale isFinal results from replaying committed sentences.
+        let generation = recognitionGeneration
+        return { [weak self] result, error in
+            if let error {
+                let nsError = error as NSError
+                // kAFAssistantErrorDomain 216/301 = intentional cancellation from our own
+                // restartRecognitionTask / stop calls — ignore silently.
+                let isCancellation = nsError.domain == "kAFAssistantErrorDomain"
+                    && (nsError.code == 216 || nsError.code == 301)
+
+                if isCancellation { return }
+
+                // For any other error, attempt a silent restart so recording continues.
+                // If the recogniser is truly unavailable the restart guard will bail out.
+                self?.captureQueue.async { [weak self] in
+                    guard let self, self.speechRecognizer != nil,
+                          self.recognitionGeneration == generation else { return }
+                    self.restartRecognitionTask()
+                }
+                return
+            }
+
+            guard let result else { return }
+            self?.captureQueue.async { [weak self] in
+                guard let self, self.recognitionGeneration == generation else { return }
+                self.processRecognitionResult(result)
+            }
+        }
+    }
+
+    // MARK: - Silence-commit timer
+
+    /// Time after the last ASR callback before we force-commit pending text.
+    ///
+    /// 420 ms was too short: SFSpeechRecognizer can take 400–600 ms between consecutive
+    /// partial-result callbacks for the same utterance on a loaded device, causing the
+    /// timer to fire between two ASR deliveries for the same sentence.
+    ///
+    /// 700 ms sits safely above:
+    ///   • inter-result ASR delivery gaps (typically 100–500 ms during speech)
+    ///   • natural within-sentence pauses in Mandarin/Japanese (200–450 ms)
+    /// and below clear sentence-ending silences (≥ 600 ms for most speakers).
+    ///
+    /// Follow ≈ 700 ms · Balanced ≈ 750 ms · Reading ≈ 800 ms.
+    private var silenceCommitDeadlineMs: Int {
+        max(700, modeConfig.minSilenceCommitMs + 500)
+    }
+
+    private func scheduleSilenceCommit() {
+        silenceCommitTimer?.cancel()
+        let timer = DispatchSource.makeTimerSource(queue: captureQueue)
+        timer.schedule(deadline: .now() + .milliseconds(silenceCommitDeadlineMs))
+        timer.setEventHandler { [weak self] in
+            self?.forceCommitOnSilence()
+        }
+        timer.resume()
+        silenceCommitTimer = timer
+    }
+
+    private func cancelSilenceTimer() {
+        silenceCommitTimer?.cancel()
+        silenceCommitTimer = nil
+    }
+
+    /// Called by the silence timer when no new ASR result has arrived for
+    /// silenceCommitDeadlineMs — meaning the user has paused.
+    private func forceCommitOnSilence() {
+        silenceCommitTimer = nil
+        let segments = latestSegments
+        let formattedText = latestFormattedText
+
+        guard committedSegmentCount < segments.count else { return }
+
+        let lastIdx = segments.count - 1
+        let currentRange = combinedRange(for: segments, from: committedSegmentCount, to: lastIdx)
+        let sentenceText = (formattedText.substring(with: currentRange) as String)
+            .replacingOccurrences(of: "\n", with: " ")
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+
+        if sentenceText.isEmpty == false {
+            let sentence = RecognizedSentence(text: sentenceText)
+            Task { await emitRecognizedSentence(sentence) }
+        }
+
+        committedSegmentCount = segments.count
+        resetDraftState()
+        Task { await emitPartialDraft(nil) }
+    }
+
+    // MARK: - Draft helpers (called on captureQueue)
+
+    private func resetDraftState() {
+        currentDraftId = UUID()
+        lastDraftText = ""
+        lastDraftTextChangeTime = Date.distantPast
+        draftChangeHistory = []
+        draftPrefixCandidate = ""
+        draftPrefixCandidateTime = Date.distantPast
+        confirmedStablePrefixLength = 0
+    }
+
+    private func emitDraftUpdate(
+        draftRange: Range<Int>,
+        allSegments: [SFTranscriptionSegment],
+        formattedText: NSString
+    ) {
+        let now = Date()
+        let lastIdx = draftRange.upperBound - 1
+        let draftNSRange = combinedRange(for: allSegments, from: draftRange.lowerBound, to: lastIdx)
+        let text = (formattedText.substring(with: draftNSRange) as String)
+            .replacingOccurrences(of: "\n", with: " ")
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+
+        guard !text.isEmpty else {
+            Task { await emitPartialDraft(nil) }
+            return
+        }
+
+        // Track text changes for stability scoring
+        if text != lastDraftText {
+            lastDraftText = text
+            lastDraftTextChangeTime = now
+            draftChangeHistory.append((text: text, time: now))
+        }
+        draftChangeHistory.removeAll { now.timeIntervalSince($0.time) > 0.4 }
+
+        let silenceMs = Int(now.timeIntervalSince(lastDraftTextChangeTime) * 1000)
+
+        // Stability score: fewer changes in 400 ms → higher score
+        let recentChanges = draftChangeHistory.count
+        let stabilityScore: Float
+        switch recentChanges {
+        case 0, 1: stabilityScore = 1.0
+        case 2:    stabilityScore = 0.7
+        default:   stabilityScore = max(0.1, 0.5 - Float(recentChanges - 2) * 0.15)
+        }
+
+        // Boundary score: sentence-terminating punctuation scores highest
+        let lastSeg = allSegments[lastIdx]
+        let boundaryScore: Float = lastSeg.substring.containsSentenceTerminator ? 0.9 : 0.45
+
+        // Length fit score
+        let charCount = text.count
+        let isCJK = text.containsCJKCharacters
+        let lengthFitScore: Float
+        if isCJK {
+            switch charCount {
+            case 12...20: lengthFitScore = 1.0
+            case 5..<12:  lengthFitScore = Float(charCount) / 12.0 * 0.6
+            case 21...30: lengthFitScore = 0.7
+            default:      lengthFitScore = 0.3
+            }
+        } else {
+            switch charCount {
+            case 28...56: lengthFitScore = 1.0
+            case 10..<28: lengthFitScore = Float(charCount) / 28.0 * 0.6
+            case 57...84: lengthFitScore = 0.7
+            default:      lengthFitScore = 0.3
+            }
+        }
+
+        let draftSegs = Array(allSegments[draftRange])
+        let avgConfidence = draftSegs.map(\.confidence).reduce(0, +) / Float(draftSegs.count)
+
+        let chunkScore = ChunkScorer.score(
+            silenceMs: silenceMs,
+            stabilityScore: stabilityScore,
+            boundaryScore: boundaryScore,
+            lengthFitScore: lengthFitScore,
+            confidenceScore: avgConfidence
+        )
+
+        let stablePrefixLen = computeStablePrefixLength(text: text, now: now)
+        let mutableTail = String(text.dropFirst(min(stablePrefixLen, text.count)))
+
+        let words = draftSegs.map { seg in
+            WordToken(
+                text: seg.substring,
+                startMs: Int(seg.timestamp * 1000),
+                endMs: Int((seg.timestamp + seg.duration) * 1000),
+                confidence: seg.confidence,
+                stable: seg.confidence >= 0.80
+            )
+        }
+
+        let draft = DraftSegment(
+            segmentId: currentDraftId,
+            sourceText: text,
+            stablePrefixLength: stablePrefixLen,
+            mutableTailText: mutableTail,
+            avgConfidence: avgConfidence,
+            startMs: Int(draftSegs[0].timestamp * 1000),
+            lastUpdateMs: Int(now.timeIntervalSinceReferenceDate * 1000),
+            silenceMs: silenceMs,
+            stabilityScore: stabilityScore,
+            boundaryScore: boundaryScore,
+            chunkScore: chunkScore,
+            words: words
+        )
+
+        Task { await emitPartialDraft(draft) }
+    }
+
+    /// Returns the character count of the stable (frozen) prefix.
+    /// A prefix is stable once it has been unchanged for >= 400 ms.
+    private func computeStablePrefixLength(text: String, now: Date) -> Int {
+        let mutableLen = mutableTailCharCount(for: text)
+        let candidateLen = max(0, text.count - mutableLen)
+        let candidate = String(text.prefix(candidateLen))
+
+        if candidate == draftPrefixCandidate {
+            if now.timeIntervalSince(draftPrefixCandidateTime) >= 0.4 {
+                confirmedStablePrefixLength = candidateLen
+            }
+        } else if text.hasPrefix(draftPrefixCandidate) {
+            // Text grew but prefix region unchanged — slide candidate forward
+            draftPrefixCandidate = candidate
+        } else {
+            // Prefix regressed — reset
+            draftPrefixCandidate = candidate
+            draftPrefixCandidateTime = now
+            confirmedStablePrefixLength = 0
+        }
+
+        return confirmedStablePrefixLength
+    }
+
+    /// Characters in the mutable tail: last 12 for CJK, last 35 for Latin (≈ 6 words).
+    private func mutableTailCharCount(for text: String) -> Int {
+        text.containsCJKCharacters ? min(12, text.count) : min(35, text.count)
     }
 
     private func combinedRange(for segments: [SFTranscriptionSegment], from startIndex: Int, to endIndex: Int) -> NSRange {
@@ -782,6 +1200,14 @@ private struct ApplicationProcessAssociation {
 private extension String {
     var containsSentenceTerminator: Bool {
         contains(where: { ".!?。！？;；".contains($0) })
+    }
+
+    var containsCJKCharacters: Bool {
+        unicodeScalars.contains {
+            (0x4E00...0x9FFF).contains($0.value)   // CJK Unified Ideographs
+                || (0x3040...0x30FF).contains($0.value) // Hiragana + Katakana
+                || (0xAC00...0xD7AF).contains($0.value) // Korean Hangul
+        }
     }
 }
 

@@ -10,10 +10,11 @@ struct SettingsView: View {
             sourceSection
             languageSection
             overlaySection
+            glossarySection
         }
         .formStyle(.grouped)
         .padding(20)
-        .frame(minWidth: 720, minHeight: 520)
+        .frame(minWidth: 720, minHeight: 560)
     }
 
     private var generalSection: some View {
@@ -67,6 +68,50 @@ struct SettingsView: View {
                 ForEach(LanguageCatalog.common) { option in
                     Text(option.displayName).tag(option.id)
                 }
+            }
+
+            Picker("Subtitle Mode", selection: subtitleModeBinding) {
+                ForEach(SubtitleMode.allCases, id: \.self) { mode in
+                    VStack(alignment: .leading) {
+                        Text(mode.displayName)
+                        Text(mode.detail).font(.caption).foregroundStyle(.secondary)
+                    }
+                    .tag(mode)
+                }
+            }
+        }
+    }
+
+    private var glossarySection: some View {
+        Section("Glossary") {
+            if model.glossary.isEmpty {
+                Text("No terms added. Use + to add source → target term pairs.")
+                    .foregroundStyle(.secondary)
+                    .font(.caption)
+            } else {
+                ForEach(Array(model.glossary.keys.sorted()), id: \.self) { key in
+                    HStack {
+                        Text(key)
+                        Image(systemName: "arrow.right")
+                            .foregroundStyle(.secondary)
+                            .font(.caption)
+                        Text(model.glossary[key] ?? "")
+                            .foregroundStyle(.secondary)
+                        Spacer()
+                        Button {
+                            model.glossary.removeValue(forKey: key)
+                        } label: {
+                            Image(systemName: "minus.circle.fill")
+                                .foregroundStyle(.red)
+                        }
+                        .buttonStyle(.plain)
+                    }
+                }
+            }
+
+            GlossaryAddRow { source, target in
+                guard !source.isEmpty, !target.isEmpty else { return }
+                model.glossary[source] = target
             }
         }
     }
@@ -136,6 +181,13 @@ struct SettingsView: View {
         )
     }
 
+    private var subtitleModeBinding: Binding<SubtitleMode> {
+        Binding(
+            get: { model.subtitleMode },
+            set: { model.subtitleMode = $0 }
+        )
+    }
+
     private var clickThroughBinding: Binding<Bool> {
         overlayBinding(\.clickThrough)
     }
@@ -181,6 +233,41 @@ struct SettingsView: View {
             Spacer()
             Text(value)
                 .foregroundStyle(.secondary)
+        }
+    }
+}
+
+private struct GlossaryAddRow: View {
+    let onAdd: (String, String) -> Void
+    @State private var source = ""
+    @State private var target = ""
+
+    var body: some View {
+        HStack(spacing: 8) {
+            TextField("Source term", text: $source)
+                .textFieldStyle(.roundedBorder)
+                .frame(maxWidth: .infinity)
+
+            Image(systemName: "arrow.right")
+                .foregroundStyle(.secondary)
+                .font(.caption)
+
+            TextField("Target term", text: $target)
+                .textFieldStyle(.roundedBorder)
+                .frame(maxWidth: .infinity)
+
+            Button {
+                onAdd(source.trimmingCharacters(in: .whitespaces),
+                      target.trimmingCharacters(in: .whitespaces))
+                source = ""
+                target = ""
+            } label: {
+                Image(systemName: "plus.circle.fill")
+                    .foregroundStyle(.green)
+            }
+            .buttonStyle(.plain)
+            .disabled(source.trimmingCharacters(in: .whitespaces).isEmpty
+                      || target.trimmingCharacters(in: .whitespaces).isEmpty)
         }
     }
 }

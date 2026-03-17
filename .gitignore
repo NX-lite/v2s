@@ -21,6 +21,8 @@ xcuserdata/
 # Local app artifacts
 *.log
 tmp/
+dist/
+.claude/worktrees/
 
 
 #Ignore cursor AI rules
