@@ -124,6 +124,8 @@ resolve_identity() {
   local label="$3"
   local match_count=0
   local resolved=""
+  local upper_label
+  upper_label="$(printf '%s' "$label" | tr '[:lower:]' '[:upper:]')"
 
   if [[ -n "$current_value" ]]; then
     while IFS= read -r identity; do
@@ -142,13 +144,13 @@ resolve_identity() {
 
   case "$match_count" in
     0)
-      fail "No ${label} identity found in keychain. Install a ${prefix} certificate or set ${label^^}_IDENTITY."
+      fail "No ${label} identity found in keychain. Install a ${prefix} certificate or set ${upper_label}_IDENTITY."
       ;;
     1)
       printf '%s\n' "$resolved"
       ;;
     *)
-      fail "Multiple ${label} identities found. Set ${label^^}_IDENTITY explicitly."
+      fail "Multiple ${label} identities found. Set ${upper_label}_IDENTITY explicitly."
       ;;
   esac
 }
