@@ -21,113 +21,56 @@
 - Keep the original speech and the translated line visible together for fast context switching.
 - Stay in a lightweight menu bar workflow instead of juggling browser tabs or full-screen caption apps.
 
-## Standout Features
+## Features
 
 - Menu bar app built for always-available subtitle access.
 - Live subtitle overlay with translated text on the first line and source text on the second.
 - Audio source selection for microphones and running macOS apps.
-- Apple Speech transcription pipeline for live recognition.
-- Apple Translation pipeline for bilingual subtitle output.
+- On-device speech transcription powered by Apple Speech.
+- On-device translation powered by Apple Translation.
 - Overlay styling controls so the subtitle bar stays readable on top of real work.
 
-## Privacy & Connectivity
+## Privacy
 
-- No v2s account, cloud backend, analytics SDK, or custom telemetry is built into this repository.
-- This codebase does not send captured audio or subtitle text to any v2s-operated server, because there is no v2s server in the product flow.
-- Translation uses Apple's system Translation framework and local language assets on the Mac when available; some language assets may need to be downloaded first.
-- Internet is not required to contact any v2s service.
-- Full offline operation is not guaranteed for every language or device in the current implementation:
-- Apple documents that some Speech framework recognition paths depend on Apple servers unless on-device recognition is explicitly required.
-- The current speech pipeline uses `SFSpeechRecognizer` but does not set `requiresOnDeviceRecognition = true`, so speech recognition may still depend on Apple's service for some locales.
+- No account, cloud backend, analytics, or telemetry.
+- Audio and subtitle text never leave your Mac through v2s.
+- Translation uses Apple's on-device Translation framework. Some language packs may need to be downloaded first through System Settings.
+- Speech recognition uses Apple's on-device Speech framework. Some locales may fall back to Apple's servers unless on-device recognition is explicitly configured.
 
-## What You Can Use Today
+## Getting Started
 
-- Launch v2s as a macOS menu bar app.
-- Pick a microphone or a supported app audio source.
-- Start a live transcription session.
-- See translated subtitles appear in a floating desktop overlay.
-- Adjust overlay appearance from settings.
+1. Download the latest `.app.zip` from [Releases](https://github.com/user/v2s/releases).
+2. Unzip and move `v2s.app` to your Applications folder.
+3. Launch v2s — it appears as an icon in your menu bar.
+4. Select an input source (a running app or microphone).
+5. Choose your input and subtitle languages.
+6. Click **Start**.
 
-## In Progress
+v2s will ask for permissions on first use:
 
-- Better subtitle segmentation and pacing.
-- Wider app-audio compatibility and diagnostics.
-- Release CI automation and credential setup.
-- Polished onboarding and production install docs.
+- **Speech Recognition** — to transcribe audio into text.
+- **Microphone** — when using a microphone as the input source.
+- **Audio Capture** — when capturing audio from another app.
 
 ## Requirements
 
 - macOS 15 or newer
-- Xcode 17 or newer
-- Speech Recognition permission
-- Audio capture permission when using app audio sources
+- Translation requires macOS 26 or newer
 
-## Run Locally
-
-Open the Xcode project:
+## Building from Source
 
 ```bash
-open /Users/franklioxygen/Projects/v2s/v2s.xcodeproj
+git clone https://github.com/user/v2s.git
+cd v2s
+open v2s.xcodeproj
 ```
 
-Build from the terminal:
+Or from the terminal:
 
 ```bash
-cd /Users/franklioxygen/Projects/v2s
-swift build
-xcodebuild -project v2s.xcodeproj -scheme v2s -configuration Debug -derivedDataPath .build/xcode build
-open .build/xcode/Build/Products/Debug/v2s.app
+xcodebuild -project v2s.xcodeproj -scheme v2s -configuration Debug build
 ```
 
-## Release
+## License
 
-Create a GitHub release with an auto-bumped version and a versioned installer package:
-
-```bash
-cd /Users/franklioxygen/Projects/v2s
-./scripts/release.sh
-```
-
-Optional bumps:
-
-```bash
-./scripts/release.sh patch
-./scripts/release.sh minor
-./scripts/release.sh major
-./scripts/release.sh 1.2.0
-```
-
-The release script:
-
-- requires a clean `main` worktree
-- bumps `MARKETING_VERSION` and `CURRENT_PROJECT_VERSION` in `v2s.xcodeproj/project.pbxproj`
-- builds the Release app
-- signs the app with `Developer ID Application`
-- creates a signed installer package with `Developer ID Installer`
-- notarizes the package with Apple and staples the notarization ticket
-- creates `dist/v2s-<version>.pkg` and `dist/v2s-<version>.sha256`
-- commits the version bump, tags `v<version>`, pushes to GitHub, and creates a GitHub release with both assets attached
-
-Requirements:
-
-- authenticated GitHub CLI: `gh auth login`
-- a buildable project state
-- installed `Developer ID Application` and `Developer ID Installer` certificates in your keychain
-- notarization credentials via one of:
-- `NOTARYTOOL_KEYCHAIN_PROFILE` from `xcrun notarytool store-credentials`
-- `NOTARYTOOL_APPLE_ID`, `NOTARYTOOL_TEAM_ID`, and `NOTARYTOOL_APP_PASSWORD`
-- `NOTARYTOOL_KEY_PATH` and `NOTARYTOOL_KEY_ID`, plus `NOTARYTOOL_ISSUER` when required
-
-Example with a keychain profile:
-
-```bash
-export APP_SIGN_IDENTITY="Developer ID Application: Your Name (TEAMID)"
-export PKG_SIGN_IDENTITY="Developer ID Installer: Your Name (TEAMID)"
-export NOTARYTOOL_KEYCHAIN_PROFILE="AC_NOTARY"
-./scripts/release.sh
-```
-
-## Documents
-
-- [System Design](docs/v2s-system-design.md)
-- [MVP Plan](docs/v2s-mvp-plan.md)
+MIT
