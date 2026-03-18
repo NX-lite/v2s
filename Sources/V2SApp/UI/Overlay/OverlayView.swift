@@ -3,26 +3,38 @@ import SwiftUI
 
 struct OverlayView: View {
     @ObservedObject var model: AppModel
+    @ObservedObject var interactionState: OverlayInteractionState
     @State private var committedOpacity: Double = 1.0
-    @State private var isResizeDragging = false
-    @State private var resizeDragStartScale: Double = 1.0
+    @State private var renderedPassThroughBubble: OverlayPassThroughBubble?
+    @State private var passThroughRevealProgress: Double = 0.0
 
     var body: some View {
+        ZStack {
+            subtitleContent
+                .mask(passThroughMask)
+
+            passThroughBubble
+        }
+        .frame(maxWidth: .infinity, maxHeight: .infinity)
+        .onAppear {
+            syncPassThroughBubble(interactionState.passThroughBubble)
+        }
+        .onChange(of: interactionState.passThroughBubble) { _, bubble in
+            syncPassThroughBubble(bubble)
+        }
+    }
+
+    @ViewBuilder
+    private var subtitleContent: some View {
         Group {
             if let state = model.overlayState {
-                ZStack(alignment: .leading) {
-                    VStack(alignment: .center, spacing: 6) {
-                        previousCaptionLayer(state)
-                        committedLayer(state)
-                        draftLayer(state)
-                    }
-                    .padding(.horizontal, 20)
-                    .padding(.vertical, 12)
-                    .frame(maxWidth: .infinity, maxHeight: .infinity)
-
-                    controlStrip
-                        .padding(.leading, 10)
+                VStack(alignment: .center, spacing: 6) {
+                    previousCaptionLayer(state)
+                    committedLayer(state)
+                    draftLayer(state)
                 }
+                .padding(.horizontal, 20)
+                .padding(.vertical, 12)
                 .frame(maxWidth: .infinity, maxHeight: .infinity)
                 .background(backgroundView)
                 .overlay(
@@ -31,70 +43,8 @@ struct OverlayView: View {
                 )
             }
         }
-        .frame(maxWidth: .infinity, maxHeight: .infinity)
-        .padding(.horizontal, 4)
-        .padding(.vertical, 4)
-    }
-
-    // MARK: - Control strip
-
-    private var controlStrip: some View {
-        VStack(spacing: 6) {
-            // Drag / move handle
-            OverlayMoveHandle()
-                .frame(width: 22, height: 22)
-                .background(Circle().fill(Color.white.opacity(0.12)))
-                .overlay(
-                    Image(systemName: "line.3.horizontal")
-                        .font(.system(size: 9, weight: .medium))
-                        .foregroundColor(.white.opacity(0.65))
-                        .allowsHitTesting(false)
-                )
-
-            // Close / stop session
-            Button { model.stopSession() } label: {
-                ZStack {
-                    Circle().fill(Color.white.opacity(0.12))
-                    Image(systemName: "xmark")
-                        .font(.system(size: 9, weight: .semibold))
-                        .foregroundColor(.white.opacity(0.65))
-                }
-            }
-            .buttonStyle(.plain)
-            .frame(width: 22, height: 22)
-
-            // Resize — drag up/down to scale the overlay
-            ZStack {
-                Circle().fill(Color.white.opacity(0.12))
-                Image(systemName: "arrow.up.and.down")
-                    .font(.system(size: 9, weight: .medium))
-                    .foregroundColor(.white.opacity(0.65))
-            }
-            .frame(width: 22, height: 22)
-            .gesture(
-                DragGesture(minimumDistance: 1)
-                    .onChanged { value in
-                        if !isResizeDragging {
-                            isResizeDragging = true
-                            resizeDragStartScale = model.overlayStyle.overlayScaleFactor
-                        }
-                        let delta = Double(-value.translation.height) / 120.0
-                        let newScale = max(0.5, min(2.5, resizeDragStartScale + delta))
-                        model.updateOverlayStyle { $0.overlayScaleFactor = newScale }
-                    }
-                    .onEnded { _ in isResizeDragging = false }
-            )
-        }
-        .padding(.vertical, 7)
-        .padding(.horizontal, 5)
-        .background(
-            RoundedRectangle(cornerRadius: 9, style: .continuous)
-                .fill(Color.black.opacity(0.28))
-                .overlay(
-                    RoundedRectangle(cornerRadius: 9, style: .continuous)
-                        .strokeBorder(Color.white.opacity(0.08), lineWidth: 0.5)
-                )
-        )
+        .padding(.horizontal, OverlayControlsLayout.outerPadding)
+        .padding(.vertical, OverlayControlsLayout.outerPadding)
     }
 
     // MARK: - Previous caption layer (80% opacity, scrolls up then fades)
@@ -206,19 +156,311 @@ struct OverlayView: View {
         RoundedRectangle(cornerRadius: 16, style: .continuous)
             .fill(Color.black.opacity(model.overlayStyle.backgroundOpacity))
     }
-}
 
-// MARK: - Drag handle (NSViewRepresentable — calls window.performDrag)
-
-private struct OverlayMoveHandle: NSViewRepresentable {
-    func makeNSView(context: Context) -> OverlayMoveHandleView { OverlayMoveHandleView() }
-    func updateNSView(_ nsView: OverlayMoveHandleView, context: Context) {}
-}
-
-final class OverlayMoveHandleView: NSView {
-    override func mouseDown(with event: NSEvent) {
-        window?.performDrag(with: event)
+    @ViewBuilder
+    private var passThroughBubble: some View {
+        if let hint = renderedPassThroughBubble {
+            OverlayPassThroughBubbleView()
+                .frame(width: hint.diameter, height: hint.diameter)
+                .position(x: hint.center.x, y: hint.center.y)
+                .scaleEffect(0.92 + (0.08 * passThroughRevealProgress))
+                .opacity(passThroughRevealProgress)
+                .allowsHitTesting(false)
+        }
     }
+
+    private var passThroughMask: some View {
+        Rectangle()
+            .fill(Color.white)
+            .overlay {
+                if let hint = renderedPassThroughBubble {
+                    Circle()
+                        .fill(
+                            RadialGradient(
+                                stops: [
+                                    .init(color: .black, location: 0.0),
+                                    .init(color: .black, location: 0.38),
+                                    .init(color: .black.opacity(0.68), location: 0.58),
+                                    .init(color: .black.opacity(0.28), location: 0.76),
+                                    .init(color: .clear, location: 1.0)
+                                ],
+                                center: .center,
+                                startRadius: 0,
+                                endRadius: hint.diameter * 0.5
+                            )
+                        )
+                        .frame(width: hint.diameter, height: hint.diameter)
+                        .position(x: hint.center.x, y: hint.center.y)
+                        .scaleEffect(0.92 + (0.08 * passThroughRevealProgress))
+                        .opacity(passThroughRevealProgress)
+                        .blendMode(.destinationOut)
+                }
+            }
+            .compositingGroup()
+    }
+
+    private func syncPassThroughBubble(_ bubble: OverlayPassThroughBubble?) {
+        if let bubble {
+            renderedPassThroughBubble = bubble
+
+            guard passThroughRevealProgress < 1.0 else { return }
+            withAnimation(Self.passThroughTransitionAnimation) {
+                passThroughRevealProgress = 1.0
+            }
+            return
+        }
+
+        guard renderedPassThroughBubble != nil else { return }
+        withAnimation(Self.passThroughTransitionAnimation) {
+            passThroughRevealProgress = 0.0
+        }
+    }
+}
+
+struct OverlayControlsChromeView: View {
+    var body: some View {
+        RoundedRectangle(cornerRadius: 9, style: .continuous)
+            .fill(Color.black.opacity(0.28))
+            .overlay(
+                RoundedRectangle(cornerRadius: 9, style: .continuous)
+                    .strokeBorder(Color.white.opacity(0.08), lineWidth: 0.5)
+            )
+            .frame(width: OverlayControlsLayout.stripSize.width, height: OverlayControlsLayout.stripSize.height)
+    }
+}
+
+struct OverlayMoveButtonView: View {
+    let onMoveDragStart: () -> Void
+    let onMoveDragChanged: (CGSize) -> Void
+    let onMoveDragEnded: () -> Void
+
+    @State private var isMoveDragging = false
+
+    var body: some View {
+        OverlayDragHandle(
+            onDragStart: {
+                isMoveDragging = true
+                onMoveDragStart()
+            },
+            onDragChanged: { translation in
+                onMoveDragChanged(translation)
+            },
+            onDragEnded: {
+                if isMoveDragging {
+                    onMoveDragEnded()
+                }
+                isMoveDragging = false
+            }
+        )
+        .frame(width: OverlayControlsLayout.controlSize, height: OverlayControlsLayout.controlSize)
+        .background(Circle().fill(Color.white.opacity(0.12)))
+        .overlay(
+            Image(systemName: "line.3.horizontal")
+                .font(.system(size: 9, weight: .medium))
+                .foregroundColor(.white.opacity(0.65))
+                .allowsHitTesting(false)
+        )
+    }
+}
+
+struct OverlayCloseButtonView: View {
+    @ObservedObject var model: AppModel
+
+    var body: some View {
+        Button { model.stopSession() } label: {
+            ZStack {
+                Circle().fill(Color.white.opacity(0.12))
+                Image(systemName: "xmark")
+                    .font(.system(size: 9, weight: .semibold))
+                    .foregroundColor(.white.opacity(0.65))
+            }
+        }
+        .buttonStyle(.plain)
+        .frame(width: OverlayControlsLayout.controlSize, height: OverlayControlsLayout.controlSize)
+    }
+}
+
+struct OverlayResizeButtonView: View {
+    let onResizeDragStart: () -> Void
+    let onResizeDragChanged: (CGSize) -> Void
+    let onResizeDragEnded: () -> Void
+
+    var body: some View {
+        OverlayDragHandle(
+            onDragStart: onResizeDragStart,
+            onDragChanged: onResizeDragChanged,
+            onDragEnded: onResizeDragEnded
+        )
+        .frame(width: OverlayControlsLayout.controlSize, height: OverlayControlsLayout.controlSize)
+        .background(Circle().fill(Color.white.opacity(0.12)))
+        .overlay(
+            OverlayResizeGlyph()
+                .frame(width: 10, height: 10)
+                .allowsHitTesting(false)
+        )
+    }
+}
+
+enum OverlayControlsLayout {
+    static let outerPadding: CGFloat = 4
+    static let leadingInset: CGFloat = 10
+    static let controlPaddingX: CGFloat = 5
+    static let controlPaddingY: CGFloat = 7
+    static let controlSize: CGFloat = 22
+    static let controlSpacing: CGFloat = 6
+
+    static var stripSize: CGSize {
+        CGSize(
+            width: controlSize + (controlPaddingX * 2),
+            height: (controlSize * 3) + (controlSpacing * 2) + (controlPaddingY * 2)
+        )
+    }
+}
+
+private struct OverlayDragHandle: NSViewRepresentable {
+    let onDragStart: () -> Void
+    let onDragChanged: (CGSize) -> Void
+    let onDragEnded: () -> Void
+
+    func makeNSView(context: Context) -> OverlayDragHandleView {
+        let view = OverlayDragHandleView()
+        view.onDragStart = onDragStart
+        view.onDragChanged = onDragChanged
+        view.onDragEnded = onDragEnded
+        return view
+    }
+
+    func updateNSView(_ nsView: OverlayDragHandleView, context: Context) {
+        nsView.onDragStart = onDragStart
+        nsView.onDragChanged = onDragChanged
+        nsView.onDragEnded = onDragEnded
+    }
+}
+
+final class OverlayDragHandleView: NSView {
+    var onDragStart: (() -> Void)?
+    var onDragChanged: ((CGSize) -> Void)?
+    var onDragEnded: (() -> Void)?
+
+    private var dragStartPointInScreen: NSPoint?
+
+    override func mouseDown(with event: NSEvent) {
+        guard let startPoint = screenPoint(for: event) else { return }
+        dragStartPointInScreen = startPoint
+        onDragStart?()
+    }
+
+    override func mouseDragged(with event: NSEvent) {
+        guard let dragStartPointInScreen,
+              let currentPoint = screenPoint(for: event) else {
+            return
+        }
+
+        onDragChanged?(
+            CGSize(
+                width: currentPoint.x - dragStartPointInScreen.x,
+                height: currentPoint.y - dragStartPointInScreen.y
+            )
+        )
+    }
+
+    override func mouseUp(with event: NSEvent) {
+        if dragStartPointInScreen != nil {
+            onDragEnded?()
+        }
+        dragStartPointInScreen = nil
+    }
+
     override var mouseDownCanMoveWindow: Bool { false }
+
     override func acceptsFirstMouse(for event: NSEvent?) -> Bool { true }
+
+    private func screenPoint(for event: NSEvent) -> NSPoint? {
+        guard let window else { return nil }
+        return window.convertPoint(toScreen: event.locationInWindow)
+    }
+}
+
+private struct OverlayResizeGlyph: View {
+    var body: some View {
+        Canvas { context, size in
+            let stroke = StrokeStyle(lineWidth: 1.3, lineCap: .round, lineJoin: .round)
+            let color = Color.white.opacity(0.65)
+            let start = CGPoint(x: 2, y: size.height - 2)
+            let end = CGPoint(x: size.width - 2, y: 2)
+
+            var diagonal = Path()
+            diagonal.move(to: start)
+            diagonal.addLine(to: end)
+            context.stroke(diagonal, with: .color(color), style: stroke)
+
+            var startHead = Path()
+            startHead.move(to: start)
+            startHead.addLine(to: CGPoint(x: start.x + 2.6, y: start.y))
+            startHead.move(to: start)
+            startHead.addLine(to: CGPoint(x: start.x, y: start.y - 2.6))
+            context.stroke(startHead, with: .color(color), style: stroke)
+
+            var endHead = Path()
+            endHead.move(to: end)
+            endHead.addLine(to: CGPoint(x: end.x - 2.6, y: end.y))
+            endHead.move(to: end)
+            endHead.addLine(to: CGPoint(x: end.x, y: end.y + 2.6))
+            context.stroke(endHead, with: .color(color), style: stroke)
+        }
+    }
+}
+
+@MainActor
+final class OverlayInteractionState: ObservableObject {
+    @Published private(set) var passThroughBubble: OverlayPassThroughBubble?
+
+    func updatePassThroughBubble(_ bubble: OverlayPassThroughBubble?) {
+        guard needsUpdate(from: passThroughBubble, to: bubble) else { return }
+        passThroughBubble = bubble
+    }
+
+    private func needsUpdate(from current: OverlayPassThroughBubble?, to next: OverlayPassThroughBubble?) -> Bool {
+        switch (current, next) {
+        case (nil, nil):
+            return false
+        case (nil, _), (_, nil):
+            return true
+        case let (.some(current), .some(next)):
+            return abs(current.center.x - next.center.x) > 0.5
+                || abs(current.center.y - next.center.y) > 0.5
+                || abs(current.diameter - next.diameter) > 0.5
+        }
+    }
+}
+
+struct OverlayPassThroughBubble: Equatable {
+    var center: CGPoint
+    var diameter: CGFloat
+}
+
+private struct OverlayPassThroughBubbleView: View {
+    var body: some View {
+        Circle()
+            .fill(
+                RadialGradient(
+                    stops: [
+                        .init(color: .clear, location: 0.0),
+                        .init(color: .clear, location: 0.42),
+                        .init(color: Color.black.opacity(0.12), location: 0.68),
+                        .init(color: Color.black.opacity(0.07), location: 0.84),
+                        .init(color: .clear, location: 1.0)
+                    ],
+                    center: .center,
+                    startRadius: 0,
+                    endRadius: 58
+                )
+            )
+            .blur(radius: 1.6)
+    }
+}
+
+private extension OverlayView {
+    static let passThroughTransitionDuration: Double = 0.18
+    static let passThroughTransitionAnimation = Animation.easeOut(duration: passThroughTransitionDuration)
 }

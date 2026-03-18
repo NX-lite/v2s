@@ -5,11 +5,27 @@ import SwiftUI
 @MainActor
 final class OverlayWindowController {
     private let model: AppModel
+    private let interactionState = OverlayInteractionState()
     private let panel: OverlayPanel
-    private let containerView: OverlayContainerView
+    private let controlsChromePanel: OverlayPanel
+    private let moveButtonPanel: OverlayPanel
+    private let closeButtonPanel: OverlayPanel
+    private let resizeButtonPanel: OverlayPanel
+    private let subtitleHostingView: NSHostingView<OverlayView>
+    private let controlsChromeHostingView: NSHostingView<OverlayControlsChromeView>
+    private let moveButtonHostingView: NSHostingView<OverlayMoveButtonView>
+    private let closeButtonHostingView: NSHostingView<OverlayCloseButtonView>
+    private let resizeButtonHostingView: NSHostingView<OverlayResizeButtonView>
     private var cancellables = Set<AnyCancellable>()
     /// Top-left corner (minX, maxY) of the panel after a user drag. nil = use auto-position.
     private var userDefinedTopLeft: NSPoint?
+    private var userDefinedHeight: Double?
+    private var liveResizeWidth: Double?
+    private var dragStartTopLeft: NSPoint?
+    private var resizeDragStartWidth: Double?
+    private var resizeDragStartHeight: Double?
+    private var resizeDragStartTopLeft: NSPoint?
+    private var mouseTrackingTimer: Timer?
 
     init(model: AppModel) {
         self.model = model
@@ -19,41 +35,100 @@ final class OverlayWindowController {
             backing: .buffered,
             defer: false
         )
-        self.containerView = OverlayContainerView(rootView: OverlayView(model: model))
+        self.controlsChromePanel = OverlayPanel(
+            contentRect: NSRect(origin: .zero, size: OverlayControlsLayout.stripSize),
+            styleMask: [.borderless, .nonactivatingPanel],
+            backing: .buffered,
+            defer: false
+        )
+        self.moveButtonPanel = OverlayPanel(
+            contentRect: NSRect(origin: .zero, size: Self.controlButtonSize),
+            styleMask: [.borderless, .nonactivatingPanel],
+            backing: .buffered,
+            defer: false
+        )
+        self.closeButtonPanel = OverlayPanel(
+            contentRect: NSRect(origin: .zero, size: Self.controlButtonSize),
+            styleMask: [.borderless, .nonactivatingPanel],
+            backing: .buffered,
+            defer: false
+        )
+        self.resizeButtonPanel = OverlayPanel(
+            contentRect: NSRect(origin: .zero, size: Self.controlButtonSize),
+            styleMask: [.borderless, .nonactivatingPanel],
+            backing: .buffered,
+            defer: false
+        )
+        self.subtitleHostingView = NSHostingView(
+            rootView: OverlayView(model: model, interactionState: interactionState)
+        )
+        self.controlsChromeHostingView = NSHostingView(rootView: OverlayControlsChromeView())
+        self.moveButtonHostingView = NSHostingView(
+            rootView: OverlayMoveButtonView(
+                onMoveDragStart: {},
+                onMoveDragChanged: { _ in },
+                onMoveDragEnded: {}
+            )
+        )
+        self.closeButtonHostingView = NSHostingView(rootView: OverlayCloseButtonView(model: model))
+        self.resizeButtonHostingView = NSHostingView(
+            rootView: OverlayResizeButtonView(
+                onResizeDragStart: {},
+                onResizeDragChanged: { _ in },
+                onResizeDragEnded: {}
+            )
+        )
 
-        configurePanel()
+        configurePanels()
+        moveButtonHostingView.rootView = OverlayMoveButtonView(
+            onMoveDragStart: { [weak self] in self?.beginControlDrag() },
+            onMoveDragChanged: { [weak self] translation in self?.updateControlDrag(with: translation) },
+            onMoveDragEnded: { [weak self] in self?.endControlDrag() }
+        )
+        resizeButtonHostingView.rootView = OverlayResizeButtonView(
+            onResizeDragStart: { [weak self] in self?.beginResizeDrag() },
+            onResizeDragChanged: { [weak self] translation in self?.updateResizeDrag(with: translation) },
+            onResizeDragEnded: { [weak self] in self?.endResizeDrag() }
+        )
         bindModel()
         syncWindow()
     }
 
-    private func configurePanel() {
+    deinit {
+        mouseTrackingTimer?.invalidate()
+    }
+
+    private func configurePanels() {
+        configurePanel(panel, acceptsInput: false, level: .statusBar)
+        panel.contentView = subtitleHostingView
+
+        configurePanel(controlsChromePanel, acceptsInput: false, level: .statusBar)
+        controlsChromePanel.contentView = controlsChromeHostingView
+
+        let controlLevel = NSWindow.Level(rawValue: NSWindow.Level.statusBar.rawValue + 1)
+        configurePanel(moveButtonPanel, acceptsInput: true, level: controlLevel)
+        moveButtonPanel.contentView = moveButtonHostingView
+
+        configurePanel(closeButtonPanel, acceptsInput: true, level: controlLevel)
+        closeButtonPanel.contentView = closeButtonHostingView
+
+        configurePanel(resizeButtonPanel, acceptsInput: true, level: controlLevel)
+        resizeButtonPanel.contentView = resizeButtonHostingView
+    }
+
+    private func configurePanel(_ panel: OverlayPanel, acceptsInput: Bool, level: NSWindow.Level) {
         panel.isReleasedWhenClosed = false
-        panel.level = .statusBar
+        panel.level = level
         panel.isFloatingPanel = true
         panel.tabbingMode = .disallowed
         panel.backgroundColor = .clear
         panel.isOpaque = false
         panel.hasShadow = false
         panel.hidesOnDeactivate = false
-        // Always false — partial click-through is handled by OverlayContainerView.hitTest
-        panel.ignoresMouseEvents = false
-        panel.isMovable = true
+        panel.ignoresMouseEvents = !acceptsInput
+        panel.isMovable = false
         panel.isMovableByWindowBackground = false
         panel.collectionBehavior = [.canJoinAllSpaces, .fullScreenAuxiliary, .ignoresCycle, .stationary]
-        panel.contentView = containerView
-        containerView.isClickThrough = model.overlayStyle.clickThrough
-
-        NotificationCenter.default.addObserver(
-            self,
-            selector: #selector(handleWindowMove),
-            name: NSWindow.didMoveNotification,
-            object: panel
-        )
-    }
-
-    @objc private func handleWindowMove(_ notification: Notification) {
-        // Record top-left so resizes anchor to the same top edge
-        userDefinedTopLeft = NSPoint(x: panel.frame.minX, y: panel.frame.maxY)
     }
 
     private func bindModel() {
@@ -66,10 +141,7 @@ final class OverlayWindowController {
             .store(in: &cancellables)
 
         model.$overlayStyle
-            .sink { [weak self] style in
-                self?.containerView.isClickThrough = style.clickThrough
-                self?.scheduleWindowSync()
-            }
+            .sink { [weak self] _ in self?.scheduleWindowSync() }
             .store(in: &cancellables)
 
         NotificationCenter.default.publisher(for: NSApplication.didChangeScreenParametersNotification)
@@ -85,22 +157,50 @@ final class OverlayWindowController {
 
     private func syncWindow() {
         guard model.isOverlayVisible, model.overlayState != nil else {
-            panel.orderOut(nil)
+            stopMouseTracking()
+            interactionState.updatePassThroughBubble(nil)
+            orderOutAllPanels()
             return
         }
 
-        positionPanel()
-        panel.orderFront(nil)
-        panel.orderFrontRegardless()
+        positionPanels()
+        orderFrontAllPanels()
+        startMouseTrackingIfNeeded()
+        updatePassThroughBubble()
     }
 
-    private func positionPanel() {
+    private func orderFrontAllPanels() {
+        panel.orderFront(nil)
+        panel.orderFrontRegardless()
+
+        controlsChromePanel.orderFront(nil)
+        controlsChromePanel.orderFrontRegardless()
+
+        moveButtonPanel.orderFront(nil)
+        moveButtonPanel.orderFrontRegardless()
+
+        closeButtonPanel.orderFront(nil)
+        closeButtonPanel.orderFrontRegardless()
+
+        resizeButtonPanel.orderFront(nil)
+        resizeButtonPanel.orderFrontRegardless()
+    }
+
+    private func orderOutAllPanels() {
+        panel.orderOut(nil)
+        controlsChromePanel.orderOut(nil)
+        moveButtonPanel.orderOut(nil)
+        closeButtonPanel.orderOut(nil)
+        resizeButtonPanel.orderOut(nil)
+    }
+
+    private func positionPanels() {
         guard let screen = currentScreen() else { return }
 
         let visibleFrame = screen.visibleFrame
         let style = model.overlayStyle
-        let width = min(max(visibleFrame.width * style.widthRatio, style.minWidth), style.maxWidth)
-        let height = panelHeight()
+        let width = resolvedPanelWidth(in: visibleFrame, style: style)
+        let height = resolvedPanelHeight(in: visibleFrame)
 
         let originX: Double
         let originY: Double
@@ -114,30 +214,192 @@ final class OverlayWindowController {
             originY = visibleFrame.maxY - style.topInset - height
         }
 
-        panel.setFrame(
-            NSRect(x: originX, y: originY, width: width, height: height),
-            display: true
+        let overlayFrame = NSRect(x: originX, y: originY, width: width, height: height)
+        panel.setFrame(overlayFrame, display: true)
+
+        let chromeFrame = controlsChromeFrame(relativeTo: overlayFrame)
+        controlsChromePanel.setFrame(chromeFrame, display: true)
+
+        let buttonFrames = controlButtonFrames(relativeTo: chromeFrame)
+        moveButtonPanel.setFrame(buttonFrames[0], display: true)
+        closeButtonPanel.setFrame(buttonFrames[1], display: true)
+        resizeButtonPanel.setFrame(buttonFrames[2], display: true)
+    }
+
+    private func resolvedPanelWidth(in visibleFrame: NSRect, style: OverlayStyle) -> Double {
+        if let liveResizeWidth {
+            return min(max(liveResizeWidth, style.minWidth), style.maxWidth)
+        }
+
+        return min(max(visibleFrame.width * style.widthRatio, style.minWidth), style.maxWidth)
+    }
+
+    private func controlsChromeFrame(relativeTo overlayFrame: NSRect) -> NSRect {
+        let size = OverlayControlsLayout.stripSize
+        return NSRect(
+            x: overlayFrame.minX + OverlayControlsLayout.outerPadding,
+            y: overlayFrame.minY + OverlayControlsLayout.outerPadding,
+            width: size.width,
+            height: size.height
         )
     }
 
-    private func panelHeight() -> Double {
+    private func controlButtonFrames(relativeTo chromeFrame: NSRect) -> [NSRect] {
+        let buttonX = chromeFrame.minX + OverlayControlsLayout.controlPaddingX
+        let topButtonY = chromeFrame.maxY
+            - OverlayControlsLayout.controlPaddingY
+            - OverlayControlsLayout.controlSize
+
+        return (0..<3).map { index in
+            NSRect(
+                x: buttonX,
+                y: topButtonY - CGFloat(index) * (OverlayControlsLayout.controlSize + OverlayControlsLayout.controlSpacing),
+                width: OverlayControlsLayout.controlSize,
+                height: OverlayControlsLayout.controlSize
+            )
+        }
+    }
+
+    private func resolvedPanelHeight(in visibleFrame: NSRect) -> Double {
+        let minimumHeight = Self.minimumOverlayHeight
+        let maximumHeight = max(minimumHeight, visibleFrame.height * 0.5)
+        if let userDefinedHeight {
+            return min(max(userDefinedHeight, minimumHeight), maximumHeight)
+        }
+
+        return min(max(defaultPanelHeight(), minimumHeight), maximumHeight)
+    }
+
+    private func defaultPanelHeight() -> Double {
         let style = model.overlayStyle
-        let state = model.overlayState
 
         // Base: committed layer (translated + source + internal spacing)
         let base = style.scaledTranslatedFontSize + style.scaledSourceFontSize + 48.0
 
-        // Previous caption layer adds height for ~1 second while fading
-        let previousExtra: Double = state?.hasPreviousCaptionLayer == true
-            ? style.scaledTranslatedFontSize * 0.82 + style.scaledSourceFontSize * 0.82 + 20.0
-            : 0.0
+        // Default height reserves room for the optional previous-caption and draft rows.
+        let previousExtra = style.scaledTranslatedFontSize * 0.82
+            + style.scaledSourceFontSize * 0.82
+            + 20.0
 
-        // Draft layer adds one source-size line
-        let draftExtra: Double = state?.hasActiveDraftLayer == true
-            ? style.scaledSourceFontSize + 12.0
-            : 0.0
+        let draftExtra = style.scaledSourceFontSize + 12.0
 
         return min(max(base + previousExtra + draftExtra, 88.0), 280.0)
+    }
+
+    private func beginControlDrag() {
+        dragStartTopLeft = NSPoint(x: panel.frame.minX, y: panel.frame.maxY)
+    }
+
+    private func updateControlDrag(with translation: CGSize) {
+        guard let dragStartTopLeft else { return }
+
+        userDefinedTopLeft = NSPoint(
+            x: dragStartTopLeft.x + translation.width,
+            y: dragStartTopLeft.y + translation.height
+        )
+        positionPanels()
+    }
+
+    private func endControlDrag() {
+        dragStartTopLeft = nil
+    }
+
+    private func beginResizeDrag() {
+        resizeDragStartWidth = panel.frame.width
+        resizeDragStartHeight = panel.frame.height
+        resizeDragStartTopLeft = NSPoint(x: panel.frame.minX, y: panel.frame.maxY)
+    }
+
+    private func updateResizeDrag(with translation: CGSize) {
+        guard let resizeDragStartWidth,
+              let resizeDragStartHeight,
+              let resizeDragStartTopLeft,
+              let screen = currentScreen() else {
+            return
+        }
+
+        let visibleFrame = screen.visibleFrame
+        guard visibleFrame.width > 0 else { return }
+
+        let style = model.overlayStyle
+        let rightEdgeX = resizeDragStartTopLeft.x + resizeDragStartWidth
+        let maximumWidth = min(style.maxWidth, rightEdgeX - visibleFrame.minX)
+        let newWidth = min(max(resizeDragStartWidth - translation.width, style.minWidth), maximumWidth)
+        let minimumHeight = Self.minimumOverlayHeight
+        let maximumHeight = max(
+            minimumHeight,
+            min(resizeDragStartTopLeft.y - visibleFrame.minY, visibleFrame.height * 0.5)
+        )
+        let newHeight = min(max(resizeDragStartHeight - translation.height, minimumHeight), maximumHeight)
+        let newWidthRatio = newWidth / visibleFrame.width
+        let newLeftX = rightEdgeX - newWidth
+        let newTopY = resizeDragStartTopLeft.y
+
+        liveResizeWidth = newWidth
+        model.updateOverlayStyle { style in
+            style.widthRatio = newWidthRatio
+        }
+        userDefinedTopLeft = NSPoint(x: newLeftX, y: newTopY)
+        userDefinedHeight = newHeight
+        positionPanels()
+    }
+
+    private func endResizeDrag() {
+        liveResizeWidth = nil
+        resizeDragStartWidth = nil
+        resizeDragStartHeight = nil
+        resizeDragStartTopLeft = nil
+    }
+
+    private func startMouseTrackingIfNeeded() {
+        guard mouseTrackingTimer == nil else { return }
+
+        let timer = Timer(timeInterval: 1.0 / 30.0, repeats: true) { [weak self] _ in
+            self?.updatePassThroughBubble()
+        }
+        mouseTrackingTimer = timer
+        RunLoop.main.add(timer, forMode: .common)
+    }
+
+    private func stopMouseTracking() {
+        mouseTrackingTimer?.invalidate()
+        mouseTrackingTimer = nil
+    }
+
+    private func updatePassThroughBubble() {
+        guard model.isOverlayVisible,
+              model.overlayState != nil,
+              model.overlayStyle.clickThrough else {
+            interactionState.updatePassThroughBubble(nil)
+            return
+        }
+
+        let mouseLocation = NSEvent.mouseLocation
+        let overlayFrame = panel.frame
+        guard overlayFrame.contains(mouseLocation) else {
+            interactionState.updatePassThroughBubble(nil)
+            return
+        }
+
+        let interactiveFrames = [
+            moveButtonPanel.frame,
+            closeButtonPanel.frame,
+            resizeButtonPanel.frame
+        ]
+        guard interactiveFrames.contains(where: { $0.contains(mouseLocation) }) == false else {
+            interactionState.updatePassThroughBubble(nil)
+            return
+        }
+
+        interactionState.updatePassThroughBubble(
+            OverlayPassThroughBubble(
+                center: CGPoint(
+                    x: mouseLocation.x - overlayFrame.minX,
+                    y: overlayFrame.maxY - mouseLocation.y
+                ),
+                diameter: Self.passThroughBubbleDiameter
+            )
+        )
     }
 
     private func currentScreen() -> NSScreen? {
@@ -154,49 +416,21 @@ final class OverlayWindowController {
     }
 }
 
-// MARK: - Container view with per-region click-through
-
-/// Wraps the SwiftUI hosting view and routes hit-testing so the left control
-/// strip (first ~56 pts) is always interactive while the subtitle content area
-/// can pass mouse events to underlying windows when clickThrough is enabled.
-final class OverlayContainerView: NSView {
-    var isClickThrough = true
-
-    /// Width of the left-side control strip that must always receive mouse events.
-    private static let controlStripMaxX: CGFloat = 56
-
-    private let hostingView: NSHostingView<OverlayView>
-
-    init(rootView: OverlayView) {
-        self.hostingView = NSHostingView(rootView: rootView)
-        super.init(frame: .zero)
-        addSubview(hostingView)
-        hostingView.translatesAutoresizingMaskIntoConstraints = false
-        NSLayoutConstraint.activate([
-            hostingView.topAnchor.constraint(equalTo: topAnchor),
-            hostingView.bottomAnchor.constraint(equalTo: bottomAnchor),
-            hostingView.leadingAnchor.constraint(equalTo: leadingAnchor),
-            hostingView.trailingAnchor.constraint(equalTo: trailingAnchor),
-        ])
-    }
-
-    required init?(coder: NSCoder) { fatalError() }
-
-    override func hitTest(_ point: NSPoint) -> NSView? {
-        // Left control strip — always interactive
-        if point.x <= OverlayContainerView.controlStripMaxX {
-            return super.hitTest(point)
-        }
-        // Subtitle content area — pass through when click-through is enabled
-        return isClickThrough ? nil : super.hitTest(point)
-    }
-}
-
 // MARK: - Panel
 
 private final class OverlayPanel: NSPanel {
     override var canBecomeKey: Bool { false }
     override var canBecomeMain: Bool { false }
+}
+
+private extension OverlayWindowController {
+    static let minimumOverlayHeight: Double = 105
+    static let passThroughBubbleDiameter: CGFloat = 118
+
+    static let controlButtonSize = CGSize(
+        width: OverlayControlsLayout.controlSize,
+        height: OverlayControlsLayout.controlSize
+    )
 }
 
 private extension NSScreen {

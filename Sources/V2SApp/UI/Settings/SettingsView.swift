@@ -119,8 +119,11 @@ struct SettingsView: View {
     private var overlaySection: some View {
         Section("Subtitle Overlay") {
             HStack {
-                Toggle("Click-through", isOn: clickThroughBinding)
                 Toggle("Translated Text First", isOn: translatedFirstBinding)
+                Spacer()
+                Text("Only the 3 controls accept clicks")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
             }
 
             LabeledSlider(
@@ -133,7 +136,7 @@ struct SettingsView: View {
             LabeledSlider(
                 title: "Width Ratio",
                 value: widthRatioBinding,
-                range: 0.50 ... 0.95,
+                range: 0.10 ... 1.00,
                 precision: 2
             )
 
@@ -186,10 +189,6 @@ struct SettingsView: View {
             get: { model.subtitleMode },
             set: { model.subtitleMode = $0 }
         )
-    }
-
-    private var clickThroughBinding: Binding<Bool> {
-        overlayBinding(\.clickThrough)
     }
 
     private var translatedFirstBinding: Binding<Bool> {

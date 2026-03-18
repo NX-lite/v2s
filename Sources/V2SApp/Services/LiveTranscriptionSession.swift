@@ -556,7 +556,6 @@ final class LiveTranscriptionSession: NSObject {
             }
 
             let currentRange = combinedRange(for: segments, from: sentenceStartIndex, to: index)
-            let currentTextLength = currentRange.length
             let currentSegmentCount = index - sentenceStartIndex + 1
             let sentenceStartTimestamp = segments[sentenceStartIndex].timestamp
             let sentenceEndTimestamp = segment.timestamp + segment.duration

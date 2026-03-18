@@ -297,7 +297,7 @@ final class AppModel: ObservableObject {
             guard sourceID != targetID else { return }
 
             let translated = await withTaskGroup(of: String?.self, returning: String?.self) { group in
-                group.addTask { [translationService] in
+                group.addTask { [translationService = self.translationService] in
                     try? await translationService.translate(text, from: sourceID, to: targetID)
                 }
                 // 1 s hard timeout so draft translation never blocks the UI

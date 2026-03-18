@@ -115,7 +115,7 @@ struct StatusBarPopoverView: View {
                     }
                     .buttonStyle(.bordered)
                     Spacer()
-                    Text(model.overlayStyle.clickThrough ? "Click-through" : "Interactive")
+                    Text("Controls Only")
                         .font(.caption).foregroundStyle(.secondary)
                 }
                 sliderRow(
