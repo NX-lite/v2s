@@ -37,7 +37,7 @@ struct ModeConfig: Sendable {
         firstTokenTargetMs: 300,
         commitSourceTargetMs: 600,
         commitTranslationTargetMs: 900,
-        maxChunkAudioSec: 3.2,
+        maxChunkAudioSec: 3.0,
         minSilenceCommitMs: 280
     )
 
@@ -45,7 +45,7 @@ struct ModeConfig: Sendable {
         firstTokenTargetMs: 200,
         commitSourceTargetMs: 450,
         commitTranslationTargetMs: 700,
-        maxChunkAudioSec: 2.4,
+        maxChunkAudioSec: 2.2,
         minSilenceCommitMs: 220
     )
 
@@ -53,7 +53,7 @@ struct ModeConfig: Sendable {
         firstTokenTargetMs: 400,
         commitSourceTargetMs: 800,
         commitTranslationTargetMs: 1200,
-        maxChunkAudioSec: 3.8,
+        maxChunkAudioSec: 3.5,
         minSilenceCommitMs: 340
     )
 

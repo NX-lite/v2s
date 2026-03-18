@@ -86,6 +86,8 @@ final class LiveTranscriptionSession: NSObject {
     private var speechTranscriberState: AnyObject?
     private var analyzerInputContinuationState: Any?
     private var analyzerInputFormat: AVAudioFormat?
+    private var latestModernText = ""
+    private var modernCommittedPrefixText = ""
 
     private var microphoneCaptureSession: AVCaptureSession?
     private var applicationAudioCapture: ApplicationAudioCapture?
@@ -180,6 +182,7 @@ final class LiveTranscriptionSession: NSObject {
 
         latestSegments = []
         latestFormattedText = ""
+        resetModernTranscriptionState()
         partialHandler = nil
         resetDraftState()
     }
@@ -246,6 +249,7 @@ final class LiveTranscriptionSession: NSObject {
         committedSegmentCount = 0
         latestSegments = []
         latestFormattedText = ""
+        resetModernTranscriptionState()
         cancelSilenceTimer()
         resetDraftState()
 
@@ -344,6 +348,7 @@ final class LiveTranscriptionSession: NSObject {
         committedSegmentCount = 0
         latestSegments = []
         latestFormattedText = ""
+        resetModernTranscriptionState()
         cancelSilenceTimer()
         cancelVADSilenceTimer()
         resetDraftState()
@@ -383,6 +388,7 @@ final class LiveTranscriptionSession: NSObject {
         recognitionBackend = .legacy
         modernAudioConverter = nil
         modernAudioConverterInputSignature = nil
+        resetModernTranscriptionState()
 
         if #available(macOS 26.0, *) {
             (analyzerInputContinuationState as? AsyncStream<AnalyzerInput>.Continuation)?.finish()
@@ -464,6 +470,11 @@ final class LiveTranscriptionSession: NSObject {
         noiseFloorRMS = 0.0012
         highPassPreviousInput = 0
         highPassPreviousOutput = 0
+    }
+
+    private func resetModernTranscriptionState() {
+        latestModernText = ""
+        modernCommittedPrefixText = ""
     }
 
     private func startMicrophoneCapture(deviceUniqueID: String) throws {
@@ -925,6 +936,13 @@ final class LiveTranscriptionSession: NSObject {
     }
 
     @MainActor
+    private func emitRecognizedText(_ text: String) {
+        for sentenceText in splitRecognizedSentences(in: text) {
+            emitRecognizedSentence(RecognizedSentence(text: sentenceText))
+        }
+    }
+
+    @MainActor
     private func emitPartialDraft(_ draft: DraftSegment?) {
         partialHandler?(draft)
     }
@@ -940,6 +958,141 @@ final class LiveTranscriptionSession: NSObject {
                 continuation.resume(returning: status == .authorized)
             }
         }
+    }
+
+    private func splitRecognizedSentences(in text: String) -> [String] {
+        let normalizedText = text
+            .replacingOccurrences(of: "\n", with: " ")
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+        guard normalizedText.isEmpty == false else {
+            return []
+        }
+
+        let nsText = normalizedText as NSString
+        let sentenceRanges = sentenceRanges(in: nsText)
+        guard sentenceRanges.isEmpty == false else {
+            return [normalizedText]
+        }
+
+        return sentenceRanges.compactMap { range in
+            let sentence = nsText.substring(with: range)
+                .trimmingCharacters(in: .whitespacesAndNewlines)
+            return sentence.isEmpty ? nil : sentence
+        }
+    }
+
+    private func sentenceRanges(in text: NSString) -> [NSRange] {
+        var ranges: [NSRange] = []
+        text.enumerateSubstrings(
+            in: NSRange(location: 0, length: text.length),
+            options: [.bySentences, .substringNotRequired]
+        ) { _, substringRange, _, _ in
+            guard substringRange.length > 0 else {
+                return
+            }
+            ranges.append(substringRange)
+        }
+
+        return ranges
+    }
+
+    private func pendingModernText(from fullText: String) -> String {
+        guard modernCommittedPrefixText.isEmpty == false else {
+            return fullText
+        }
+        if fullText.hasPrefix(modernCommittedPrefixText) {
+            return String(fullText.dropFirst(modernCommittedPrefixText.count))
+        }
+
+        let committedSentences = splitRecognizedSentences(in: modernCommittedPrefixText)
+        let nsFullText = fullText as NSString
+        let fullSentenceRanges = sentenceRanges(in: nsFullText)
+
+        guard committedSentences.isEmpty == false,
+              fullSentenceRanges.count >= committedSentences.count else {
+            modernCommittedPrefixText = ""
+            return fullText
+        }
+
+        for (index, committedSentence) in committedSentences.enumerated() {
+            let candidateSentence = nsFullText.substring(with: fullSentenceRanges[index])
+                .trimmingCharacters(in: .whitespacesAndNewlines)
+            guard candidateSentence == committedSentence else {
+                modernCommittedPrefixText = ""
+                return fullText
+            }
+        }
+
+        guard committedSentences.count < fullSentenceRanges.count else {
+            return ""
+        }
+
+        return nsFullText.substring(from: fullSentenceRanges[committedSentences.count].location)
+    }
+
+    private func committableModernText(in rawText: String) -> (committedRawText: String, remainingRawText: String)? {
+        let trimmedText = rawText.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard trimmedText.isEmpty == false else {
+            return nil
+        }
+
+        let nsText = rawText as NSString
+        let sentenceRanges = sentenceRanges(in: nsText)
+        guard sentenceRanges.isEmpty == false else {
+            return nil
+        }
+
+        if String(trimmedText.suffix(1)).containsSentenceTerminator {
+            return (rawText, "")
+        }
+
+        guard sentenceRanges.count >= 2,
+              let trailingSentenceRange = sentenceRanges.last,
+              trailingSentenceRange.location > 0 else {
+            return nil
+        }
+
+        let committedRawText = nsText.substring(to: trailingSentenceRange.location)
+        let remainingRawText = nsText.substring(from: trailingSentenceRange.location)
+        guard committedRawText.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty == false else {
+            return nil
+        }
+
+        return (committedRawText, remainingRawText)
+    }
+
+    private func boundaryGapText(
+        afterSegmentAt index: Int,
+        in formattedText: NSString,
+        segments: [SFTranscriptionSegment]
+    ) -> String {
+        let currentRange = segments[index].substringRange
+        let currentEndLocation = currentRange.location + currentRange.length
+        let nextStartLocation = index < segments.count - 1
+            ? segments[index + 1].substringRange.location
+            : formattedText.length
+
+        guard nextStartLocation > currentEndLocation else {
+            return ""
+        }
+
+        return formattedText.substring(
+            with: NSRange(location: currentEndLocation, length: nextStartLocation - currentEndLocation)
+        )
+    }
+
+    private func emittedTextRange(
+        in formattedText: NSString,
+        segments: [SFTranscriptionSegment],
+        from startIndex: Int,
+        to endIndex: Int
+    ) -> NSRange {
+        let startLocation = segments[startIndex].substringRange.location
+        let endLocation = endIndex < segments.count - 1
+            ? segments[endIndex + 1].substringRange.location
+            : formattedText.length
+
+        return NSRange(location: startLocation, length: max(0, endLocation - startLocation))
     }
 
     private func processRecognitionResult(_ result: SFSpeechRecognitionResult) {
@@ -977,17 +1130,17 @@ final class LiveTranscriptionSession: NSObject {
                 nextPauseDuration = nil
             }
 
-            let currentRange = combinedRange(for: segments, from: sentenceStartIndex, to: index)
             let currentSegmentCount = index - sentenceStartIndex + 1
             let sentenceStartTimestamp = segments[sentenceStartIndex].timestamp
             let sentenceEndTimestamp = segment.timestamp + segment.duration
             let currentSentenceDuration = max(sentenceEndTimestamp - sentenceStartTimestamp, 0)
+            let gapText = boundaryGapText(afterSegmentAt: index, in: formattedText, segments: segments)
 
-            // Boundaries that fire mid-loop (require a gap to a *next* word, or explicit cues)
-            let punctuationBoundary = segment.substring.containsSentenceTerminator
-            // 0.85 s leaves more room for expressive pauses and background-noise jitter
-            // before we cut the sentence. Shorter silences are handled by the commit timers.
-            let strongPauseBoundary = (nextPauseDuration ?? 0) >= 0.85
+            // Apple may place restored punctuation in the gap before the next segment
+            // rather than inside the current segment substring.
+            let punctuationBoundary = segment.substring.containsSentenceTerminator || gapText.containsSentenceTerminator
+            // 0.85 s was too conservative and often merged two short sentences.
+            let strongPauseBoundary = (nextPauseDuration ?? 0) >= max(0.55, Double(modeConfig.minSilenceCommitMs) / 1000.0 + 0.24)
             // Char-length limit removed: 40 chars is only ~6 English words and caused
             // false mid-sentence cuts. Segment count + audio duration are sufficient.
             let forcedBoundary = currentSegmentCount >= 18
@@ -1009,17 +1162,19 @@ final class LiveTranscriptionSession: NSObject {
                 }
             }
 
-            let commitRange = commitEndIndex == index
-                ? currentRange
-                : combinedRange(for: segments, from: sentenceStartIndex, to: commitEndIndex)
+            let commitRange = emittedTextRange(
+                in: formattedText,
+                segments: segments,
+                from: sentenceStartIndex,
+                to: commitEndIndex
+            )
 
             let sentenceText = formattedText.substring(with: commitRange)
                 .replacingOccurrences(of: "\n", with: " ")
                 .trimmingCharacters(in: .whitespacesAndNewlines)
 
             if sentenceText.isEmpty == false {
-                let recognizedSentence = RecognizedSentence(text: sentenceText)
-                Task { await emitRecognizedSentence(recognizedSentence) }
+                Task { await emitRecognizedText(sentenceText) }
             }
 
             sentenceStartIndex = commitEndIndex + 1
@@ -1082,6 +1237,7 @@ final class LiveTranscriptionSession: NSObject {
         committedSegmentCount = 0
         latestSegments = []
         latestFormattedText = ""
+        resetModernTranscriptionState()
         resetDraftState()
         Task { await emitPartialDraft(nil) }
     }
@@ -1128,7 +1284,9 @@ final class LiveTranscriptionSession: NSObject {
     @available(macOS 26.0, *)
     private func processModernRecognitionResult(_ result: SpeechTranscriber.Result) {
         lastRecognitionResultTime = Date()
-        let text = normalizedTranscriberText(result.text)
+        let fullText = normalizedTranscriberText(result.text)
+        let pendingRawText = pendingModernText(from: fullText)
+        let text = pendingRawText.trimmingCharacters(in: .whitespacesAndNewlines)
 
         if result.isFinal {
             let identity = modernResultIdentity(for: result)
@@ -1137,11 +1295,12 @@ final class LiveTranscriptionSession: NSObject {
 
             cancelSilenceTimer()
             cancelVADSilenceTimer()
+            resetModernTranscriptionState()
             resetDraftState()
 
             if text.isEmpty == false {
                 Task {
-                    await emitRecognizedSentence(RecognizedSentence(text: text))
+                    await emitRecognizedText(text)
                     await emitPartialDraft(nil)
                 }
             } else {
@@ -1151,11 +1310,16 @@ final class LiveTranscriptionSession: NSObject {
         }
 
         guard text.isEmpty == false else {
+            latestModernText = ""
+            cancelSilenceTimer()
+            cancelVADSilenceTimer()
             Task { await emitPartialDraft(nil) }
             return
         }
 
+        latestModernText = pendingRawText
         emitDraftUpdate(from: result, text: text)
+        scheduleSilenceCommit()
     }
 
     @available(macOS 26.0, *)
@@ -1290,14 +1454,14 @@ final class LiveTranscriptionSession: NSObject {
     /// partial-result callbacks for the same utterance on a loaded device, causing the
     /// timer to fire between two ASR deliveries for the same sentence.
     ///
-    /// 700 ms sits safely above:
+    /// ~600–690 ms sits safely above:
     ///   • inter-result ASR delivery gaps (typically 100–500 ms during speech)
     ///   • natural within-sentence pauses in Mandarin/Japanese (200–450 ms)
     /// and below clear sentence-ending silences (≥ 600 ms for most speakers).
     ///
-    /// Follow ≈ 700 ms · Balanced ≈ 750 ms · Reading ≈ 800 ms.
+    /// Follow ≈ 600 ms · Balanced ≈ 630 ms · Reading ≈ 690 ms.
     private var silenceCommitDeadlineMs: Int {
-        max(700, modeConfig.minSilenceCommitMs + 500)
+        max(600, modeConfig.minSilenceCommitMs + 350)
     }
 
     private var vadSilenceCommitDeadlineMs: Int {
@@ -1363,6 +1527,23 @@ final class LiveTranscriptionSession: NSObject {
             vadSilenceCommitTimer = nil
         }
 
+        if recognitionBackend == .speechAnalyzer {
+            guard trigger == .asrInactivity,
+                  let split = committableModernText(in: latestModernText) else {
+                return
+            }
+
+            let text = split.committedRawText.trimmingCharacters(in: .whitespacesAndNewlines)
+            modernCommittedPrefixText += split.committedRawText
+            latestModernText = split.remainingRawText
+            resetDraftState()
+            Task {
+                await emitRecognizedText(text)
+                await emitPartialDraft(nil)
+            }
+            return
+        }
+
         let segments = latestSegments
         let formattedText = latestFormattedText
 
@@ -1381,8 +1562,7 @@ final class LiveTranscriptionSession: NSObject {
             .trimmingCharacters(in: .whitespacesAndNewlines)
 
         if sentenceText.isEmpty == false {
-            let sentence = RecognizedSentence(text: sentenceText)
-            Task { await emitRecognizedSentence(sentence) }
+            Task { await emitRecognizedText(sentenceText) }
         }
 
         committedSegmentCount = segments.count

@@ -22,10 +22,13 @@ final class AppModel: ObservableObject {
     private var fadeTask: Task<Void, Never>?
     private var draftTranslationTask: Task<Void, Never>?
     private var lastDraftStablePrefix = ""
+    private var lastDraftTranslationSource = ""
+    private var draftTranslationGeneration: Int = 0
     private var displayedCaptionLastVisualUpdateAt = Date.distantPast
     private var displayedCaptionLastVisualUpdateWasLateTranslation = false
     // Revision tracking: captionID → (committedTranslation, committedAt, revisionCount)
     private var translationRevisions: [UUID: (text: String, committedAt: Date, count: Int)] = [:]
+    private var recentRecognizedCaptionTexts: [(text: String, time: Date)] = []
 
     @Published private(set) var applicationSources: [InputSource] = []
     @Published private(set) var microphoneSources: [InputSource] = []
@@ -282,44 +285,49 @@ final class AppModel: ObservableObject {
         overlayState?.draftSourceText = draft?.sourceText
         overlayState?.draftStablePrefixLength = draft?.stablePrefixLength ?? 0
 
-        let stablePrefix: String
-        if let draft, draft.stablePrefixLength > 0 {
-            stablePrefix = String(draft.sourceText.prefix(draft.stablePrefixLength))
-        } else {
-            stablePrefix = ""
-        }
-
-        guard stablePrefix != lastDraftStablePrefix else { return }
+        let stablePrefix = draft.map { String($0.sourceText.prefix($0.stablePrefixLength)) } ?? ""
         lastDraftStablePrefix = stablePrefix
 
-        if stablePrefix.isEmpty {
+        let draftText = draft?.sourceText.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+        guard draftText != lastDraftTranslationSource else { return }
+        lastDraftTranslationSource = draftText
+
+        if draftText.isEmpty {
             draftTranslationTask?.cancel()
             draftTranslationTask = nil
+            draftTranslationGeneration &+= 1
             overlayState?.draftTranslatedText = nil
         } else {
-            scheduleDraftTranslation(for: stablePrefix)
+            scheduleDraftTranslation(for: draftText)
         }
     }
 
     private func scheduleDraftTranslation(for text: String) {
         draftTranslationTask?.cancel()
+        draftTranslationGeneration &+= 1
+        let generation = draftTranslationGeneration
         draftTranslationTask = Task { @MainActor [weak self] in
             guard let self else { return }
-            // 150 ms debounce — coalesces rapid stable-prefix growth bursts
-            do { try await Task.sleep(nanoseconds: 150_000_000) } catch { return }
+            // Keep draft translation responsive while still coalescing very fast ASR churn.
+            do { try await Task.sleep(nanoseconds: 60_000_000) } catch { return }
             guard !Task.isCancelled, liveTranscriptionSession != nil else { return }
 
             let sourceID = currentSourceLanguageID
             let targetID = outputLanguageID
-            guard sourceID != targetID else { return }
+            guard generation == draftTranslationGeneration else { return }
+
+            guard sourceID != targetID else {
+                overlayState?.draftTranslatedText = text
+                return
+            }
 
             let translated = await withTaskGroup(of: String?.self, returning: String?.self) { group in
                 group.addTask { [translationService = self.translationService] in
                     try? await translationService.translate(text, from: sourceID, to: targetID)
                 }
-                // 1 s hard timeout so draft translation never blocks the UI
+                // Draft translation should feel live; drop stale work quickly.
                 group.addTask {
-                    try? await Task.sleep(nanoseconds: 1_000_000_000)
+                    try? await Task.sleep(nanoseconds: 700_000_000)
                     return nil
                 }
                 let result = await group.next() ?? nil
@@ -327,7 +335,9 @@ final class AppModel: ObservableObject {
                 return result
             }
 
-            guard !Task.isCancelled, liveTranscriptionSession != nil else { return }
+            guard !Task.isCancelled,
+                  liveTranscriptionSession != nil,
+                  generation == draftTranslationGeneration else { return }
             if let translated {
                 overlayState?.draftTranslatedText = glossaryService.apply(to: translated, glossary: glossary)
             }
@@ -479,19 +489,24 @@ final class AppModel: ObservableObject {
             return
         }
 
+        guard shouldEnqueueRecognizedSentence(sourceText) else {
+            return
+        }
+
         let caption = QueuedCaption(
             id: UUID(),
             sourceText: sourceText,
             sourceName: sourceName
         )
 
+        rememberRecognizedSentence(sourceText)
         pendingCaptions.append(caption)
         translateCaption(caption)
 
-        // Cap the queue at 2 items: whatever is currently being displayed (index 0)
-        // plus the newest arrival (just appended). Drop anything in between so the
-        // display never falls behind by more than one sentence.
-        while pendingCaptions.count > 2 {
+        // Keep the currently displayed caption plus up to two fresh arrivals.
+        // This avoids losing the first sentence when a single ASR result is split
+        // into two back-to-back captions.
+        while pendingCaptions.count > 3 {
             let dropped = pendingCaptions.remove(at: 1)
             captionTranslationTasks[dropped.id]?.cancel()
             captionTranslationTasks.removeValue(forKey: dropped.id)
@@ -556,10 +571,13 @@ final class AppModel: ObservableObject {
         draftTranslationTask?.cancel()
         draftTranslationTask = nil
         lastDraftStablePrefix = ""
+        lastDraftTranslationSource = ""
+        draftTranslationGeneration &+= 1
         cancelCaptionTranslations()
         pendingCaptions.removeAll()
         readyCaptionTranslations.removeAll()
         translationRevisions.removeAll()
+        recentRecognizedCaptionTexts.removeAll()
         displayedCaption = nil
         activeInputLanguageID = nil
         displayedCaptionLastVisualUpdateAt = Date.distantPast
@@ -646,6 +664,40 @@ final class AppModel: ObservableObject {
             // defer runs here: removes caption from pendingCaptions + readyCaptionTranslations
         }
         // defer runs here: captionDisplayTask = nil
+    }
+
+    private func normalizedCaptionText(_ text: String) -> String {
+        text
+            .components(separatedBy: .whitespacesAndNewlines)
+            .filter { $0.isEmpty == false }
+            .joined(separator: " ")
+    }
+
+    private func shouldEnqueueRecognizedSentence(_ text: String) -> Bool {
+        let now = Date()
+        let normalized = normalizedCaptionText(text)
+        recentRecognizedCaptionTexts.removeAll { now.timeIntervalSince($0.time) > 6.0 }
+
+        if normalized.isEmpty {
+            return false
+        }
+
+        if let displayedCaption,
+           normalizedCaptionText(displayedCaption.sourceText) == normalized {
+            return false
+        }
+
+        if pendingCaptions.contains(where: { normalizedCaptionText($0.sourceText) == normalized }) {
+            return false
+        }
+
+        return recentRecognizedCaptionTexts.contains(where: { $0.text == normalized }) == false
+    }
+
+    private func rememberRecognizedSentence(_ text: String) {
+        let now = Date()
+        recentRecognizedCaptionTexts.removeAll { now.timeIntervalSince($0.time) > 6.0 }
+        recentRecognizedCaptionTexts.append((text: normalizedCaptionText(text), time: now))
     }
 
     private func waitForTranslatedCaption(id: UUID, timeout: Double = 1.5) async -> String? {
