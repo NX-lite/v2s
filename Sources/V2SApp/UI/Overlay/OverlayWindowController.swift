@@ -582,8 +582,8 @@ final class OverlayWindowController {
         let base = style.scaledTranslatedFontSize + style.scaledSourceFontSize + 48.0
 
         // Default height reserves room for the scrollback history and draft rows.
-        let historyExtra = style.scaledTranslatedFontSize * 0.82
-            + style.scaledSourceFontSize * 0.82
+        let historyExtra = style.scaledTranslatedFontSize
+            + style.scaledSourceFontSize
             + 20.0
 
         let draftExtra = style.scaledTranslatedFontSize + style.scaledSourceFontSize + 18.0

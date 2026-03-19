@@ -10,6 +10,7 @@ struct OverlayStyle: Codable, Equatable {
     var translatedFontSize: Double
     var sourceFontSize: Double
     var clickThrough: Bool
+    // Retained for backwards compatibility with persisted settings.
     var translatedFirst: Bool
     var overlayScaleFactor: Double
 
@@ -67,7 +68,7 @@ struct OverlayStyle: Codable, Equatable {
         translatedFontSize = try c.decode(Double.self, forKey: .translatedFontSize)
         sourceFontSize     = try c.decode(Double.self, forKey: .sourceFontSize)
         clickThrough       = try c.decode(Bool.self,   forKey: .clickThrough)
-        translatedFirst    = try c.decode(Bool.self,   forKey: .translatedFirst)
+        translatedFirst    = try c.decodeIfPresent(Bool.self, forKey: .translatedFirst) ?? true
         overlayScaleFactor = try c.decodeIfPresent(Double.self, forKey: .overlayScaleFactor) ?? 1.0
     }
 }

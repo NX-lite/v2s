@@ -95,7 +95,8 @@ final class AppModel: ObservableObject {
         self.selectedSourceID = settings.selectedSourceID
         self.inputLanguageID = settings.inputLanguageID
         self.outputLanguageID = settings.outputLanguageID
-        self.overlayStyle = settings.overlayStyle
+        let normalizedOverlayStyle = AppModel.normalizedOverlayStyle(settings.overlayStyle)
+        self.overlayStyle = normalizedOverlayStyle
         self.subtitleMode = settings.subtitleMode
         self.glossary = settings.glossary
         self.translationHostConfiguration = nil
@@ -105,6 +106,9 @@ final class AppModel: ObservableObject {
         }
 
         isBootstrapping = false
+        if normalizedOverlayStyle != settings.overlayStyle {
+            persistSettings()
+        }
         refreshSources()
         scheduleSelectedLanguageResourcePreparation()
     }
@@ -187,7 +191,7 @@ final class AppModel: ObservableObject {
         activeInputLanguageID = inputLanguageID
         isOverlayVisible = true
         overlayState = OverlayPreviewState(
-            translatedText: "Listening…",
+            translatedText: Self.listeningPlaceholderText,
             sourceText: "Waiting for audio from \(selectedSource.name)…",
             sourceName: selectedSource.name
         )
@@ -276,7 +280,7 @@ final class AppModel: ObservableObject {
     func updateOverlayStyle(_ update: (inout OverlayStyle) -> Void) {
         var style = overlayStyle
         update(&style)
-        overlayStyle = style
+        overlayStyle = AppModel.normalizedOverlayStyle(style)
     }
 
     func updateOverlayHistoryVisibleCount(_ count: Int) {
@@ -312,6 +316,12 @@ final class AppModel: ObservableObject {
         )
 
         settingsStore.save(settings)
+    }
+
+    private static func normalizedOverlayStyle(_ style: OverlayStyle) -> OverlayStyle {
+        var normalized = style
+        normalized.translatedFirst = true
+        return normalized
     }
 
     private func recognitionContextualStrings() -> [String] {
@@ -738,6 +748,10 @@ final class AppModel: ObservableObject {
             ? 0
             : min(draft?.stablePrefixLength ?? 0, draftText.count)
 
+        if draftText.isEmpty == false {
+            dismissListeningPlaceholderIfNeeded()
+        }
+
         let stablePrefix = draftText.isEmpty
             ? ""
             : String(draftText.prefix(min(draft?.stablePrefixLength ?? 0, draftText.count)))
@@ -831,7 +845,7 @@ final class AppModel: ObservableObject {
         guard let current = overlayState,
               displayedCaption != nil,
               !current.translatedText.isEmpty,
-              current.translatedText != "Listening…",
+              current.translatedText != Self.listeningPlaceholderText,
               current.translatedText != "Capture stopped",
               current.translatedText != "Unable to start" else { return }
         appendOverlayHistoryEntry(
@@ -1319,11 +1333,20 @@ final class AppModel: ObservableObject {
         }
 
         switch normalizedTranslated {
-        case "Listening…", "Capture stopped", "Unable to start":
+        case Self.listeningPlaceholderText, "Capture stopped", "Unable to start":
             return false
         default:
             return true
         }
+    }
+
+    private func dismissListeningPlaceholderIfNeeded() {
+        guard overlayState?.translatedText == Self.listeningPlaceholderText else {
+            return
+        }
+
+        overlayState?.translatedText = ""
+        overlayState?.sourceText = ""
     }
 
     // MARK: - Display duration (strategy §10)
@@ -1386,6 +1409,7 @@ final class AppModel: ObservableObject {
 
 private extension AppModel {
     static let overlayHistoryLimit = 120
+    static let listeningPlaceholderText = "Listening…"
 }
 
 private struct QueuedCaption: Identifiable, Equatable {

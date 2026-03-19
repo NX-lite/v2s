@@ -152,11 +152,10 @@ struct SettingsView: View {
     private var overlaySection: some View {
         Section("Subtitle Overlay") {
             HStack {
-                Toggle("Translated Text First", isOn: translatedFirstBinding)
-                Spacer()
                 Text("Only the 3 controls accept clicks")
                     .font(.caption)
                     .foregroundStyle(.secondary)
+                Spacer()
             }
 
             LabeledSlider(
@@ -222,10 +221,6 @@ struct SettingsView: View {
             get: { model.subtitleMode },
             set: { model.subtitleMode = $0 }
         )
-    }
-
-    private var translatedFirstBinding: Binding<Bool> {
-        overlayBinding(\.translatedFirst)
     }
 
     private var topInsetBinding: Binding<Double> {
