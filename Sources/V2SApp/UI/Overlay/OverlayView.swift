@@ -95,9 +95,14 @@ struct OverlayView: View {
         }
         .opacity(committedOpacity)
         .onChange(of: state.captionEpoch) { _, _ in
-            committedOpacity = 0.0
-            withAnimation(.easeOut(duration: 0.3)) {
+            if state.skipCommittedFadeIn {
+                // Draft translation was visible — replace instantly, no flash.
                 committedOpacity = 1.0
+            } else {
+                committedOpacity = 0.0
+                withAnimation(.easeOut(duration: 0.3)) {
+                    committedOpacity = 1.0
+                }
             }
         }
     }
@@ -128,7 +133,7 @@ struct OverlayView: View {
             VStack(spacing: 2) {
                 if let draftTranslated = state.draftTranslatedText, !draftTranslated.isEmpty {
                     Text(draftTranslated)
-                        .font(.system(size: model.overlayStyle.scaledTranslatedFontSize * 0.88, weight: .medium))
+                        .font(.system(size: model.overlayStyle.scaledTranslatedFontSize, weight: .semibold))
                         .foregroundStyle(Color.white.opacity(0.55))
                         .multilineTextAlignment(.center)
                         .lineLimit(2)

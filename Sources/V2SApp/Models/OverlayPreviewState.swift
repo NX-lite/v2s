@@ -21,6 +21,10 @@ struct OverlayPreviewState: Equatable {
     // MARK: Caption epoch — increments on each new committed sentence (drives slide-in transition)
     var captionEpoch: Int = 0
 
+    /// When true, the committed layer should appear instantly (no fade-in) because
+    /// a draft translation was already visible and is being directly replaced.
+    var skipCommittedFadeIn: Bool = false
+
     // MARK: Derived helpers
 
     var hasActiveDraftLayer: Bool {

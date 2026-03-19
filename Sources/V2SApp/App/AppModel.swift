@@ -124,7 +124,11 @@ final class AppModel: ObservableObject {
     }
 
     var sessionButtonTitle: String {
-        sessionState == .running ? "Stop" : "Start"
+        if sessionState == .running {
+            return "Stop"
+        }
+
+        return isSessionButtonDisabled ? "Wait" : "Start"
     }
 
     var isSessionButtonDisabled: Bool {
@@ -1047,6 +1051,12 @@ final class AppModel: ObservableObject {
 
             // Source-first: show source text immediately while translation is pending
             displayedCaption = caption
+
+            // If a draft translation was visible, skip the fade-in so the committed
+            // text replaces the draft seamlessly instead of flashing.
+            let hadDraftTranslation = overlayState?.draftTranslatedText?.isEmpty == false
+
+            overlayState?.skipCommittedFadeIn = hadDraftTranslation
             updateCommittedOverlay(
                 translatedText: caption.sourceText,
                 sourceText: caption.sourceText,

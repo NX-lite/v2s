@@ -3,6 +3,7 @@ import SwiftUI
 
 struct SettingsView: View {
     @ObservedObject var model: AppModel
+    let closeSettings: () -> Void
 
     var body: some View {
         Form {
@@ -25,7 +26,11 @@ struct SettingsView: View {
 
             HStack {
                 Button(model.sessionButtonTitle) {
+                    let shouldCloseSettings = model.sessionState != .running
                     model.toggleSession()
+                    if shouldCloseSettings {
+                        closeSettings()
+                    }
                 }
                 .buttonStyle(.borderedProminent)
                 .disabled(model.isSessionButtonDisabled)
