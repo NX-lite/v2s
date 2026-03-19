@@ -20,7 +20,6 @@ final class AppModel: ObservableObject {
     private var displayedCaption: QueuedCaption?
     private var activeInputLanguageID: String?
     private var isBootstrapping = true
-    private var fadeTask: Task<Void, Never>?
     private var draftTranslationTask: Task<Void, Never>?
     private var languageResourcePreparationTask: Task<Void, Never>?
     private var lastDraftStablePrefix = ""
@@ -41,6 +40,8 @@ final class AppModel: ObservableObject {
     @Published private(set) var languageResourceStatuses: [LanguageResourceStatus] = []
     @Published private(set) var translationHostConfiguration: TranslationSession.Configuration?
     @Published var isOverlayVisible = false
+    @Published private(set) var overlayHistoryVisibleCount = 1
+    @Published private(set) var overlayHistoryScrollOffset = 0
 
     @Published var selectedSourceID: String? {
         didSet {
@@ -186,6 +187,7 @@ final class AppModel: ObservableObject {
             sourceText: "Waiting for audio from \(selectedSource.name)…",
             sourceName: selectedSource.name
         )
+        overlayHistoryScrollOffset = 0
         statusMessage = "Checking language resources..."
         await awaitSelectedLanguageResourcePreparationIfNeeded()
         statusMessage = "Preparing \(selectedSource.name)…"
@@ -231,6 +233,7 @@ final class AppModel: ObservableObject {
                 sourceText: error.localizedDescription,
                 sourceName: selectedSource.name
             )
+            overlayHistoryScrollOffset = 0
         }
     }
 
@@ -247,6 +250,7 @@ final class AppModel: ObservableObject {
     func showOverlayPreview() {
         let source = selectedSource ?? InputSource.preview
         overlayState = makePreviewState(for: source)
+        overlayHistoryScrollOffset = 0
         isOverlayVisible = true
 
         if sessionState != .running {
@@ -269,6 +273,24 @@ final class AppModel: ObservableObject {
         var style = overlayStyle
         update(&style)
         overlayStyle = style
+    }
+
+    func updateOverlayHistoryVisibleCount(_ count: Int) {
+        let clampedCount = max(1, count)
+        guard overlayHistoryVisibleCount != clampedCount else { return }
+        overlayHistoryVisibleCount = clampedCount
+        clampOverlayHistoryScrollOffset()
+    }
+
+    func scrollOverlayHistory(by delta: Int) {
+        guard delta != 0 else { return }
+        setOverlayHistoryScrollOffset(overlayHistoryScrollOffset + delta)
+    }
+
+    func setOverlayHistoryScrollOffset(_ offset: Int) {
+        let clampedOffset = min(max(offset, 0), overlayHistoryMaxScrollOffset)
+        guard overlayHistoryScrollOffset != clampedOffset else { return }
+        overlayHistoryScrollOffset = clampedOffset
     }
 
     func persistSettings() {
@@ -768,14 +790,13 @@ final class AppModel: ObservableObject {
         }
     }
 
-    // MARK: - Previous caption fade
+    // MARK: - Overlay history
 
-    /// Fades out the currently displayed caption and clears the overlay text.
-    /// Called when the display hold time expires and no new caption is queued.
+    /// Archives the current committed caption, then clears the live overlay text.
     private func clearOverlayText() {
         guard let current = overlayState,
               !current.translatedText.isEmpty else { return }
-        beginFadeOutPreviousCaption(
+        appendOverlayHistoryEntry(
             translatedText: current.translatedText,
             sourceText: current.sourceText
         )
@@ -788,8 +809,8 @@ final class AppModel: ObservableObject {
         displayedCaptionLastVisualUpdateWasLateTranslation = false
     }
 
-    /// Snapshots the currently committed caption into the previous layer at full opacity.
-    /// The previous layer stays visible until `startPreviousCaptionFade()` is called.
+    /// Archives the currently committed caption into the scrollback history before
+    /// the next sentence replaces it.
     private func capturePreviousCaption() {
         guard let current = overlayState,
               displayedCaption != nil,
@@ -797,22 +818,10 @@ final class AppModel: ObservableObject {
               current.translatedText != "Listening…",
               current.translatedText != "Capture stopped",
               current.translatedText != "Unable to start" else { return }
-
-        if inputLanguageID != outputLanguageID,
-           current.translatedText == current.sourceText {
-            return
-        }
-
-        if displayedCaptionLastVisualUpdateWasLateTranslation,
-           Date().timeIntervalSince(displayedCaptionLastVisualUpdateAt) < 0.8 {
-            return
-        }
-
-        fadeTask?.cancel()
-        fadeTask = nil
-        overlayState?.previousTranslatedText = current.translatedText
-        overlayState?.previousSourceText = current.sourceText
-        overlayState?.previousFadeProgress = 0.0   // fully visible — no animation yet
+        appendOverlayHistoryEntry(
+            translatedText: current.translatedText,
+            sourceText: current.sourceText
+        )
     }
 
     private func updateCommittedOverlay(
@@ -831,48 +840,6 @@ final class AppModel: ObservableObject {
         displayedCaptionLastVisualUpdateWasLateTranslation = lateTranslation
     }
 
-    /// Triggers the scroll-up + fade animation on the previous caption layer.
-    /// Call this after the new translation is committed so the previous caption
-    /// stays on screen until meaningful content replaces it.
-    private func startPreviousCaptionFade() {
-        guard overlayState?.previousTranslatedText != nil else { return }
-        fadeTask?.cancel()
-        fadeTask = Task { @MainActor [weak self] in
-            guard let self else { return }
-            try? await Task.sleep(nanoseconds: 16_666_667)    // one render frame
-            guard !Task.isCancelled else { return }
-            overlayState?.previousFadeProgress = 1.0           // triggers scroll-up animation
-            try? await Task.sleep(nanoseconds: 600_000_000)    // wait for 0.5 s animation
-            guard !Task.isCancelled else { return }
-            overlayState?.previousTranslatedText = nil
-            overlayState?.previousSourceText = nil
-        }
-    }
-
-    /// Fades out a caption immediately (used when the queue empties — no new caption coming).
-    private func beginFadeOutPreviousCaption(translatedText: String, sourceText: String) {
-        guard !translatedText.isEmpty,
-              translatedText != "Listening…",
-              translatedText != "Capture stopped",
-              translatedText != "Unable to start" else { return }
-
-        overlayState?.previousTranslatedText = translatedText
-        overlayState?.previousSourceText = sourceText
-        overlayState?.previousFadeProgress = 0.0
-
-        fadeTask?.cancel()
-        fadeTask = Task { @MainActor [weak self] in
-            guard let self else { return }
-            try? await Task.sleep(nanoseconds: 16_666_667)
-            guard !Task.isCancelled else { return }
-            overlayState?.previousFadeProgress = 1.0
-            try? await Task.sleep(nanoseconds: 600_000_000)
-            guard !Task.isCancelled else { return }
-            overlayState?.previousTranslatedText = nil
-            overlayState?.previousSourceText = nil
-        }
-    }
-
     // MARK: - Settings sync
 
     private func syncOverlayPreviewIfNeeded() {
@@ -886,6 +853,7 @@ final class AppModel: ObservableObject {
 
         let source = selectedSource ?? InputSource.preview
         overlayState = makePreviewState(for: source)
+        overlayHistoryScrollOffset = 0
     }
 
     private func makePreviewState(for source: InputSource) -> OverlayPreviewState {
@@ -988,8 +956,6 @@ final class AppModel: ObservableObject {
     }
 
     private func resetLiveTextPipeline() {
-        fadeTask?.cancel()
-        fadeTask = nil
         captionDisplayTask?.cancel()
         captionDisplayTask = nil
         draftTranslationTask?.cancel()
@@ -1004,6 +970,7 @@ final class AppModel: ObservableObject {
         recentRecognizedCaptionTexts.removeAll()
         displayedCaption = nil
         activeInputLanguageID = nil
+        overlayHistoryScrollOffset = 0
         displayedCaptionLastVisualUpdateAt = Date.distantPast
         displayedCaptionLastVisualUpdateWasLateTranslation = false
 
@@ -1045,8 +1012,7 @@ final class AppModel: ObservableObject {
                 readyCaptionTranslations.removeValue(forKey: caption.id)
             }
 
-            // Snapshot the current caption into the previous layer at full opacity.
-            // It stays visible until the new translation arrives — then we scroll it away.
+            // Archive the current caption before the next sentence replaces it.
             capturePreviousCaption()
 
             // Source-first: show source text immediately while translation is pending
@@ -1078,9 +1044,6 @@ final class AppModel: ObservableObject {
                 lateTranslation: finalText != caption.sourceText
             )
             translationRevisions[caption.id] = (text: finalText, committedAt: Date(), count: 0)
-
-            // New translation is now visible — scroll the previous caption upward
-            startPreviousCaptionFade()
 
             let holdDuration = computeDisplayDuration(
                 sourceText: caption.sourceText,
@@ -1266,6 +1229,66 @@ final class AppModel: ObservableObject {
         captionTranslationTasks.removeAll()
     }
 
+    private var overlayHistoryCount: Int {
+        overlayState?.history.count ?? 0
+    }
+
+    private var overlayHistoryMaxScrollOffset: Int {
+        max(0, overlayHistoryCount - max(1, overlayHistoryVisibleCount))
+    }
+
+    private func clampOverlayHistoryScrollOffset() {
+        overlayHistoryScrollOffset = min(max(overlayHistoryScrollOffset, 0), overlayHistoryMaxScrollOffset)
+    }
+
+    private func appendOverlayHistoryEntry(translatedText: String, sourceText: String) {
+        guard shouldStoreOverlayHistory(translatedText: translatedText, sourceText: sourceText) else {
+            return
+        }
+
+        if let lastEntry = overlayState?.history.last,
+           lastEntry.translatedText == translatedText,
+           lastEntry.sourceText == sourceText {
+            return
+        }
+
+        if overlayHistoryScrollOffset > 0 {
+            overlayHistoryScrollOffset += 1
+        }
+
+        overlayState?.history.append(
+            OverlayHistoryEntry(
+                translatedText: translatedText,
+                sourceText: sourceText
+            )
+        )
+
+        let overflow = max(0, (overlayState?.history.count ?? 0) - Self.overlayHistoryLimit)
+        if overflow > 0 {
+            overlayState?.history.removeFirst(overflow)
+            if overlayHistoryScrollOffset > 0 {
+                overlayHistoryScrollOffset = max(0, overlayHistoryScrollOffset - overflow)
+            }
+        }
+
+        clampOverlayHistoryScrollOffset()
+    }
+
+    private func shouldStoreOverlayHistory(translatedText: String, sourceText: String) -> Bool {
+        let normalizedTranslated = translatedText.trimmingCharacters(in: .whitespacesAndNewlines)
+        let normalizedSource = sourceText.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard normalizedTranslated.isEmpty == false || normalizedSource.isEmpty == false else {
+            return false
+        }
+
+        switch normalizedTranslated {
+        case "Listening…", "Capture stopped", "Unable to start":
+            return false
+        default:
+            return true
+        }
+    }
+
     // MARK: - Display duration (strategy §10)
 
     /// max(min_hold, reading_time, audio_span × sync_factor), clamped to [1.2, 4.5] s
@@ -1322,6 +1345,10 @@ final class AppModel: ObservableObject {
         }
     }
 
+}
+
+private extension AppModel {
+    static let overlayHistoryLimit = 120
 }
 
 private struct QueuedCaption: Identifiable, Equatable {

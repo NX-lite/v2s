@@ -30,11 +30,12 @@ struct OverlayView: View {
         Group {
             if let state = model.overlayState {
                 VStack(alignment: .center, spacing: 6) {
-                    previousCaptionLayer(state)
+                    historyLayer(state)
                     committedLayer(state)
                     draftLayer(state)
                 }
-                .padding(.horizontal, 20)
+                .padding(.leading, 20)
+                .padding(.trailing, 20 + OverlayHistoryScrollbarLayout.panelWidth + OverlayHistoryScrollbarLayout.contentSpacing)
                 .padding(.vertical, 12)
                 .frame(maxWidth: .infinity, maxHeight: .infinity)
                 .background(backgroundView)
@@ -48,35 +49,37 @@ struct OverlayView: View {
         .padding(.vertical, OverlayControlsLayout.outerPadding)
     }
 
-    // MARK: - Previous caption layer (80% opacity, scrolls up then fades)
+    // MARK: - History layer
 
     @ViewBuilder
-    private func previousCaptionLayer(_ state: OverlayPreviewState) -> some View {
-        if let prevTranslated = state.previousTranslatedText {
-            VStack(spacing: 3) {
-                Text(prevTranslated)
-                    .font(.system(size: model.overlayStyle.scaledTranslatedFontSize * 0.82, weight: .semibold))
-                    .foregroundStyle(Color.white.opacity(0.80))
-                    .multilineTextAlignment(.center)
-                    .lineLimit(1)
-                    .frame(maxWidth: .infinity)
+    private func historyLayer(_ state: OverlayPreviewState) -> some View {
+        if state.hasHistory {
+            GeometryReader { proxy in
+                let visibleCount = historyVisibleCount(for: proxy.size.height)
+                let visibleEntries = historyVisibleEntries(from: state.history, visibleCount: visibleCount)
 
-                if let prevSource = state.previousSourceText, !prevSource.isEmpty {
-                    Text(prevSource)
-                        .font(.system(size: model.overlayStyle.scaledSourceFontSize * 0.82, weight: .regular))
-                        .foregroundStyle(Color.white.opacity(0.55))
-                        .multilineTextAlignment(.center)
-                        .lineLimit(1)
-                        .frame(maxWidth: .infinity)
+                VStack(spacing: 8) {
+                    ForEach(Array(visibleEntries.enumerated()), id: \.element.id) { index, entry in
+                        historyEntry(entry)
+
+                        if index < visibleEntries.count - 1 {
+                            Divider()
+                                .overlay(Color.white.opacity(0.08))
+                        }
+                    }
+                }
+                .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .bottom)
+                .onAppear {
+                    model.updateOverlayHistoryVisibleCount(visibleCount)
+                }
+                .onChange(of: visibleCount) { _, newCount in
+                    model.updateOverlayHistoryVisibleCount(newCount)
+                }
+                .onChange(of: state.history.count) { _, _ in
+                    model.updateOverlayHistoryVisibleCount(visibleCount)
                 }
             }
-            .opacity(1.0 - state.previousFadeProgress)
-            .offset(y: -28 * state.previousFadeProgress)
-            .animation(.easeInOut(duration: 0.5), value: state.previousFadeProgress)
-
-            Divider()
-                .overlay(Color.white.opacity(0.08 * (1.0 - state.previousFadeProgress)))
-                .animation(.easeInOut(duration: 0.5), value: state.previousFadeProgress)
+            .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .bottom)
         }
     }
 
@@ -154,6 +157,42 @@ struct OverlayView: View {
                 .frame(maxWidth: .infinity)
             }
         }
+    }
+
+    private func historyEntry(_ entry: OverlayHistoryEntry) -> some View {
+        VStack(spacing: 3) {
+            Text(entry.translatedText)
+                .font(.system(size: model.overlayStyle.scaledTranslatedFontSize * 0.78, weight: .semibold))
+                .foregroundStyle(Color.white.opacity(0.76))
+                .multilineTextAlignment(.center)
+                .lineLimit(2)
+                .frame(maxWidth: .infinity)
+
+            if entry.sourceText.isEmpty == false {
+                Text(entry.sourceText)
+                    .font(.system(size: model.overlayStyle.scaledSourceFontSize * 0.78, weight: .regular))
+                    .foregroundStyle(Color.white.opacity(0.50))
+                    .multilineTextAlignment(.center)
+                    .lineLimit(2)
+                    .frame(maxWidth: .infinity)
+            }
+        }
+    }
+
+    private func historyVisibleEntries(from history: [OverlayHistoryEntry], visibleCount: Int) -> [OverlayHistoryEntry] {
+        let clampedVisibleCount = max(1, visibleCount)
+        let maxOffset = max(0, history.count - clampedVisibleCount)
+        let offset = min(max(model.overlayHistoryScrollOffset, 0), maxOffset)
+        let upperBound = max(0, history.count - offset)
+        let lowerBound = max(0, upperBound - clampedVisibleCount)
+        return Array(history[lowerBound..<upperBound])
+    }
+
+    private func historyVisibleCount(for height: CGFloat) -> Int {
+        let rowHeight = (model.overlayStyle.scaledTranslatedFontSize * 0.78)
+            + (model.overlayStyle.scaledSourceFontSize * 0.78)
+            + 24.0
+        return max(1, Int((height / rowHeight).rounded(.down)))
     }
 
     // MARK: - Background
@@ -319,6 +358,134 @@ struct OverlayResizeButtonView: View {
     }
 }
 
+struct OverlayHistoryScrollbarView: View {
+    @ObservedObject var model: AppModel
+    @ObservedObject var interactionState: OverlayInteractionState
+
+    var body: some View {
+        let revealProgress = interactionState.scrollbarRevealProgress
+        let latestButtonRevealProgress = latestButtonRevealProgress(for: revealProgress)
+
+        GeometryReader { proxy in
+            let trackHeight = resolvedTrackHeight(
+                in: proxy.size.height,
+                latestButtonRevealProgress: latestButtonRevealProgress
+            )
+            let metrics = scrollbarMetrics(trackHeight: trackHeight)
+            let trackWidth = resolvedTrackWidth(for: revealProgress)
+
+            ZStack(alignment: .bottom) {
+                ZStack(alignment: .top) {
+                    Capsule()
+                        .fill(Color.white.opacity(0.035 + (0.055 * revealProgress)))
+                        .frame(width: trackWidth)
+                        .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .top)
+
+                    Capsule()
+                        .fill(
+                            Color.white.opacity(
+                                metrics.canScroll
+                                    ? (0.28 + (0.32 * revealProgress))
+                                    : (0.12 + (0.10 * revealProgress))
+                            )
+                        )
+                        .frame(
+                            width: trackWidth,
+                            height: metrics.thumbHeight
+                        )
+                        .frame(maxWidth: .infinity, alignment: .top)
+                        .offset(y: metrics.thumbTop)
+
+                    OverlayHistoryScrollbarInputLayer(
+                        currentOffset: model.overlayHistoryScrollOffset,
+                        maxScrollOffset: metrics.maxScrollOffset,
+                        thumbHeight: metrics.thumbHeight,
+                        onOffsetChange: { model.setOverlayHistoryScrollOffset($0) },
+                        onStepScroll: { model.scrollOverlayHistory(by: $0) }
+                    )
+                }
+                .frame(height: trackHeight)
+                .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .top)
+
+                latestButton(revealProgress: latestButtonRevealProgress)
+            }
+            .animation(.easeOut(duration: 0.16), value: revealProgress)
+            .animation(.easeOut(duration: 0.18), value: latestButtonRevealProgress)
+        }
+        .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .bottom)
+        .padding(.vertical, OverlayHistoryScrollbarLayout.verticalPadding)
+    }
+
+    private func scrollbarMetrics(trackHeight: CGFloat) -> OverlayHistoryScrollbarMetrics {
+        let totalCount = max(model.overlayState?.history.count ?? 0, 0)
+        let visibleCount = max(1, model.overlayHistoryVisibleCount)
+        let maxScrollOffset = max(0, totalCount - visibleCount)
+        let clampedTrackHeight = max(trackHeight, OverlayHistoryScrollbarLayout.minimumThumbHeight)
+        let visibilityRatio = totalCount > 0
+            ? min(1.0, CGFloat(visibleCount) / CGFloat(max(totalCount, visibleCount)))
+            : 1.0
+        let thumbHeight = max(
+            OverlayHistoryScrollbarLayout.minimumThumbHeight,
+            clampedTrackHeight * visibilityRatio
+        )
+        let travel = max(clampedTrackHeight - thumbHeight, 0)
+        let progressFromTop: CGFloat
+
+        if maxScrollOffset > 0 {
+            progressFromTop = 1.0 - (CGFloat(model.overlayHistoryScrollOffset) / CGFloat(maxScrollOffset))
+        } else {
+            progressFromTop = 1.0
+        }
+
+        return OverlayHistoryScrollbarMetrics(
+            maxScrollOffset: maxScrollOffset,
+            thumbHeight: min(thumbHeight, clampedTrackHeight),
+            thumbTop: travel * progressFromTop,
+            canScroll: maxScrollOffset > 0
+        )
+    }
+
+    private func resolvedTrackWidth(for revealProgress: CGFloat) -> CGFloat {
+        OverlayHistoryScrollbarLayout.trackWidth
+            + ((OverlayHistoryScrollbarLayout.expandedTrackWidth - OverlayHistoryScrollbarLayout.trackWidth) * revealProgress)
+    }
+
+    private func resolvedTrackHeight(in totalHeight: CGFloat, latestButtonRevealProgress: CGFloat) -> CGFloat {
+        let reservedHeight = latestButtonReservedHeight(for: latestButtonRevealProgress)
+        return max(totalHeight - reservedHeight, OverlayHistoryScrollbarLayout.minimumThumbHeight)
+    }
+
+    private func latestButtonReservedHeight(for revealProgress: CGFloat) -> CGFloat {
+        let fullHeight = OverlayControlsLayout.controlSize + OverlayHistoryScrollbarLayout.buttonSpacing
+        return fullHeight * revealProgress
+    }
+
+    private func latestButtonRevealProgress(for revealProgress: CGFloat) -> CGFloat {
+        guard model.overlayHistoryScrollOffset > 0 else { return 0.0 }
+        return revealProgress
+    }
+
+    private func latestButton(revealProgress: CGFloat) -> some View {
+        Button {
+            model.setOverlayHistoryScrollOffset(0)
+        } label: {
+            ZStack {
+                Circle().fill(Color.white.opacity(0.12))
+                Image(systemName: "arrow.down.to.line")
+                    .font(.system(size: 9, weight: .medium))
+                    .foregroundColor(.white.opacity(0.65))
+            }
+        }
+        .buttonStyle(.plain)
+        .frame(width: OverlayControlsLayout.controlSize, height: OverlayControlsLayout.controlSize)
+        .opacity(revealProgress)
+        .scaleEffect(0.9 + (0.1 * revealProgress))
+        .allowsHitTesting(revealProgress > 0.05)
+        .animation(.easeOut(duration: 0.16), value: revealProgress)
+        .accessibilityLabel("Scroll to latest subtitle")
+    }
+}
+
 enum OverlayControlsLayout {
     static let outerPadding: CGFloat = 4
     static let leadingInset: CGFloat = 10
@@ -332,6 +499,115 @@ enum OverlayControlsLayout {
             width: controlSize + (controlPaddingX * 2),
             height: (controlSize * 3) + (controlSpacing * 2) + (controlPaddingY * 2)
         )
+    }
+}
+
+enum OverlayHistoryScrollbarLayout {
+    static let panelWidth: CGFloat = 28
+    static let trackWidth: CGFloat = 4
+    static let expandedTrackWidth: CGFloat = OverlayControlsLayout.controlSize
+    static let contentSpacing: CGFloat = 10
+    static let verticalPadding: CGFloat = 8
+    static let buttonSpacing: CGFloat = 8
+    static let minimumThumbHeight: CGFloat = 36
+
+    static var panelSize: CGSize {
+        CGSize(width: panelWidth, height: 120)
+    }
+}
+
+private struct OverlayHistoryScrollbarMetrics {
+    var maxScrollOffset: Int
+    var thumbHeight: CGFloat
+    var thumbTop: CGFloat
+    var canScroll: Bool
+}
+
+private struct OverlayHistoryScrollbarInputLayer: NSViewRepresentable {
+    let currentOffset: Int
+    let maxScrollOffset: Int
+    let thumbHeight: CGFloat
+    let onOffsetChange: (Int) -> Void
+    let onStepScroll: (Int) -> Void
+
+    func makeNSView(context: Context) -> OverlayHistoryScrollbarInputView {
+        let view = OverlayHistoryScrollbarInputView()
+        view.currentOffset = currentOffset
+        view.maxScrollOffset = maxScrollOffset
+        view.thumbHeight = thumbHeight
+        view.onOffsetChange = onOffsetChange
+        view.onStepScroll = onStepScroll
+        return view
+    }
+
+    func updateNSView(_ nsView: OverlayHistoryScrollbarInputView, context: Context) {
+        nsView.currentOffset = currentOffset
+        nsView.maxScrollOffset = maxScrollOffset
+        nsView.thumbHeight = thumbHeight
+        nsView.onOffsetChange = onOffsetChange
+        nsView.onStepScroll = onStepScroll
+    }
+}
+
+final class OverlayHistoryScrollbarInputView: NSView {
+    var currentOffset = 0
+    var maxScrollOffset = 0
+    var thumbHeight: CGFloat = OverlayHistoryScrollbarLayout.minimumThumbHeight
+    var onOffsetChange: ((Int) -> Void)?
+    var onStepScroll: ((Int) -> Void)?
+
+    private var isDraggingThumb = false
+
+    override var isFlipped: Bool { true }
+
+    override func mouseDown(with event: NSEvent) {
+        isDraggingThumb = true
+        updateOffset(for: event)
+    }
+
+    override func mouseDragged(with event: NSEvent) {
+        guard isDraggingThumb else { return }
+        updateOffset(for: event)
+    }
+
+    override func mouseUp(with event: NSEvent) {
+        if isDraggingThumb {
+            updateOffset(for: event)
+        }
+        isDraggingThumb = false
+    }
+
+    override func scrollWheel(with event: NSEvent) {
+        guard maxScrollOffset > 0 else { return }
+
+        let delta = event.scrollingDeltaY
+        guard delta != 0 else { return }
+
+        let divisor: CGFloat = event.hasPreciseScrollingDeltas ? 12.0 : 1.0
+        let magnitude = max(1, Int((abs(delta) / divisor).rounded(.awayFromZero)))
+        onStepScroll?(delta > 0 ? magnitude : -magnitude)
+    }
+
+    override func acceptsFirstMouse(for event: NSEvent?) -> Bool { true }
+
+    private func updateOffset(for event: NSEvent) {
+        guard maxScrollOffset > 0 else {
+            onOffsetChange?(0)
+            return
+        }
+
+        let point = convert(event.locationInWindow, from: nil)
+        onOffsetChange?(resolvedOffset(forThumbCenterY: point.y))
+    }
+
+    private func resolvedOffset(forThumbCenterY thumbCenterY: CGFloat) -> Int {
+        let clampedThumbHeight = min(max(thumbHeight, 0), bounds.height)
+        let travel = max(bounds.height - clampedThumbHeight, 0)
+        guard travel > 0 else { return 0 }
+
+        let thumbTop = min(max(thumbCenterY - (clampedThumbHeight / 2), 0), travel)
+        let progressFromBottom = 1.0 - (thumbTop / travel)
+        return Int((progressFromBottom * CGFloat(maxScrollOffset)).rounded())
     }
 }
 
@@ -432,10 +708,17 @@ private struct OverlayResizeGlyph: View {
 @MainActor
 final class OverlayInteractionState: ObservableObject {
     @Published private(set) var passThroughBubble: OverlayPassThroughBubble?
+    @Published private(set) var scrollbarRevealProgress: CGFloat = 0.0
 
     func updatePassThroughBubble(_ bubble: OverlayPassThroughBubble?) {
         guard needsUpdate(from: passThroughBubble, to: bubble) else { return }
         passThroughBubble = bubble
+    }
+
+    func updateScrollbarRevealProgress(_ progress: CGFloat) {
+        let clampedProgress = min(max(progress, 0.0), 1.0)
+        guard abs(scrollbarRevealProgress - clampedProgress) > 0.01 else { return }
+        scrollbarRevealProgress = clampedProgress
     }
 
     private func needsUpdate(from current: OverlayPassThroughBubble?, to next: OverlayPassThroughBubble?) -> Bool {

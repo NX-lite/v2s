@@ -1,5 +1,17 @@
 import Foundation
 
+struct OverlayHistoryEntry: Identifiable, Equatable {
+    let id: UUID
+    var translatedText: String
+    var sourceText: String
+
+    init(id: UUID = UUID(), translatedText: String, sourceText: String) {
+        self.id = id
+        self.translatedText = translatedText
+        self.sourceText = sourceText
+    }
+}
+
 struct OverlayPreviewState: Equatable {
     // MARK: Committed caption (main display)
     var translatedText: String
@@ -12,11 +24,8 @@ struct OverlayPreviewState: Equatable {
     /// Incremental translation of the current draft text (updates as stable prefix grows).
     var draftTranslatedText: String? = nil
 
-    // MARK: Previous caption — scrolls up above committed, then fades
-    var previousTranslatedText: String? = nil
-    var previousSourceText: String? = nil
-    /// 0.0 = fully visible · 1.0 = fully invisible (triggers SwiftUI animation)
-    var previousFadeProgress: Double = 1.0
+    // MARK: History layer — committed captions the user can scroll back through
+    var history: [OverlayHistoryEntry] = []
 
     // MARK: Caption epoch — increments on each new committed sentence (drives slide-in transition)
     var captionEpoch: Int = 0
@@ -31,7 +40,7 @@ struct OverlayPreviewState: Equatable {
         draftSourceText?.isEmpty == false
     }
 
-    var hasPreviousCaptionLayer: Bool {
-        previousTranslatedText != nil
+    var hasHistory: Bool {
+        history.isEmpty == false
     }
 }

@@ -9,11 +9,13 @@ final class OverlayWindowController {
     private let interactionState = OverlayInteractionState()
     private let panel: OverlayPanel
     private let controlsChromePanel: OverlayPanel
+    private let scrollbarPanel: OverlayPanel
     private let moveButtonPanel: OverlayPanel
     private let closeButtonPanel: OverlayPanel
     private let resizeButtonPanel: OverlayPanel
     private let subtitleHostingView: NSHostingView<OverlayView>
     private let controlsChromeHostingView: NSHostingView<OverlayControlsChromeView>
+    private let scrollbarHostingView: NSHostingView<OverlayHistoryScrollbarView>
     private let moveButtonHostingView: NSHostingView<OverlayMoveButtonView>
     private let closeButtonHostingView: NSHostingView<OverlayCloseButtonView>
     private let resizeButtonHostingView: NSHostingView<OverlayResizeButtonView>
@@ -53,6 +55,12 @@ final class OverlayWindowController {
             backing: .buffered,
             defer: false
         )
+        self.scrollbarPanel = OverlayPanel(
+            contentRect: NSRect(origin: .zero, size: OverlayHistoryScrollbarLayout.panelSize),
+            styleMask: [.borderless, .nonactivatingPanel],
+            backing: .buffered,
+            defer: false
+        )
         self.moveButtonPanel = OverlayPanel(
             contentRect: NSRect(origin: .zero, size: Self.controlButtonSize),
             styleMask: [.borderless, .nonactivatingPanel],
@@ -75,6 +83,9 @@ final class OverlayWindowController {
             rootView: OverlayView(model: model, interactionState: interactionState)
         )
         self.controlsChromeHostingView = NSHostingView(rootView: OverlayControlsChromeView())
+        self.scrollbarHostingView = NSHostingView(
+            rootView: OverlayHistoryScrollbarView(model: model, interactionState: interactionState)
+        )
         self.moveButtonHostingView = NSHostingView(
             rootView: OverlayMoveButtonView(
                 onMoveDragStart: {},
@@ -118,6 +129,9 @@ final class OverlayWindowController {
         controlsChromePanel.contentView = controlsChromeHostingView
 
         let controlLevel = NSWindow.Level(rawValue: NSWindow.Level.statusBar.rawValue + 1)
+        configurePanel(scrollbarPanel, acceptsInput: true, level: controlLevel)
+        scrollbarPanel.contentView = scrollbarHostingView
+
         configurePanel(moveButtonPanel, acceptsInput: true, level: controlLevel)
         moveButtonPanel.contentView = moveButtonHostingView
 
@@ -240,7 +254,7 @@ final class OverlayWindowController {
         )
 
         // Hide control panels during animation
-        let controlPanels = [controlsChromePanel, moveButtonPanel, closeButtonPanel, resizeButtonPanel]
+        let controlPanels = [controlsChromePanel, scrollbarPanel, moveButtonPanel, closeButtonPanel, resizeButtonPanel]
         controlPanels.forEach { $0.alphaValue = 0; $0.orderOut(nil) }
 
         // Set initial state for main panel
@@ -432,7 +446,7 @@ final class OverlayWindowController {
 
     private func fadeInControlPanels() {
         positionPanels()
-        let controlPanels = [controlsChromePanel, moveButtonPanel, closeButtonPanel, resizeButtonPanel]
+        let controlPanels = [controlsChromePanel, scrollbarPanel, moveButtonPanel, closeButtonPanel, resizeButtonPanel]
         controlPanels.forEach { $0.alphaValue = 0; $0.orderFront(nil) }
 
         NSAnimationContext.runAnimationGroup { context in
@@ -451,6 +465,9 @@ final class OverlayWindowController {
         controlsChromePanel.orderFront(nil)
         controlsChromePanel.orderFrontRegardless()
 
+        scrollbarPanel.orderFront(nil)
+        scrollbarPanel.orderFrontRegardless()
+
         moveButtonPanel.orderFront(nil)
         moveButtonPanel.orderFrontRegardless()
 
@@ -464,6 +481,7 @@ final class OverlayWindowController {
     private func orderOutAllPanels() {
         panel.orderOut(nil)
         controlsChromePanel.orderOut(nil)
+        scrollbarPanel.orderOut(nil)
         moveButtonPanel.orderOut(nil)
         closeButtonPanel.orderOut(nil)
         resizeButtonPanel.orderOut(nil)
@@ -495,6 +513,9 @@ final class OverlayWindowController {
         let chromeFrame = controlsChromeFrame(relativeTo: overlayFrame)
         controlsChromePanel.setFrame(chromeFrame, display: true)
 
+        let scrollbarFrame = historyScrollbarFrame(relativeTo: overlayFrame)
+        scrollbarPanel.setFrame(scrollbarFrame, display: true)
+
         let buttonFrames = controlButtonFrames(relativeTo: chromeFrame)
         moveButtonPanel.setFrame(buttonFrames[0], display: true)
         closeButtonPanel.setFrame(buttonFrames[1], display: true)
@@ -516,6 +537,15 @@ final class OverlayWindowController {
             y: overlayFrame.minY + OverlayControlsLayout.outerPadding,
             width: size.width,
             height: size.height
+        )
+    }
+
+    private func historyScrollbarFrame(relativeTo overlayFrame: NSRect) -> NSRect {
+        NSRect(
+            x: overlayFrame.maxX - OverlayControlsLayout.outerPadding - OverlayHistoryScrollbarLayout.panelWidth,
+            y: overlayFrame.minY + OverlayControlsLayout.outerPadding,
+            width: OverlayHistoryScrollbarLayout.panelWidth,
+            height: max(overlayFrame.height - (OverlayControlsLayout.outerPadding * 2), 1)
         )
     }
 
@@ -551,14 +581,14 @@ final class OverlayWindowController {
         // Base: committed layer (translated + source + internal spacing)
         let base = style.scaledTranslatedFontSize + style.scaledSourceFontSize + 48.0
 
-        // Default height reserves room for the optional previous-caption and draft rows.
-        let previousExtra = style.scaledTranslatedFontSize * 0.82
+        // Default height reserves room for the scrollback history and draft rows.
+        let historyExtra = style.scaledTranslatedFontSize * 0.82
             + style.scaledSourceFontSize * 0.82
             + 20.0
 
         let draftExtra = style.scaledSourceFontSize + 12.0
 
-        return min(max(base + previousExtra + draftExtra, 88.0), 280.0)
+        return min(max(base + historyExtra + draftExtra, 88.0), 280.0)
     }
 
     private func beginControlDrag() {
@@ -645,13 +675,22 @@ final class OverlayWindowController {
 
     private func updatePassThroughBubble() {
         guard model.isOverlayVisible,
-              model.overlayState != nil,
-              model.overlayStyle.clickThrough else {
+              model.overlayState != nil else {
+            interactionState.updateScrollbarRevealProgress(0.0)
             interactionState.updatePassThroughBubble(nil)
             return
         }
 
         let mouseLocation = NSEvent.mouseLocation
+        interactionState.updateScrollbarRevealProgress(
+            scrollbarRevealProgress(for: mouseLocation, scrollbarFrame: scrollbarPanel.frame)
+        )
+
+        guard model.overlayStyle.clickThrough else {
+            interactionState.updatePassThroughBubble(nil)
+            return
+        }
+
         let overlayFrame = panel.frame
         guard overlayFrame.contains(mouseLocation) else {
             interactionState.updatePassThroughBubble(nil)
@@ -659,6 +698,7 @@ final class OverlayWindowController {
         }
 
         let interactiveFrames = [
+            scrollbarPanel.frame,
             moveButtonPanel.frame,
             closeButtonPanel.frame,
             resizeButtonPanel.frame
@@ -677,6 +717,34 @@ final class OverlayWindowController {
                 diameter: Self.passThroughBubbleDiameter
             )
         )
+    }
+
+    private func scrollbarRevealProgress(for mouseLocation: NSPoint, scrollbarFrame: NSRect) -> CGFloat {
+        let distance = distance(from: mouseLocation, to: scrollbarFrame)
+        guard distance < Self.scrollbarRevealDistance else { return 0.0 }
+        return 1.0 - (distance / Self.scrollbarRevealDistance)
+    }
+
+    private func distance(from point: NSPoint, to rect: NSRect) -> CGFloat {
+        let dx: CGFloat
+        if point.x < rect.minX {
+            dx = rect.minX - point.x
+        } else if point.x > rect.maxX {
+            dx = point.x - rect.maxX
+        } else {
+            dx = 0.0
+        }
+
+        let dy: CGFloat
+        if point.y < rect.minY {
+            dy = rect.minY - point.y
+        } else if point.y > rect.maxY {
+            dy = point.y - rect.maxY
+        } else {
+            dy = 0.0
+        }
+
+        return sqrt((dx * dx) + (dy * dy))
     }
 
     private func currentScreen() -> NSScreen? {
@@ -703,6 +771,7 @@ private final class OverlayPanel: NSPanel {
 private extension OverlayWindowController {
     static let minimumOverlayHeight: Double = 105
     static let passThroughBubbleDiameter: CGFloat = 118
+    static let scrollbarRevealDistance: CGFloat = 42
 
     static let controlButtonSize = CGSize(
         width: OverlayControlsLayout.controlSize,
