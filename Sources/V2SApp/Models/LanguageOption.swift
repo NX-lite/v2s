@@ -9,10 +9,14 @@ enum LanguageCatalog {
     static let common: [LanguageOption] = [
         LanguageOption(id: "en", displayName: "English"),
         LanguageOption(id: "zh-Hans", displayName: "Chinese (Simplified)"),
-        LanguageOption(id: "ja", displayName: "Japanese"),
-        LanguageOption(id: "ko", displayName: "Korean"),
-        LanguageOption(id: "fr", displayName: "French"),
+        LanguageOption(id: "es", displayName: "Spanish"),
         LanguageOption(id: "de", displayName: "German"),
+        LanguageOption(id: "ja", displayName: "Japanese"),
+        LanguageOption(id: "fr", displayName: "French"),
+        LanguageOption(id: "ko", displayName: "Korean"),
+        LanguageOption(id: "ar", displayName: "Arabic"),
+        LanguageOption(id: "pt", displayName: "Portuguese"),
+        LanguageOption(id: "ru", displayName: "Russian"),
     ]
 
     static func displayName(for identifier: String) -> String {
@@ -23,10 +27,14 @@ enum LanguageCatalog {
         switch identifier {
         case "en": return "en-US"
         case "zh-Hans": return "zh-CN"
-        case "ja": return "ja-JP"
-        case "ko": return "ko-KR"
-        case "fr": return "fr-FR"
+        case "es": return "es-ES"
         case "de": return "de-DE"
+        case "ja": return "ja-JP"
+        case "fr": return "fr-FR"
+        case "ko": return "ko-KR"
+        case "ar": return "ar-SA"
+        case "pt": return "pt-BR"
+        case "ru": return "ru-RU"
         default: return identifier
         }
     }

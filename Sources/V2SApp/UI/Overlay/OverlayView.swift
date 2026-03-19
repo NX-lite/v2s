@@ -22,6 +22,7 @@ struct OverlayView: View {
         .onChange(of: interactionState.passThroughBubble) { _, bubble in
             syncPassThroughBubble(bubble)
         }
+        .modifier(OverlayTranslationHostModifier(model: model))
     }
 
     @ViewBuilder
@@ -213,6 +214,18 @@ struct OverlayView: View {
         guard renderedPassThroughBubble != nil else { return }
         withAnimation(Self.passThroughTransitionAnimation) {
             passThroughRevealProgress = 0.0
+        }
+    }
+}
+
+private struct OverlayTranslationHostModifier: ViewModifier {
+    @ObservedObject var model: AppModel
+
+    func body(content: Content) -> some View {
+        if model.sessionState == .running {
+            content.v2sTranslationHost(model: model)
+        } else {
+            content
         }
     }
 }

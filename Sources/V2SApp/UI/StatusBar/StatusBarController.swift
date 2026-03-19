@@ -3,19 +3,22 @@ import Combine
 import SwiftUI
 
 @MainActor
-final class StatusBarController {
+final class StatusBarController: NSObject, NSPopoverDelegate {
     private let model: AppModel
     private let openSettings: () -> Void
     private let quitApp: () -> Void
     private let statusItem: NSStatusItem
     private let popover = NSPopover()
     private var cancellables = Set<AnyCancellable>()
+    private var localMouseMonitor: Any?
+    private var globalMouseMonitor: Any?
 
     init(model: AppModel, openSettings: @escaping () -> Void, quitApp: @escaping () -> Void) {
         self.model = model
         self.openSettings = openSettings
         self.quitApp = quitApp
         self.statusItem = NSStatusBar.system.statusItem(withLength: NSStatusItem.variableLength)
+        super.init()
 
         configureStatusItem()
         configurePopover()
@@ -35,6 +38,7 @@ final class StatusBarController {
     }
 
     private func configurePopover() {
+        popover.delegate = self
         popover.behavior = .transient
         popover.contentSize = NSSize(width: 380, height: 520)
         popover.contentViewController = NSHostingController(
@@ -99,5 +103,78 @@ final class StatusBarController {
         } else {
             popover.show(relativeTo: button.bounds, of: button, preferredEdge: .minY)
         }
+    }
+
+    func popoverWillShow(_ notification: Notification) {
+        startClosingMonitorsIfNeeded()
+    }
+
+    func popoverDidClose(_ notification: Notification) {
+        stopClosingMonitors()
+    }
+
+    private func startClosingMonitorsIfNeeded() {
+        guard localMouseMonitor == nil, globalMouseMonitor == nil else {
+            return
+        }
+
+        let mouseEvents: NSEvent.EventTypeMask = [.leftMouseDown, .rightMouseDown, .otherMouseDown]
+
+        localMouseMonitor = NSEvent.addLocalMonitorForEvents(matching: mouseEvents) { [weak self] event in
+            self?.closePopoverIfNeeded(for: event)
+            return event
+        }
+
+        globalMouseMonitor = NSEvent.addGlobalMonitorForEvents(matching: mouseEvents) { [weak self] event in
+            Task { @MainActor [weak self] in
+                self?.closePopoverIfNeeded(for: event)
+            }
+        }
+    }
+
+    private func stopClosingMonitors() {
+        if let localMouseMonitor {
+            NSEvent.removeMonitor(localMouseMonitor)
+            self.localMouseMonitor = nil
+        }
+
+        if let globalMouseMonitor {
+            NSEvent.removeMonitor(globalMouseMonitor)
+            self.globalMouseMonitor = nil
+        }
+    }
+
+    private func closePopoverIfNeeded(for event: NSEvent) {
+        guard popover.isShown else {
+            return
+        }
+
+        let clickPoint = screenPoint(for: event)
+        guard clickShouldKeepPopoverOpen(at: clickPoint) == false else {
+            return
+        }
+
+        popover.performClose(nil)
+    }
+
+    private func clickShouldKeepPopoverOpen(at screenPoint: NSPoint) -> Bool {
+        if let buttonRect = statusItemScreenRect, buttonRect.contains(screenPoint) {
+            return true
+        }
+
+        if let popoverWindow = popover.contentViewController?.view.window,
+           popoverWindow.frame.contains(screenPoint) {
+            return true
+        }
+
+        return false
+    }
+
+    private func screenPoint(for event: NSEvent) -> NSPoint {
+        guard let window = event.window else {
+            return NSEvent.mouseLocation
+        }
+
+        return window.convertPoint(toScreen: event.locationInWindow)
     }
 }

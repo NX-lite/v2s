@@ -42,7 +42,7 @@ struct StatusBarPopoverView: View {
             }
             Button(model.sessionButtonTitle) { model.toggleSession() }
                 .buttonStyle(.borderedProminent)
-                .disabled(model.selectedSource == nil)
+                .disabled(model.isSessionButtonDisabled)
         }
     }
 
@@ -99,6 +99,13 @@ struct StatusBarPopoverView: View {
                     .pickerStyle(.menu).labelsHidden()
                     .frame(width: Self.pickerW)
                 }
+
+                if model.languageResourceStatuses.isEmpty == false {
+                    row(nil) {
+                        LanguageResourceStatusListView(statuses: model.languageResourceStatuses)
+                            .frame(width: Self.pickerW, alignment: .leading)
+                    }
+                }
             }
         }
     }
@@ -127,6 +134,11 @@ struct StatusBarPopoverView: View {
                     label: "Font Size",
                     value: translatedFontBinding, in: 16 ... 34,
                     display: "\(Int(model.overlayStyle.translatedFontSize.rounded()))pt"
+                )
+                sliderRow(
+                    label: "Source Size",
+                    value: sourceFontBinding, in: 14 ... 28,
+                    display: "\(Int(model.overlayStyle.sourceFontSize.rounded()))pt"
                 )
             }
         }
@@ -206,6 +218,12 @@ struct StatusBarPopoverView: View {
         Binding(
             get: { model.overlayStyle.translatedFontSize },
             set: { v in model.updateOverlayStyle { $0.translatedFontSize = v } }
+        )
+    }
+    private var sourceFontBinding: Binding<Double> {
+        Binding(
+            get: { model.overlayStyle.sourceFontSize },
+            set: { v in model.updateOverlayStyle { $0.sourceFontSize = v } }
         )
     }
 }

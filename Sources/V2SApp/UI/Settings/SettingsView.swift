@@ -15,6 +15,7 @@ struct SettingsView: View {
         .formStyle(.grouped)
         .padding(20)
         .frame(minWidth: 720, minHeight: 560)
+        .v2sTranslationHost(model: model)
     }
 
     private var generalSection: some View {
@@ -27,6 +28,7 @@ struct SettingsView: View {
                     model.toggleSession()
                 }
                 .buttonStyle(.borderedProminent)
+                .disabled(model.isSessionButtonDisabled)
 
                 Button("Show Subtitle Preview") {
                     model.showOverlayPreview()
@@ -78,6 +80,11 @@ struct SettingsView: View {
                     }
                     .tag(mode)
                 }
+            }
+
+            if model.languageResourceStatuses.isEmpty == false {
+                LanguageResourceStatusListView(statuses: model.languageResourceStatuses)
+                    .padding(.top, 4)
             }
         }
     }
@@ -232,6 +239,53 @@ struct SettingsView: View {
             Spacer()
             Text(value)
                 .foregroundStyle(.secondary)
+        }
+    }
+}
+
+struct LanguageResourceStatusListView: View {
+    let statuses: [LanguageResourceStatus]
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 10) {
+            ForEach(statuses) { status in
+                VStack(alignment: .leading, spacing: 6) {
+                    HStack(alignment: .firstTextBaseline) {
+                        Text(status.title)
+                            .font(.caption.weight(.semibold))
+                        Spacer()
+                        if let progress = status.progress, status.isError == false {
+                            Text("\(Int((progress * 100).rounded()))%")
+                                .font(.caption.monospacedDigit())
+                                .foregroundStyle(.secondary)
+                        }
+                    }
+
+                    if status.isError {
+                        Text(status.detail)
+                            .font(.caption)
+                            .foregroundStyle(.red)
+                    } else if let progress = status.progress {
+                        ProgressView(value: progress)
+                            .progressViewStyle(.linear)
+                            .controlSize(.small)
+                            .frame(maxWidth: .infinity)
+                        Text(status.detail)
+                            .font(.caption)
+                            .foregroundStyle(.secondary)
+                    } else {
+                        ProgressView()
+                            .progressViewStyle(.linear)
+                            .controlSize(.small)
+                            .frame(maxWidth: .infinity)
+                        Text(status.detail)
+                            .font(.caption)
+                            .foregroundStyle(.secondary)
+                    }
+                }
+                .padding(10)
+                .background(.quinary, in: RoundedRectangle(cornerRadius: 8))
+            }
         }
     }
 }

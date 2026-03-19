@@ -1,5 +1,6 @@
 import Combine
 import Foundation
+import Speech
 import SwiftUI
 import Translation
 
@@ -7,7 +8,7 @@ import Translation
 final class AppModel: ObservableObject {
     private let settingsStore: SettingsStore
     private let sourceCatalogService: SourceCatalogService
-    private let translationService = LiveTranslationService()
+    private let translationCoordinator = TranslationCoordinator()
     private let glossaryService = GlossaryService()
     private let entityCache = EntityCache()
     private let speedMonitor = SpeedMonitor()
@@ -21,6 +22,7 @@ final class AppModel: ObservableObject {
     private var isBootstrapping = true
     private var fadeTask: Task<Void, Never>?
     private var draftTranslationTask: Task<Void, Never>?
+    private var languageResourcePreparationTask: Task<Void, Never>?
     private var lastDraftStablePrefix = ""
     private var lastDraftTranslationSource = ""
     private var draftTranslationGeneration: Int = 0
@@ -29,12 +31,15 @@ final class AppModel: ObservableObject {
     // Revision tracking: captionID → (committedTranslation, committedAt, revisionCount)
     private var translationRevisions: [UUID: (text: String, committedAt: Date, count: Int)] = [:]
     private var recentRecognizedCaptionTexts: [(text: String, time: Date)] = []
+    var onTranslationPreparationUIRequested: (() -> Void)?
 
     @Published private(set) var applicationSources: [InputSource] = []
     @Published private(set) var microphoneSources: [InputSource] = []
     @Published private(set) var sessionState: SessionState = .idle
     @Published private(set) var statusMessage = "Ready"
     @Published private(set) var overlayState: OverlayPreviewState?
+    @Published private(set) var languageResourceStatuses: [LanguageResourceStatus] = []
+    @Published private(set) var translationHostConfiguration: TranslationSession.Configuration?
     @Published var isOverlayVisible = false
 
     @Published var selectedSourceID: String? {
@@ -48,6 +53,7 @@ final class AppModel: ObservableObject {
         didSet {
             persistSettings()
             syncOverlayPreviewIfNeeded()
+            scheduleSelectedLanguageResourcePreparation()
         }
     }
 
@@ -55,7 +61,7 @@ final class AppModel: ObservableObject {
         didSet {
             persistSettings()
             syncOverlayPreviewIfNeeded()
-            refreshCaptionTranslations()
+            scheduleSelectedLanguageResourcePreparation(refreshTranslations: liveTranscriptionSession != nil)
         }
     }
 
@@ -91,9 +97,15 @@ final class AppModel: ObservableObject {
         self.overlayStyle = settings.overlayStyle
         self.subtitleMode = settings.subtitleMode
         self.glossary = settings.glossary
+        self.translationHostConfiguration = nil
+
+        translationCoordinator.onConfigurationChange = { [weak self] configuration in
+            self?.translationHostConfiguration = configuration
+        }
 
         isBootstrapping = false
         refreshSources()
+        scheduleSelectedLanguageResourcePreparation()
     }
 
     convenience init() {
@@ -113,6 +125,14 @@ final class AppModel: ObservableObject {
 
     var sessionButtonTitle: String {
         sessionState == .running ? "Stop" : "Start"
+    }
+
+    var isSessionButtonDisabled: Bool {
+        if sessionState == .running {
+            return false
+        }
+
+        return selectedSource == nil || isPreparingSelectedLanguageResources
     }
 
     var sessionBadgeText: String {
@@ -162,6 +182,8 @@ final class AppModel: ObservableObject {
             sourceText: "Waiting for audio from \(selectedSource.name)…",
             sourceName: selectedSource.name
         )
+        statusMessage = "Checking language resources..."
+        await awaitSelectedLanguageResourcePreparationIfNeeded()
         statusMessage = "Preparing \(selectedSource.name)…"
 
         let session = LiveTranscriptionSession()
@@ -278,6 +300,404 @@ final class AppModel: ObservableObject {
         LanguageCatalog.displayName(for: identifier)
     }
 
+    @available(macOS 15.0, *)
+    func runTranslationHost(using session: TranslationSession) async {
+        await translationCoordinator.run(using: session)
+    }
+
+    private func scheduleSelectedLanguageResourcePreparation(refreshTranslations: Bool = false) {
+        guard isBootstrapping == false else {
+            return
+        }
+
+        let inputLanguageID = self.inputLanguageID
+        let outputLanguageID = self.outputLanguageID
+
+        languageResourcePreparationTask?.cancel()
+        languageResourceStatuses = []
+
+        languageResourcePreparationTask = Task { @MainActor [weak self] in
+            guard let self else {
+                return
+            }
+
+            defer { self.languageResourcePreparationTask = nil }
+
+            await self.prepareSelectedLanguageResources(
+                inputLanguageID: inputLanguageID,
+                outputLanguageID: outputLanguageID
+            )
+
+            guard Task.isCancelled == false, refreshTranslations else {
+                return
+            }
+
+            self.refreshCaptionTranslations()
+        }
+    }
+
+    private func awaitSelectedLanguageResourcePreparationIfNeeded() async {
+        if languageResourcePreparationTask == nil {
+            scheduleSelectedLanguageResourcePreparation()
+        }
+
+        await languageResourcePreparationTask?.value
+    }
+
+    private var isPreparingSelectedLanguageResources: Bool {
+        languageResourcePreparationTask != nil
+            || languageResourceStatuses.contains(where: { $0.isError == false })
+    }
+
+    private func prepareSelectedLanguageResources(
+        inputLanguageID: String,
+        outputLanguageID: String
+    ) async {
+        await withTaskGroup(of: Void.self) { group in
+            group.addTask { [weak self] in
+                await self?.prepareSpeechRecognitionResourceIfNeeded(for: inputLanguageID)
+            }
+
+            if inputLanguageID != outputLanguageID {
+                group.addTask { [weak self] in
+                    await self?.prepareTranslationResourceIfNeeded(
+                        from: inputLanguageID,
+                        to: outputLanguageID
+                    )
+                }
+            }
+        }
+    }
+
+    private func prepareSpeechRecognitionResourceIfNeeded(for languageID: String) async {
+        guard #available(macOS 26.0, *) else {
+            return
+        }
+
+        let title = "Speech · \(languageName(for: languageID))"
+        let statusID = "speech:\(languageID)"
+        let requestedLocale = Locale(identifier: LanguageCatalog.speechLocaleIdentifier(for: languageID))
+
+        guard let resolvedLocale = await SpeechTranscriber.supportedLocale(equivalentTo: requestedLocale) else {
+            upsertLanguageResourceStatus(
+                LanguageResourceStatus(
+                    id: statusID,
+                    kind: .speech,
+                    title: title,
+                    detail: "Speech recognition is not available for this language on this macOS version.",
+                    progress: nil,
+                    isError: true
+                )
+            )
+            return
+        }
+
+        let transcriber = makeSpeechTranscriber(locale: resolvedLocale)
+
+        do {
+            try await ensureSpeechAssetsReady(
+                for: [transcriber],
+                statusID: statusID,
+                title: title
+            )
+            removeLanguageResourceStatus(id: statusID)
+        } catch is CancellationError {
+            removeLanguageResourceStatus(id: statusID)
+        } catch {
+            upsertLanguageResourceStatus(
+                LanguageResourceStatus(
+                    id: statusID,
+                    kind: .speech,
+                    title: title,
+                    detail: error.localizedDescription,
+                    progress: nil,
+                    isError: true
+                )
+            )
+        }
+    }
+
+    @available(macOS 26.0, *)
+    private func ensureSpeechAssetsReady(
+        for modules: [any SpeechModule],
+        statusID: String,
+        title: String
+    ) async throws {
+        let detail = "Downloading on-device speech recognition resources..."
+
+        while true {
+            try Task.checkCancellation()
+
+            switch await AssetInventory.status(forModules: modules) {
+            case .installed:
+                return
+            case .unsupported:
+                throw LanguageResourcePreparationError.unsupportedSpeechLanguage
+            case .supported:
+                if let request = try await AssetInventory.assetInstallationRequest(supporting: modules) {
+                    try await installSpeechAssets(
+                        request,
+                        statusID: statusID,
+                        title: title,
+                        detail: detail
+                    )
+                    return
+                }
+
+                upsertLanguageResourceStatus(
+                    LanguageResourceStatus(
+                        id: statusID,
+                        kind: .speech,
+                        title: title,
+                        detail: detail,
+                        progress: nil,
+                        isError: false
+                    )
+                )
+            case .downloading:
+                upsertLanguageResourceStatus(
+                    LanguageResourceStatus(
+                        id: statusID,
+                        kind: .speech,
+                        title: title,
+                        detail: detail,
+                        progress: nil,
+                        isError: false
+                    )
+                )
+            @unknown default:
+                upsertLanguageResourceStatus(
+                    LanguageResourceStatus(
+                        id: statusID,
+                        kind: .speech,
+                        title: title,
+                        detail: detail,
+                        progress: nil,
+                        isError: false
+                    )
+                )
+            }
+
+            try await Task.sleep(nanoseconds: 200_000_000)
+        }
+    }
+
+    @available(macOS 26.0, *)
+    private func installSpeechAssets(
+        _ request: AssetInstallationRequest,
+        statusID: String,
+        title: String,
+        detail: String
+    ) async throws {
+        let progressTask = Task { @MainActor [weak self] in
+            guard let self else {
+                return
+            }
+
+            while Task.isCancelled == false {
+                let progress = normalizedProgressValue(request.progress.fractionCompleted)
+                self.upsertLanguageResourceStatus(
+                    LanguageResourceStatus(
+                        id: statusID,
+                        kind: .speech,
+                        title: title,
+                        detail: detail,
+                        progress: progress,
+                        isError: false
+                    )
+                )
+
+                do {
+                    try await Task.sleep(nanoseconds: 120_000_000)
+                } catch {
+                    return
+                }
+            }
+        }
+
+        defer { progressTask.cancel() }
+
+        try await request.downloadAndInstall()
+    }
+
+    private func prepareTranslationResourceIfNeeded(from sourceLanguageID: String, to targetLanguageID: String) async {
+        let title = "Translation · \(languageName(for: sourceLanguageID)) → \(languageName(for: targetLanguageID))"
+        let statusID = "translation:\(sourceLanguageID)->\(targetLanguageID)"
+        let downloadingDetail = "Downloading on-device translation resources..."
+        let waitingDetail = "Waiting for translation resources to finish installing..."
+        var didRequestPreparationUI = false
+
+        while Task.isCancelled == false {
+            let availabilityStatus = await translationAvailabilityStatus(
+                from: sourceLanguageID,
+                to: targetLanguageID
+            )
+
+            switch availabilityStatus {
+            case .unsupported:
+                upsertLanguageResourceStatus(
+                    LanguageResourceStatus(
+                        id: statusID,
+                        kind: .translation,
+                        title: title,
+                        detail: "Translation is not supported for this language pair on this macOS version.",
+                        progress: nil,
+                        isError: true
+                    )
+                )
+                return
+            case .supported, .installed:
+                upsertLanguageResourceStatus(
+                    LanguageResourceStatus(
+                        id: statusID,
+                        kind: .translation,
+                        title: title,
+                        detail: availabilityStatus == .supported ? downloadingDetail : waitingDetail,
+                        progress: nil,
+                        isError: false
+                    )
+                )
+
+                do {
+                    if didRequestPreparationUI == false {
+                        didRequestPreparationUI = true
+                        onTranslationPreparationUIRequested?()
+                    }
+                    try await translationCoordinator.prepareIfNeeded(from: sourceLanguageID, to: targetLanguageID)
+                    removeLanguageResourceStatus(id: statusID)
+                    return
+                } catch is CancellationError {
+                    removeLanguageResourceStatus(id: statusID)
+                    return
+                } catch {
+                    if let serviceError = error as? TranslationCoordinator.ServiceError {
+                        upsertLanguageResourceStatus(
+                            LanguageResourceStatus(
+                                id: statusID,
+                                kind: .translation,
+                                title: title,
+                                detail: serviceError.localizedDescription,
+                                progress: nil,
+                                isError: true
+                            )
+                        )
+                        return
+                    }
+
+                    let refreshedStatus = await translationAvailabilityStatus(
+                        from: sourceLanguageID,
+                        to: targetLanguageID
+                    )
+
+                    if refreshedStatus == .supported || refreshedStatus == .installed {
+                        upsertLanguageResourceStatus(
+                            LanguageResourceStatus(
+                                id: statusID,
+                                kind: .translation,
+                                title: title,
+                                detail: waitingDetail,
+                                progress: nil,
+                                isError: false
+                            )
+                        )
+
+                        do {
+                            try await Task.sleep(nanoseconds: 800_000_000)
+                        } catch {
+                            removeLanguageResourceStatus(id: statusID)
+                            return
+                        }
+
+                        continue
+                    }
+
+                    upsertLanguageResourceStatus(
+                        LanguageResourceStatus(
+                            id: statusID,
+                            kind: .translation,
+                            title: title,
+                            detail: error.localizedDescription,
+                            progress: nil,
+                            isError: true
+                        )
+                    )
+                    return
+                }
+            @unknown default:
+                upsertLanguageResourceStatus(
+                    LanguageResourceStatus(
+                        id: statusID,
+                        kind: .translation,
+                        title: title,
+                        detail: waitingDetail,
+                        progress: nil,
+                        isError: false
+                    )
+                )
+
+                do {
+                    try await Task.sleep(nanoseconds: 800_000_000)
+                } catch {
+                    removeLanguageResourceStatus(id: statusID)
+                    return
+                }
+            }
+        }
+
+        removeLanguageResourceStatus(id: statusID)
+    }
+
+    @available(macOS 26.0, *)
+    private func makeSpeechTranscriber(locale: Locale) -> SpeechTranscriber {
+        SpeechTranscriber(
+            locale: locale,
+            transcriptionOptions: [.etiquetteReplacements],
+            reportingOptions: [.volatileResults, .fastResults],
+            attributeOptions: [.audioTimeRange, .transcriptionConfidence]
+        )
+    }
+
+    private func normalizedProgressValue(_ fractionCompleted: Double) -> Double? {
+        guard fractionCompleted.isFinite, fractionCompleted >= 0 else {
+            return nil
+        }
+
+        return min(max(fractionCompleted, 0), 1)
+    }
+
+    private func translationAvailabilityStatus(
+        from sourceLanguageID: String,
+        to targetLanguageID: String
+    ) async -> LanguageAvailability.Status {
+        guard #available(macOS 15.0, *) else {
+            return .unsupported
+        }
+
+        let sourceLanguage = Locale.Language(identifier: sourceLanguageID)
+        let targetLanguage = Locale.Language(identifier: targetLanguageID)
+        let availability = LanguageAvailability()
+        return await availability.status(from: sourceLanguage, to: targetLanguage)
+    }
+
+    private func upsertLanguageResourceStatus(_ status: LanguageResourceStatus) {
+        if let existingIndex = languageResourceStatuses.firstIndex(where: { $0.id == status.id }) {
+            languageResourceStatuses[existingIndex] = status
+        } else {
+            languageResourceStatuses.append(status)
+        }
+
+        languageResourceStatuses.sort { lhs, rhs in
+            if lhs.kind.rawValue == rhs.kind.rawValue {
+                return lhs.title < rhs.title
+            }
+            return lhs.kind.rawValue < rhs.kind.rawValue
+        }
+    }
+
+    private func removeLanguageResourceStatus(id: String) {
+        languageResourceStatuses.removeAll { $0.id == id }
+    }
+
     // MARK: - Draft handler
 
     private func handlePartialDraft(_ draft: DraftSegment?) {
@@ -322,8 +742,8 @@ final class AppModel: ObservableObject {
             }
 
             let translated = await withTaskGroup(of: String?.self, returning: String?.self) { group in
-                group.addTask { [translationService = self.translationService] in
-                    try? await translationService.translate(text, from: sourceID, to: targetID)
+                group.addTask {
+                    try? await self.translationCoordinator.translate(text, from: sourceID, to: targetID)
                 }
                 // Draft translation should feel live; drop stale work quickly.
                 group.addTask {
@@ -583,8 +1003,9 @@ final class AppModel: ObservableObject {
         displayedCaptionLastVisualUpdateAt = Date.distantPast
         displayedCaptionLastVisualUpdateWasLateTranslation = false
 
+        translationCoordinator.reset()
+
         Task {
-            await translationService.reset()
             await entityCache.reset()
             await speedMonitor.reset()
         }
@@ -754,9 +1175,9 @@ final class AppModel: ObservableObject {
         }
 
         let raw = await withTaskGroup(of: String.self, returning: String.self) { group in
-            group.addTask { [translationService] in
+            group.addTask {
                 do {
-                    return try await translationService.translate(
+                    return try await self.translationCoordinator.translate(
                         caption.sourceText,
                         from: sourceLanguageID,
                         to: targetLanguageID
@@ -870,14 +1291,22 @@ final class AppModel: ObservableObject {
         switch languageID {
         case "zh-Hans":
             return "欢迎使用 v2s，顶部字幕条已经准备好了。"
-        case "ja":
-            return "v2s へようこそ。字幕バーの準備ができました。"
-        case "ko":
-            return "v2s에 오신 것을 환영합니다. 자막 바가 준비되었습니다."
-        case "fr":
-            return "Bienvenue dans v2s. La barre de sous-titres est prete."
+        case "es":
+            return "Bienvenido a v2s. La barra de subtitulos ya esta lista."
         case "de":
             return "Willkommen bei v2s. Die Untertitel-Leiste ist bereit."
+        case "ja":
+            return "v2s へようこそ。字幕バーの準備ができました。"
+        case "fr":
+            return "Bienvenue dans v2s. La barre de sous-titres est prete."
+        case "ko":
+            return "v2s에 오신 것을 환영합니다. 자막 바가 준비되었습니다."
+        case "ar":
+            return "مرحبا بك في v2s. شريط الترجمة جاهز."
+        case "pt":
+            return "Bem-vindo ao v2s. A barra de legendas esta pronta."
+        case "ru":
+            return "Добро пожаловать в v2s. Строка субтитров готова."
         default:
             return "Welcome to v2s. The subtitle bar is ready."
         }
@@ -891,10 +1320,55 @@ private struct QueuedCaption: Identifiable, Equatable {
     let sourceName: String
 }
 
-private actor LiveTranslationService {
+private enum LanguageResourcePreparationError: LocalizedError {
+    case unsupportedSpeechLanguage
+
+    var errorDescription: String? {
+        switch self {
+        case .unsupportedSpeechLanguage:
+            return "Speech recognition resources are not supported for this language on this macOS version."
+        }
+    }
+}
+
+struct LanguageResourceStatus: Identifiable, Equatable {
+    enum Kind: Int {
+        case speech = 0
+        case translation = 1
+    }
+
+    let id: String
+    let kind: Kind
+    let title: String
+    let detail: String
+    let progress: Double?
+    let isError: Bool
+}
+
+@MainActor
+private final class TranslationCoordinator: ObservableObject {
     private struct LanguagePair: Equatable {
         let source: String
         let target: String
+    }
+
+    private enum PendingOperation {
+        case prepare(id: UUID, pair: LanguagePair, continuation: CheckedContinuation<Void, Error>)
+        case translate(id: UUID, pair: LanguagePair, text: String, continuation: CheckedContinuation<String, Error>)
+
+        var id: UUID {
+            switch self {
+            case .prepare(let id, _, _), .translate(let id, _, _, _):
+                return id
+            }
+        }
+
+        var pair: LanguagePair {
+            switch self {
+            case .prepare(_, let pair, _), .translate(_, let pair, _, _):
+                return pair
+            }
+        }
     }
 
     enum ServiceError: LocalizedError {
@@ -904,15 +1378,59 @@ private actor LiveTranslationService {
         var errorDescription: String? {
             switch self {
             case .unavailableOnSystem:
-                return "Translation requires macOS 26 or newer."
+                return "Translation requires macOS 15 or newer."
             case .unsupportedPair(let source, let target):
                 return "Translation is not supported from \(source) to \(target)."
             }
         }
     }
 
-    private var preparedPair: LanguagePair?
-    private var sessionStorage: AnyObject?
+    var onConfigurationChange: ((TranslationSession.Configuration?) -> Void)?
+
+    private(set) var configuration: TranslationSession.Configuration? {
+        didSet {
+            onConfigurationChange?(configuration)
+        }
+    }
+
+    private var currentPair: LanguagePair?
+    private var pendingOperations: [PendingOperation] = []
+    private var activeRunnerID: UUID?
+    private var activeOperationID: UUID?
+    private var cancelledOperationIDs: Set<UUID> = []
+
+    func prepareIfNeeded(
+        from sourceIdentifier: String,
+        to targetIdentifier: String
+    ) async throws {
+        guard sourceIdentifier != targetIdentifier else {
+            return
+        }
+
+        let pair = LanguagePair(source: sourceIdentifier, target: targetIdentifier)
+        let status = try await availabilityStatus(for: pair)
+
+        guard status != .installed else {
+            return
+        }
+
+        let operationID = UUID()
+        try await withTaskCancellationHandler {
+            try await withCheckedThrowingContinuation { continuation in
+                enqueue(
+                    .prepare(
+                        id: operationID,
+                        pair: pair,
+                        continuation: continuation
+                    )
+                )
+            }
+        } onCancel: {
+            Task { @MainActor in
+                self.cancelOperation(id: operationID)
+            }
+        }
+    }
 
     func translate(_ text: String, from sourceIdentifier: String, to targetIdentifier: String) async throws -> String {
         let trimmedText = text.trimmingCharacters(in: .whitespacesAndNewlines)
@@ -924,44 +1442,249 @@ private actor LiveTranslationService {
             return trimmedText
         }
 
-        guard #available(macOS 26.0, *) else {
+        let pair = LanguagePair(source: sourceIdentifier, target: targetIdentifier)
+        _ = try await availabilityStatus(for: pair)
+
+        let operationID = UUID()
+        return try await withTaskCancellationHandler {
+            try await withCheckedThrowingContinuation { continuation in
+                enqueue(
+                    .translate(
+                        id: operationID,
+                        pair: pair,
+                        text: trimmedText,
+                        continuation: continuation
+                    )
+                )
+            }
+        } onCancel: {
+            Task { @MainActor in
+                self.cancelOperation(id: operationID)
+            }
+        }
+    }
+
+    @available(macOS 15.0, *)
+    func run(using session: TranslationSession) async {
+        let runnerID = UUID()
+
+        while Task.isCancelled == false {
+            if activeRunnerID == nil {
+                activeRunnerID = runnerID
+                break
+            }
+
+            if activeRunnerID == runnerID {
+                break
+            }
+
+            do {
+                try await Task.sleep(nanoseconds: 50_000_000)
+            } catch {
+                return
+            }
+        }
+
+        guard Task.isCancelled == false else {
+            return
+        }
+
+        defer {
+            if activeRunnerID == runnerID {
+                activeRunnerID = nil
+            }
+        }
+
+        guard let anchoredPair = currentPair else {
+            return
+        }
+
+        while Task.isCancelled == false {
+            guard let operation = await nextOperation(for: anchoredPair) else {
+                return
+            }
+
+            activeOperationID = operation.id
+
+            switch operation {
+            case .prepare(let id, _, let continuation):
+                do {
+                    try await session.prepareTranslation()
+                    finishOperation(id: id, continuation: continuation)
+                } catch {
+                    finishOperation(id: id, continuation: continuation, error: error)
+                }
+
+            case .translate(let id, _, let text, let continuation):
+                do {
+                    let response = try await session.translate(text)
+                    let translatedText = response.targetText.trimmingCharacters(in: .whitespacesAndNewlines)
+                    finishOperation(
+                        id: id,
+                        continuation: continuation,
+                        result: translatedText.isEmpty ? text : translatedText
+                    )
+                } catch {
+                    finishOperation(id: id, continuation: continuation, error: error)
+                }
+            }
+        }
+    }
+
+    func reset() {
+        for operation in pendingOperations {
+            switch operation {
+            case .prepare(_, _, let continuation):
+                continuation.resume(throwing: CancellationError())
+            case .translate(_, _, _, let continuation):
+                continuation.resume(throwing: CancellationError())
+            }
+        }
+
+        pendingOperations.removeAll()
+        activeRunnerID = nil
+        activeOperationID = nil
+        cancelledOperationIDs.removeAll()
+        currentPair = nil
+        configuration = nil
+    }
+
+    private func enqueue(_ operation: PendingOperation) {
+        activate(pair: operation.pair)
+        pendingOperations.append(operation)
+    }
+
+    private func activate(pair: LanguagePair) {
+        if currentPair != pair {
+            cancelPendingOperations(except: pair)
+            currentPair = pair
+            configuration = TranslationSession.Configuration(
+                source: Locale.Language(identifier: pair.source),
+                target: Locale.Language(identifier: pair.target)
+            )
+        } else if configuration == nil {
+            configuration = TranslationSession.Configuration(
+                source: Locale.Language(identifier: pair.source),
+                target: Locale.Language(identifier: pair.target)
+            )
+        }
+    }
+
+    private func cancelPendingOperations(except pair: LanguagePair) {
+        let survivors = pendingOperations.filter { $0.pair == pair }
+        let cancelled = pendingOperations.filter { $0.pair != pair }
+        pendingOperations = survivors
+
+        for operation in cancelled {
+            switch operation {
+            case .prepare(_, _, let continuation):
+                continuation.resume(throwing: CancellationError())
+            case .translate(_, _, _, let continuation):
+                continuation.resume(throwing: CancellationError())
+            }
+        }
+    }
+
+    private func cancelOperation(id: UUID) {
+        if let index = pendingOperations.firstIndex(where: { $0.id == id }) {
+            let operation = pendingOperations.remove(at: index)
+            switch operation {
+            case .prepare(_, _, let continuation):
+                continuation.resume(throwing: CancellationError())
+            case .translate(_, _, _, let continuation):
+                continuation.resume(throwing: CancellationError())
+            }
+            return
+        }
+
+        if activeOperationID == id {
+            cancelledOperationIDs.insert(id)
+        }
+    }
+
+    @available(macOS 15.0, *)
+    private func nextOperation(for pair: LanguagePair) async -> PendingOperation? {
+        while Task.isCancelled == false {
+            if let index = pendingOperations.firstIndex(where: { $0.pair == pair }) {
+                return pendingOperations.remove(at: index)
+            }
+
+            do {
+                try await Task.sleep(nanoseconds: 50_000_000)
+            } catch {
+                return nil
+            }
+        }
+
+        return nil
+    }
+
+    private func finishOperation(
+        id: UUID,
+        continuation: CheckedContinuation<Void, Error>,
+        error: Error? = nil
+    ) {
+        activeOperationID = nil
+
+        if cancelledOperationIDs.remove(id) != nil {
+            continuation.resume(throwing: CancellationError())
+            return
+        }
+
+        if let error {
+            continuation.resume(throwing: error)
+        } else {
+            continuation.resume()
+        }
+    }
+
+    private func finishOperation(
+        id: UUID,
+        continuation: CheckedContinuation<String, Error>,
+        result: String? = nil,
+        error: Error? = nil
+    ) {
+        activeOperationID = nil
+
+        if cancelledOperationIDs.remove(id) != nil {
+            continuation.resume(throwing: CancellationError())
+            return
+        }
+
+        if let error {
+            continuation.resume(throwing: error)
+        } else {
+            continuation.resume(returning: result ?? "")
+        }
+    }
+
+    private func availabilityStatus(for pair: LanguagePair) async throws -> LanguageAvailability.Status {
+        guard #available(macOS 15.0, *) else {
             throw ServiceError.unavailableOnSystem
         }
 
-        let sourceLanguage = Locale.Language(identifier: sourceIdentifier)
-        let targetLanguage = Locale.Language(identifier: targetIdentifier)
+        let sourceLanguage = Locale.Language(identifier: pair.source)
+        let targetLanguage = Locale.Language(identifier: pair.target)
         let availability = LanguageAvailability()
         let availabilityStatus = await availability.status(from: sourceLanguage, to: targetLanguage)
 
         guard availabilityStatus != .unsupported else {
-            throw ServiceError.unsupportedPair(sourceIdentifier, targetIdentifier)
+            throw ServiceError.unsupportedPair(pair.source, pair.target)
         }
 
-        let requestedPair = LanguagePair(source: sourceIdentifier, target: targetIdentifier)
-        let session: TranslationSession
-
-        if let cachedSession = sessionStorage as? TranslationSession,
-           preparedPair == requestedPair {
-            session = cachedSession
-        } else {
-            let newSession = TranslationSession(installedSource: sourceLanguage, target: targetLanguage)
-            try await newSession.prepareTranslation()
-            sessionStorage = newSession
-            preparedPair = requestedPair
-            session = newSession
-        }
-
-        let response = try await session.translate(trimmedText)
-        let translatedText = response.targetText.trimmingCharacters(in: .whitespacesAndNewlines)
-        return translatedText.isEmpty ? trimmedText : translatedText
+        return availabilityStatus
     }
+}
 
-    func reset() {
-        if #available(macOS 26.0, *) {
-            (sessionStorage as? TranslationSession)?.cancel()
+extension View {
+    @ViewBuilder
+    func v2sTranslationHost(model: AppModel) -> some View {
+        if #available(macOS 15.0, *) {
+            self.translationTask(model.translationHostConfiguration) { session in
+                await model.runTranslationHost(using: session)
+            }
+        } else {
+            self
         }
-
-        sessionStorage = nil
-        preparedPair = nil
     }
 }
