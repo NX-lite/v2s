@@ -3,6 +3,7 @@ import AppKit
 @MainActor
 final class AppDelegate: NSObject, NSApplicationDelegate {
     private let appModel = AppModel()
+    private let dockVisibilityController = DockVisibilityController()
     private var statusBarController: StatusBarController?
     private var settingsWindowController: SettingsWindowController?
     private var overlayWindowController: OverlayWindowController?
@@ -11,9 +12,14 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     func applicationDidFinishLaunching(_ notification: Notification) {
         NSApp.setActivationPolicy(.accessory)
 
-        let settingsWindowController = SettingsWindowController(model: appModel)
+        let settingsWindowController = SettingsWindowController(
+            model: appModel,
+            dockVisibilityController: dockVisibilityController
+        )
         let overlayWindowController = OverlayWindowController(model: appModel)
-        let statusBarController = StatusBarController(model: appModel) { [weak settingsWindowController] in
+        let statusBarController = StatusBarController(
+            model: appModel
+        ) { [weak settingsWindowController] in
             settingsWindowController?.showSettings()
         } quitApp: {
             NSApp.terminate(nil)

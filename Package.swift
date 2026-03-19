@@ -18,6 +18,7 @@ let package = Package(
             ],
             path: "Sources/V2SApp",
             resources: [
+                .copy("Resources/AppIcon/AppIcon-512.png"),
                 .copy("Resources/silero_vad.onnx"),
             ]
         ),

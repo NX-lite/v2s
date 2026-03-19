@@ -132,6 +132,10 @@ final class AppModel: ObservableObject {
         return isSessionButtonDisabled ? "Wait" : "Start"
     }
 
+    var showsSessionWaitIndicator: Bool {
+        sessionState != .running && isPreparingSelectedLanguageResources
+    }
+
     var isSessionButtonDisabled: Bool {
         if sessionState == .running {
             return false

@@ -7,6 +7,8 @@
 	objects = {
 
 /* Begin PBXBuildFile section */
+		A00000000000000000000071 /* DockVisibilityController.swift in Sources */ = {isa = PBXBuildFile; fileRef = A00000000000000000000073 /* DockVisibilityController.swift */; };
+		A00000000000000000000072 /* SessionActionButtonLabel.swift in Sources */ = {isa = PBXBuildFile; fileRef = A00000000000000000000074 /* SessionActionButtonLabel.swift */; };
 		A00000000000000000000062 /* Assets.xcassets in Resources */ = {isa = PBXBuildFile; fileRef = A00000000000000000000070 /* Assets.xcassets */; };
 		A00000000000000000000050 /* AppDelegate.swift in Sources */ = {isa = PBXBuildFile; fileRef = A00000000000000000000030 /* AppDelegate.swift */; };
 		A00000000000000000000051 /* AppModel.swift in Sources */ = {isa = PBXBuildFile; fileRef = A00000000000000000000031 /* AppModel.swift */; };
@@ -36,6 +38,8 @@
 
 /* Begin PBXFileReference section */
 		A00000000000000000000070 /* Assets.xcassets */ = {isa = PBXFileReference; lastKnownFileType = folder.assetcatalog; path = Assets.xcassets; sourceTree = "<group>"; };
+		A00000000000000000000073 /* DockVisibilityController.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = DockVisibilityController.swift; sourceTree = "<group>"; };
+		A00000000000000000000074 /* SessionActionButtonLabel.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = SessionActionButtonLabel.swift; sourceTree = "<group>"; };
 		A0000000000000000000000A /* v2s.app */ = {isa = PBXFileReference; explicitFileType = wrapper.application; includeInIndex = 0; path = v2s.app; sourceTree = BUILT_PRODUCTS_DIR; };
 		A00000000000000000000015 /* Info.plist */ = {isa = PBXFileReference; lastKnownFileType = text.plist.xml; path = Info.plist; sourceTree = "<group>"; };
 		A00000000000000000000030 /* AppDelegate.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = AppDelegate.swift; sourceTree = "<group>"; };
@@ -117,6 +121,7 @@
 			children = (
 				A00000000000000000000030 /* AppDelegate.swift */,
 				A00000000000000000000031 /* AppModel.swift */,
+				A00000000000000000000073 /* DockVisibilityController.swift */,
 				A00000000000000000000032 /* V2SApp.swift */,
 			);
 			path = App;
@@ -155,10 +160,19 @@
 			isa = PBXGroup;
 			children = (
 				A00000000000000000000011 /* Overlay */,
+				A00000000000000000000075 /* Shared */,
 				A00000000000000000000012 /* Settings */,
 				A00000000000000000000013 /* StatusBar */,
 			);
 			path = UI;
+			sourceTree = "<group>";
+		};
+		A00000000000000000000075 /* Shared */ = {
+			isa = PBXGroup;
+			children = (
+				A00000000000000000000074 /* SessionActionButtonLabel.swift */,
+			);
+			path = Shared;
 			sourceTree = "<group>";
 		};
 		A00000000000000000000011 /* Overlay */ = {
@@ -265,6 +279,8 @@
 			isa = PBXSourcesBuildPhase;
 			buildActionMask = 2147483647;
 			files = (
+				A00000000000000000000071 /* DockVisibilityController.swift in Sources */,
+				A00000000000000000000072 /* SessionActionButtonLabel.swift in Sources */,
 				A00000000000000000000050 /* AppDelegate.swift in Sources */,
 				A00000000000000000000051 /* AppModel.swift in Sources */,
 				A00000000000000000000052 /* V2SApp.swift in Sources */,

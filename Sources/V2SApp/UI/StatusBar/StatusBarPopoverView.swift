@@ -40,7 +40,12 @@ struct StatusBarPopoverView: View {
                     .padding(.vertical, 6)
                     .background(.quaternary, in: Capsule())
             }
-            Button(model.sessionButtonTitle) { model.toggleSession() }
+            Button { model.toggleSession() } label: {
+                SessionActionButtonLabel(
+                    title: model.sessionButtonTitle,
+                    showsActivity: model.showsSessionWaitIndicator
+                )
+            }
                 .buttonStyle(.borderedProminent)
                 .disabled(model.isSessionButtonDisabled)
         }

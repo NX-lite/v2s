@@ -13,7 +13,11 @@ final class StatusBarController: NSObject, NSPopoverDelegate {
     private var localMouseMonitor: Any?
     private var globalMouseMonitor: Any?
 
-    init(model: AppModel, openSettings: @escaping () -> Void, quitApp: @escaping () -> Void) {
+    init(
+        model: AppModel,
+        openSettings: @escaping () -> Void,
+        quitApp: @escaping () -> Void
+    ) {
         self.model = model
         self.openSettings = openSettings
         self.quitApp = quitApp

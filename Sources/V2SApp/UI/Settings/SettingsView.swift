@@ -4,6 +4,7 @@ import SwiftUI
 struct SettingsView: View {
     @ObservedObject var model: AppModel
     let closeSettings: () -> Void
+    let openSubtitleModeInfo: () -> Void
 
     var body: some View {
         Form {
@@ -25,12 +26,17 @@ struct SettingsView: View {
             row(title: "Status", value: model.statusMessage)
 
             HStack {
-                Button(model.sessionButtonTitle) {
+                Button {
                     let shouldCloseSettings = model.sessionState != .running
                     model.toggleSession()
                     if shouldCloseSettings {
                         closeSettings()
                     }
+                } label: {
+                    SessionActionButtonLabel(
+                        title: model.sessionButtonTitle,
+                        showsActivity: model.showsSessionWaitIndicator
+                    )
                 }
                 .buttonStyle(.borderedProminent)
                 .disabled(model.isSessionButtonDisabled)
@@ -77,14 +83,29 @@ struct SettingsView: View {
                 }
             }
 
-            Picker("Subtitle Mode", selection: subtitleModeBinding) {
-                ForEach(SubtitleMode.allCases, id: \.self) { mode in
-                    VStack(alignment: .leading) {
-                        Text(mode.displayName)
-                        Text(mode.detail).font(.caption).foregroundStyle(.secondary)
+            HStack {
+                HStack(spacing: 6) {
+                    Text("Subtitle Mode")
+                    Button(action: openSubtitleModeInfo) {
+                        Image(systemName: "info.circle")
+                            .foregroundStyle(.secondary)
                     }
-                    .tag(mode)
+                    .buttonStyle(.plain)
+                    .help("Explain the differences between subtitle modes")
                 }
+
+                Spacer()
+
+                Picker("", selection: subtitleModeBinding) {
+                    ForEach(SubtitleMode.allCases, id: \.self) { mode in
+                        VStack(alignment: .leading) {
+                            Text(mode.displayName)
+                            Text(mode.detail).font(.caption).foregroundStyle(.secondary)
+                        }
+                        .tag(mode)
+                    }
+                }
+                .labelsHidden()
             }
 
             if model.languageResourceStatuses.isEmpty == false {
