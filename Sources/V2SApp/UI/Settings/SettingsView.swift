@@ -18,6 +18,11 @@ struct SettingsView: View {
         .padding(20)
         .frame(minWidth: 720, minHeight: 560)
         .v2sTranslationHost(model: model)
+        .onChange(of: model.sessionState) { _, newState in
+            if newState == .running {
+                closeSettings()
+            }
+        }
     }
 
     private var generalSection: some View {
@@ -27,11 +32,7 @@ struct SettingsView: View {
 
             HStack {
                 Button {
-                    let shouldCloseSettings = model.sessionState != .running
                     model.toggleSession()
-                    if shouldCloseSettings {
-                        closeSettings()
-                    }
                 } label: {
                     SessionActionButtonLabel(
                         title: model.sessionButtonTitle,
@@ -358,6 +359,10 @@ struct LanguageResourceStatusListView: View {
                             .font(.caption)
                             .foregroundStyle(.secondary)
                     } else {
+                        ProgressView()
+                            .progressViewStyle(.linear)
+                            .controlSize(.small)
+                            .frame(maxWidth: .infinity)
                         Text(status.detail)
                             .font(.caption)
                             .foregroundStyle(.secondary)

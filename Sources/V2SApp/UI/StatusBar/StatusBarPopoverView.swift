@@ -21,6 +21,12 @@ struct StatusBarPopoverView: View {
         }
         .padding(16)
         .frame(width: 380)
+        .v2sTranslationHost(model: model)
+        .onChange(of: model.sessionState) { _, newState in
+            if newState == .running {
+                closePopover()
+            }
+        }
     }
 
     // MARK: - Header
@@ -42,11 +48,7 @@ struct StatusBarPopoverView: View {
                     .background(.quaternary, in: Capsule())
             }
             Button {
-                let shouldCloseAfterStart = model.sessionState != .running
                 model.toggleSession()
-                if shouldCloseAfterStart {
-                    closePopover()
-                }
             } label: {
                 SessionActionButtonLabel(
                     title: model.sessionButtonTitle,

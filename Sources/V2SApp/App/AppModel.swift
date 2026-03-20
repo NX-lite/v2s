@@ -137,7 +137,7 @@ final class AppModel: ObservableObject {
             return "Stop"
         }
 
-        if languageResourcePreparationTask != nil {
+        if isPreparingSelectedLanguageResources {
             return "Wait"
         }
 
@@ -149,7 +149,7 @@ final class AppModel: ObservableObject {
     }
 
     var showsSessionWaitIndicator: Bool {
-        sessionState != .running && languageResourcePreparationTask != nil
+        sessionState != .running && isPreparingSelectedLanguageResources
     }
 
     var isSessionButtonDisabled: Bool {
@@ -158,7 +158,7 @@ final class AppModel: ObservableObject {
         }
 
         return selectedSource == nil
-            || languageResourcePreparationTask != nil
+            || isPreparingSelectedLanguageResources
             || hasBlockingLanguageResourceStatuses
     }
 
@@ -415,10 +415,11 @@ final class AppModel: ObservableObject {
 
     private var isPreparingSelectedLanguageResources: Bool {
         languageResourcePreparationTask != nil
+            || languageResourceStatuses.contains(where: { $0.isError == false })
     }
 
     private var hasBlockingLanguageResourceStatuses: Bool {
-        languageResourceStatuses.isEmpty == false
+        languageResourceStatuses.contains(where: \.isError)
     }
 
     private func prepareSelectedLanguageResources(
@@ -630,6 +631,9 @@ final class AppModel: ObservableObject {
         let statusID = "translation:\(sourceLanguageID)->\(targetLanguageID)"
         let downloadingDetail = "Downloading on-device translation resources..."
         let waitingDetail = "Waiting for translation resources to finish installing..."
+        let manualDownloadDetail = """
+        Automatic translation download did not complete. Open macOS System Settings > General > Language & Region > Translation Languages and download this translation language.
+        """
 
         while Task.isCancelled == false {
             let availabilityStatus = await translationAvailabilityStatus(
@@ -663,13 +667,31 @@ final class AppModel: ObservableObject {
                 )
 
                 do {
-                    try await translationCoordinator.prepareIfNeeded(from: sourceLanguageID, to: targetLanguageID)
+                    try await prepareTranslationResourceWithTimeout(
+                        from: sourceLanguageID,
+                        to: targetLanguageID
+                    )
                     removeLanguageResourceStatus(id: statusID)
                     return nil
                 } catch is CancellationError {
                     removeLanguageResourceStatus(id: statusID)
                     return nil
                 } catch {
+                    if let error = error as? LanguageResourcePreparationError,
+                       error == .translationDownloadTimedOut {
+                        upsertLanguageResourceStatus(
+                            LanguageResourceStatus(
+                                id: statusID,
+                                kind: .translation,
+                                title: title,
+                                detail: manualDownloadDetail,
+                                progress: nil,
+                                isError: true
+                            )
+                        )
+                        return .translationLanguages
+                    }
+
                     if let serviceError = error as? TranslationCoordinator.ServiceError {
                         upsertLanguageResourceStatus(
                             LanguageResourceStatus(
@@ -682,6 +704,21 @@ final class AppModel: ObservableObject {
                             )
                         )
                         return nil
+                    }
+
+                    let nsError = error as NSError
+                    if nsError.domain == "TranslationErrorDomain", nsError.code == 14 {
+                        upsertLanguageResourceStatus(
+                            LanguageResourceStatus(
+                                id: statusID,
+                                kind: .translation,
+                                title: title,
+                                detail: manualDownloadDetail,
+                                progress: nil,
+                                isError: true
+                            )
+                        )
+                        return .translationLanguages
                     }
 
                     let refreshedStatus = await translationAvailabilityStatus(
@@ -746,6 +783,29 @@ final class AppModel: ObservableObject {
 
         removeLanguageResourceStatus(id: statusID)
         return nil
+    }
+
+    private func prepareTranslationResourceWithTimeout(
+        from sourceLanguageID: String,
+        to targetLanguageID: String
+    ) async throws {
+        try await withThrowingTaskGroup(of: Void.self) { group in
+            group.addTask { [translationCoordinator] in
+                try await translationCoordinator.prepareIfNeeded(
+                    from: sourceLanguageID,
+                    to: targetLanguageID
+                )
+            }
+
+            group.addTask {
+                try await Task.sleep(nanoseconds: 30_000_000_000)
+                throw LanguageResourcePreparationError.translationDownloadTimedOut
+            }
+
+            let result: Void? = try await group.next()
+            group.cancelAll()
+            _ = result
+        }
     }
 
     @available(macOS 26.0, *)
@@ -1529,11 +1589,14 @@ private struct QueuedCaption: Identifiable, Equatable {
 
 private enum LanguageResourcePreparationError: LocalizedError {
     case unsupportedSpeechLanguage
+    case translationDownloadTimedOut
 
     var errorDescription: String? {
         switch self {
         case .unsupportedSpeechLanguage:
             return "Speech recognition resources are not supported for this language on this macOS version."
+        case .translationDownloadTimedOut:
+            return "Automatic translation resource download timed out."
         }
     }
 }
