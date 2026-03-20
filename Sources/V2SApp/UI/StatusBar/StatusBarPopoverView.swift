@@ -145,12 +145,12 @@ struct StatusBarPopoverView: View {
                 )
                 sliderRow(
                     label: "Font Size",
-                    value: translatedFontBinding, in: 16 ... 34,
+                    value: translatedFontBinding, in: 8 ... 34,
                     display: "\(Int(model.overlayStyle.translatedFontSize.rounded()))pt"
                 )
                 sliderRow(
                     label: "Source Size",
-                    value: sourceFontBinding, in: 14 ... 28,
+                    value: sourceFontBinding, in: 5 ... 28,
                     display: "\(Int(model.overlayStyle.sourceFontSize.rounded()))pt"
                 )
             }

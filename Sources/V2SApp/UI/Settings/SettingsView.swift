@@ -184,14 +184,14 @@ struct SettingsView: View {
             LabeledSlider(
                 title: "Translated Font",
                 value: translatedFontBinding,
-                range: 16 ... 34,
+                range: 8 ... 34,
                 precision: 0
             )
 
             LabeledSlider(
                 title: "Source Font",
                 value: sourceFontBinding,
-                range: 14 ... 28,
+                range: 5 ... 28,
                 precision: 0
             )
         }

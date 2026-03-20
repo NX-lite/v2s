@@ -376,6 +376,7 @@ struct OverlayView: View {
             .font(.system(size: fontSize, weight: weight))
             .multilineTextAlignment(.center)
             .lineLimit(2)
+            .fixedSize(horizontal: false, vertical: true)
             .frame(maxWidth: .infinity)
     }
 
