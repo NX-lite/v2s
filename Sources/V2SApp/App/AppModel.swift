@@ -44,7 +44,7 @@ final class AppModel: ObservableObject {
     @Published private(set) var languageResourceStatuses: [LanguageResourceStatus] = []
     @Published private(set) var translationHostConfiguration: TranslationSession.Configuration?
     @Published var isOverlayVisible = false
-    @Published private(set) var overlayHistoryVisibleCount = 1
+    @Published private(set) var overlayHistoryVisibleCount = 0
     @Published private(set) var overlayHistoryScrollOffset = 0
 
     @Published var selectedSourceID: String? {
@@ -420,7 +420,7 @@ final class AppModel: ObservableObject {
     }
 
     func updateOverlayHistoryVisibleCount(_ count: Int) {
-        let clampedCount = max(1, count)
+        let clampedCount = max(0, count)
         guard overlayHistoryVisibleCount != clampedCount else { return }
         overlayHistoryVisibleCount = clampedCount
         clampOverlayHistoryScrollOffset()
@@ -1627,7 +1627,7 @@ final class AppModel: ObservableObject {
     }
 
     private var overlayHistoryMaxScrollOffset: Int {
-        max(0, overlayHistoryCount - max(1, overlayHistoryVisibleCount))
+        max(0, overlayHistoryCount - max(0, overlayHistoryVisibleCount))
     }
 
     private func clampOverlayHistoryScrollOffset() {

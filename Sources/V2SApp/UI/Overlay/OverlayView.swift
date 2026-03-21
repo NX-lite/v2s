@@ -8,6 +8,7 @@ struct OverlayView: View {
     @State private var renderedPassThroughBubble: OverlayPassThroughBubble?
     @State private var passThroughRevealProgress: Double = 0.0
     @State private var lastDraftSlotHeight: CGFloat = 0.0
+    @State private var lastLiveLayersHeight: CGFloat = 0.0
 
     var body: some View {
         ZStack {
@@ -37,16 +38,21 @@ struct OverlayView: View {
                         visibleCount: visibleHistoryCount
                     )
 
-                    VStack(alignment: .center, spacing: 10) {
-                        ForEach(Array(visibleHistoryEntries.enumerated()), id: \.element.id) { index, entry in
-                            historyEntry(
-                                entry,
-                                index: index,
-                                totalCount: visibleHistoryEntries.count
-                            )
-                        }
+                    ZStack(alignment: .bottom) {
+                        VStack(alignment: .center, spacing: 10) {
+                            ForEach(Array(visibleHistoryEntries.enumerated()), id: \.element.id) { index, entry in
+                                historyEntry(
+                                    entry,
+                                    index: index,
+                                    totalCount: visibleHistoryEntries.count
+                                )
+                            }
 
-                        liveLayers(state)
+                            liveLayers(state)
+                                .background(liveLayersHeightReader)
+                        }
+                        .fixedSize(horizontal: false, vertical: true)
+                        .frame(maxWidth: .infinity, alignment: .bottom)
                     }
                     .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .bottom)
                     .mask(continuousFlowMask)
@@ -61,6 +67,10 @@ struct OverlayView: View {
                             lastDraftSlotHeight = snappedHeight
                         }
                     }
+                    .onPreferenceChange(LiveLayersHeightPreferenceKey.self) { height in
+                        guard height > 0 else { return }
+                        lastLiveLayersHeight = ceil(height)
+                    }
                     .onAppear {
                         model.updateOverlayHistoryVisibleCount(visibleHistoryCount)
                     }
@@ -73,12 +83,15 @@ struct OverlayView: View {
                     .onChange(of: model.sessionState) { _, newState in
                         if newState != .running {
                             lastDraftSlotHeight = 0
+                            lastLiveLayersHeight = 0
                         }
                     }
                 }
                 .padding(.leading, 20)
                 .padding(.trailing, 20 + OverlayHistoryScrollbarLayout.panelWidth + OverlayHistoryScrollbarLayout.contentSpacing)
-                .padding(.vertical, 12)
+                // Keep breathing room at the top, but let the live draft stack
+                // spend the full bottom edge budget when the window is shrunk.
+                .padding(.top, 12)
                 .frame(maxWidth: .infinity, maxHeight: .infinity)
                 .background(backgroundView)
                 .overlay(
@@ -221,7 +234,8 @@ struct OverlayView: View {
     }
 
     private func historyVisibleEntries(from history: [OverlayHistoryEntry], visibleCount: Int) -> [OverlayHistoryEntry] {
-        let clampedVisibleCount = max(1, visibleCount)
+        let clampedVisibleCount = max(0, visibleCount)
+        guard clampedVisibleCount > 0 else { return [] }
         let maxOffset = max(0, history.count - clampedVisibleCount)
         let offset = min(max(model.overlayHistoryScrollOffset, 0), maxOffset)
         let upperBound = max(0, history.count - offset)
@@ -231,23 +245,11 @@ struct OverlayView: View {
 
     private func historyVisibleCount(for height: CGFloat, state: OverlayPreviewState) -> Int {
         let availableHeight = max(height - reservedFlowHeight(for: state), 0)
-        return max(1, Int((availableHeight / historyRowHeight).rounded(.down)))
+        return max(0, Int((availableHeight / historyRowHeight).rounded(.down)))
     }
 
     private func reservedFlowHeight(for state: OverlayPreviewState) -> CGFloat {
-        var reservedHeight: CGFloat = 0
-
-        if hasCommittedCaption(state) {
-            reservedHeight += committedRowHeight
-        }
-
-        reservedHeight += draftSlotHeight(for: state)
-
-        if hasCommittedCaption(state) {
-            reservedHeight += 10
-        }
-
-        return reservedHeight
+        max(lastLiveLayersHeight, estimatedLiveLayersHeight(for: state))
     }
 
     private func hasCommittedCaption(_ state: OverlayPreviewState) -> Bool {
@@ -272,8 +274,18 @@ struct OverlayView: View {
         historyRowHeight
     }
 
+    private func estimatedLiveLayersHeight(for state: OverlayPreviewState) -> CGFloat {
+        var height = draftSlotHeight(for: state)
+
+        if hasCommittedCaption(state) {
+            height += committedRowHeight + 10.0
+        }
+
+        return height
+    }
+
     private func draftSlotHeight(for state: OverlayPreviewState) -> CGFloat {
-        max(lastDraftSlotHeight, estimatedDraftRowHeight(for: state))
+        max(lastDraftSlotHeight, estimatedDraftRowHeight(for: state)) + Self.draftBottomInset
     }
 
     private func estimatedDraftRowHeight(for state: OverlayPreviewState) -> CGFloat {
@@ -290,6 +302,13 @@ struct OverlayView: View {
         GeometryReader { proxy in
             Color.clear
                 .preference(key: DraftSlotHeightPreferenceKey.self, value: proxy.size.height)
+        }
+    }
+
+    private var liveLayersHeightReader: some View {
+        GeometryReader { proxy in
+            Color.clear
+                .preference(key: LiveLayersHeightPreferenceKey.self, value: proxy.size.height)
         }
     }
 
@@ -536,6 +555,7 @@ private extension OverlayView {
         dampingFraction: 0.88,
         blendDuration: 0.08
     )
+    static let draftBottomInset: CGFloat = 3.0
     static let draftHeightJitterTolerance: CGFloat = 6.0
     static let captionPairSpacing: CGFloat = 4.0
     static let textOutlineOffsets: [CGSize] = [
@@ -559,6 +579,14 @@ private struct OverlayFlowAnimationState: Equatable {
 }
 
 private struct DraftSlotHeightPreferenceKey: PreferenceKey {
+    static var defaultValue: CGFloat = 0.0
+
+    static func reduce(value: inout CGFloat, nextValue: () -> CGFloat) {
+        value = nextValue()
+    }
+}
+
+private struct LiveLayersHeightPreferenceKey: PreferenceKey {
     static var defaultValue: CGFloat = 0.0
 
     static func reduce(value: inout CGFloat, nextValue: () -> CGFloat) {
@@ -720,11 +748,11 @@ struct OverlayHistoryScrollbarView: View {
 
     private func scrollbarMetrics(trackHeight: CGFloat) -> OverlayHistoryScrollbarMetrics {
         let totalCount = max(model.overlayState?.history.count ?? 0, 0)
-        let visibleCount = max(1, model.overlayHistoryVisibleCount)
+        let visibleCount = max(0, model.overlayHistoryVisibleCount)
         let maxScrollOffset = max(0, totalCount - visibleCount)
         let clampedTrackHeight = max(trackHeight, OverlayHistoryScrollbarLayout.minimumThumbHeight)
         let visibilityRatio = totalCount > 0
-            ? min(1.0, CGFloat(visibleCount) / CGFloat(max(totalCount, visibleCount)))
+            ? min(1.0, CGFloat(visibleCount) / CGFloat(max(totalCount, max(visibleCount, 1))))
             : 1.0
         let thumbHeight = max(
             OverlayHistoryScrollbarLayout.minimumThumbHeight,
