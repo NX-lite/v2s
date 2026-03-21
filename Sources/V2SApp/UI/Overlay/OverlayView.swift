@@ -652,9 +652,10 @@ struct OverlayMoveButtonView: View {
 
 struct OverlayCloseButtonView: View {
     @ObservedObject var model: AppModel
+    var onClose: () -> Void = {}
 
     var body: some View {
-        Button { model.stopSession() } label: {
+        Button { onClose() } label: {
             ZStack {
                 Circle().fill(Color.white.opacity(0.12))
                 Image(systemName: "xmark")

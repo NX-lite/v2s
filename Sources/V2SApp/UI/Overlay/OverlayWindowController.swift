@@ -112,6 +112,10 @@ final class OverlayWindowController {
             onMoveDragChanged: { [weak self] translation in self?.updateControlDrag(with: translation) },
             onMoveDragEnded: { [weak self] in self?.endControlDrag() }
         )
+        closeButtonHostingView.rootView = OverlayCloseButtonView(
+            model: model,
+            onClose: { [weak self] in self?.handleCloseButtonPress() }
+        )
         resizeButtonHostingView.rootView = OverlayResizeButtonView(
             onResizeDragStart: { [weak self] in self?.beginResizeDrag() },
             onResizeDragChanged: { [weak self] translation in self?.updateResizeDrag(with: translation) },
@@ -164,7 +168,7 @@ final class OverlayWindowController {
         panel.ignoresMouseEvents = !acceptsInput
         panel.isMovable = false
         panel.isMovableByWindowBackground = false
-        panel.collectionBehavior = [.canJoinAllSpaces, .fullScreenAuxiliary, .ignoresCycle, .stationary]
+        panel.collectionBehavior = Self.panelCollectionBehavior
     }
 
     private func bindModel() {
@@ -215,6 +219,23 @@ final class OverlayWindowController {
         pendingHideSnapshot = createSnapshotWindow(of: panel, frame: panel.frame)
     }
 
+    private func handleCloseButtonPress() {
+        if geniePhase == .showing {
+            cancelGenieAnimation()
+        }
+
+        if panelsShown {
+            captureHideSnapshotIfNeeded(newVisible: false, newState: nil)
+            panelsShown = false
+            stopMouseTracking()
+            stopSourceWindowTracking()
+            interactionState.updatePassThroughBubble(nil)
+            animateGenieHide()
+        }
+
+        model.stopSession()
+    }
+
     private func scheduleWindowSync() {
         DispatchQueue.main.async { [weak self] in
             self?.syncWindow()
@@ -240,10 +261,9 @@ final class OverlayWindowController {
             interactionState.updatePassThroughBubble(nil)
             animateGenieHide()
         } else if shouldShow && geniePhase == .idle {
-            // Already visible, just update layout
-            updateAttachToSourceLevels()
+            // Keep a visible overlay in its current Space instead of re-ordering it
+            // on every subtitle update.
             positionPanels(animated: true)
-            orderFrontAllPanels()
             startMouseTrackingIfNeeded()
             updatePassThroughBubble()
         }
@@ -409,7 +429,7 @@ final class OverlayWindowController {
         window.level = .statusBar
         window.hasShadow = false
         window.hidesOnDeactivate = false
-        window.collectionBehavior = [.canJoinAllSpaces, .fullScreenAuxiliary, .ignoresCycle, .stationary]
+        window.collectionBehavior = Self.panelCollectionBehavior
         window.contentView = imageView
 
         return window
@@ -836,10 +856,6 @@ final class OverlayWindowController {
             p.isFloatingPanel = useHighLevel
         }
 
-        if useHighLevel && panelsShown {
-            orderFrontAllPanels()
-        }
-
         if model.overlayStyle.attachToSource && panelsShown {
             startSourceWindowTracking()
         } else {
@@ -973,6 +989,11 @@ private extension OverlayWindowController {
     static let minimumOverlayHeight: Double = 105
     static let passThroughBubbleDiameter: CGFloat = 118
     static let scrollbarRevealDistance: CGFloat = 42
+    static let panelCollectionBehavior: NSWindow.CollectionBehavior = [
+        .fullScreenAuxiliary,
+        .ignoresCycle,
+        .stationary
+    ]
 
     static let controlButtonSize = CGSize(
         width: OverlayControlsLayout.controlSize,
