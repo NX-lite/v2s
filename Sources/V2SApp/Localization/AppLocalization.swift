@@ -103,6 +103,7 @@ enum AppTextKey: String {
     case waitingTranslationResourcesInstalling
     case manualTranslationDownloadDetail
     case speechResourcesNotSupportedOnMacOS
+    case speechResourceDownloadTimedOut
     case translationResourceDownloadTimedOut
     case translationRequiresMacOS15OrNewer
     case translationUnsupportedFromToFormat
@@ -290,6 +291,7 @@ enum AppLocalization {
             "waitingTranslationResourcesInstalling": "Waiting for translation resources to finish installing...",
             "manualTranslationDownloadDetail": "Automatic translation download did not complete. Open macOS System Settings > General > Language & Region > Translation Languages and download this translation language.",
             "speechResourcesNotSupportedOnMacOS": "Speech recognition resources are not supported for this language on this macOS version.",
+            "speechResourceDownloadTimedOut": "Automatic speech recognition resource download timed out.",
             "translationResourceDownloadTimedOut": "Automatic translation resource download timed out.",
             "translationRequiresMacOS15OrNewer": "Translation requires macOS 15 or newer.",
             "translationUnsupportedFromToFormat": "Translation is not supported from %@ to %@.",
@@ -421,6 +423,7 @@ enum AppLocalization {
             "waitingTranslationResourcesInstalling": "正在等待翻译资源安装完成...",
             "manualTranslationDownloadDetail": "自动下载翻译资源未完成。请打开 macOS 系统设置 > 通用 > 语言与地区 > 翻译语言，并下载对应翻译语言。",
             "speechResourcesNotSupportedOnMacOS": "当前 macOS 版本不支持此语言的语音识别资源。",
+            "speechResourceDownloadTimedOut": "自动下载语音识别资源超时。",
             "translationResourceDownloadTimedOut": "自动下载翻译资源超时。",
             "translationRequiresMacOS15OrNewer": "翻译功能需要 macOS 15 或更高版本。",
             "translationUnsupportedFromToFormat": "当前不支持从 %@ 翻译到 %@。",
@@ -552,6 +555,7 @@ enum AppLocalization {
             "waitingTranslationResourcesInstalling": "Esperando a que terminen de instalarse los recursos de traducción...",
             "manualTranslationDownloadDetail": "La descarga automática de la traducción no se completó. Abre Ajustes del sistema de macOS > General > Idioma y región > Idiomas de traducción y descarga este idioma.",
             "speechResourcesNotSupportedOnMacOS": "Los recursos de reconocimiento de voz no son compatibles con este idioma en esta versión de macOS.",
+            "speechResourceDownloadTimedOut": "Se agotó el tiempo de descarga automática del recurso de reconocimiento de voz.",
             "translationResourceDownloadTimedOut": "Se agotó el tiempo de descarga automática del recurso de traducción.",
             "translationRequiresMacOS15OrNewer": "La traducción requiere macOS 15 o superior.",
             "translationUnsupportedFromToFormat": "La traducción no es compatible de %@ a %@.",
@@ -683,6 +687,7 @@ enum AppLocalization {
             "waitingTranslationResourcesInstalling": "Warte, bis die Übersetzungsressourcen fertig installiert sind...",
             "manualTranslationDownloadDetail": "Der automatische Download der Übersetzung wurde nicht abgeschlossen. Öffne macOS-Systemeinstellungen > Allgemein > Sprache & Region > Übersetzungssprachen und lade diese Sprache herunter.",
             "speechResourcesNotSupportedOnMacOS": "Spracherkennungsressourcen werden für diese Sprache in dieser macOS-Version nicht unterstützt.",
+            "speechResourceDownloadTimedOut": "Der automatische Download der Spracherkennungsressource hat das Zeitlimit überschritten.",
             "translationResourceDownloadTimedOut": "Der automatische Download der Übersetzungsressource hat das Zeitlimit überschritten.",
             "translationRequiresMacOS15OrNewer": "Übersetzung erfordert macOS 15 oder neuer.",
             "translationUnsupportedFromToFormat": "Übersetzung von %@ nach %@ wird nicht unterstützt.",
@@ -814,6 +819,7 @@ enum AppLocalization {
             "waitingTranslationResourcesInstalling": "翻訳リソースのインストール完了を待っています...",
             "manualTranslationDownloadDetail": "翻訳の自動ダウンロードが完了しませんでした。macOS システム設定 > 一般 > 言語と地域 > 翻訳言語 を開いて、この翻訳言語をダウンロードしてください。",
             "speechResourcesNotSupportedOnMacOS": "この macOS バージョンでは、この言語の音声認識リソースはサポートされていません。",
+            "speechResourceDownloadTimedOut": "音声認識リソースの自動ダウンロードがタイムアウトしました。",
             "translationResourceDownloadTimedOut": "翻訳リソースの自動ダウンロードがタイムアウトしました。",
             "translationRequiresMacOS15OrNewer": "翻訳には macOS 15 以降が必要です。",
             "translationUnsupportedFromToFormat": "%@ から %@ への翻訳はサポートされていません。",
@@ -945,6 +951,7 @@ enum AppLocalization {
             "waitingTranslationResourcesInstalling": "En attente de la fin de l'installation des ressources de traduction...",
             "manualTranslationDownloadDetail": "Le téléchargement automatique de la traduction n'a pas abouti. Ouvrez Réglages Système de macOS > Général > Langue et région > Langues de traduction, puis téléchargez cette langue.",
             "speechResourcesNotSupportedOnMacOS": "Les ressources de reconnaissance vocale ne sont pas prises en charge pour cette langue sur cette version de macOS.",
+            "speechResourceDownloadTimedOut": "Le téléchargement automatique de la ressource de reconnaissance vocale a expiré.",
             "translationResourceDownloadTimedOut": "Le téléchargement automatique de la ressource de traduction a expiré.",
             "translationRequiresMacOS15OrNewer": "La traduction nécessite macOS 15 ou une version ultérieure.",
             "translationUnsupportedFromToFormat": "La traduction de %@ vers %@ n'est pas prise en charge.",
@@ -1076,6 +1083,7 @@ enum AppLocalization {
             "waitingTranslationResourcesInstalling": "번역 리소스 설치 완료를 기다리는 중...",
             "manualTranslationDownloadDetail": "자동 번역 다운로드가 완료되지 않았습니다. macOS 시스템 설정 > 일반 > 언어 및 지역 > 번역 언어를 열어 이 언어를 다운로드하세요.",
             "speechResourcesNotSupportedOnMacOS": "이 macOS 버전에서는 해당 언어의 음성 인식 리소스를 지원하지 않습니다.",
+            "speechResourceDownloadTimedOut": "자동 음성 인식 리소스 다운로드 시간이 초과되었습니다.",
             "translationResourceDownloadTimedOut": "자동 번역 리소스 다운로드 시간이 초과되었습니다.",
             "translationRequiresMacOS15OrNewer": "번역 기능은 macOS 15 이상이 필요합니다.",
             "translationUnsupportedFromToFormat": "%@ 에서 %@ 로의 번역은 지원되지 않습니다.",
@@ -1207,6 +1215,7 @@ enum AppLocalization {
             "waitingTranslationResourcesInstalling": "بانتظار اكتمال تثبيت موارد الترجمة...",
             "manualTranslationDownloadDetail": "لم يكتمل تنزيل الترجمة تلقائيًا. افتح إعدادات نظام macOS > عام > اللغة والمنطقة > لغات الترجمة وقم بتنزيل هذه اللغة.",
             "speechResourcesNotSupportedOnMacOS": "موارد التعرّف على الكلام غير مدعومة لهذه اللغة على هذا الإصدار من macOS.",
+            "speechResourceDownloadTimedOut": "انتهت مهلة تنزيل مورد التعرّف على الكلام تلقائيًا.",
             "translationResourceDownloadTimedOut": "انتهت مهلة تنزيل مورد الترجمة تلقائيًا.",
             "translationRequiresMacOS15OrNewer": "الترجمة تتطلب macOS 15 أو أحدث.",
             "translationUnsupportedFromToFormat": "الترجمة من %@ إلى %@ غير مدعومة.",
@@ -1338,6 +1347,7 @@ enum AppLocalization {
             "waitingTranslationResourcesInstalling": "Aguardando a conclusão da instalação dos recursos de tradução...",
             "manualTranslationDownloadDetail": "O download automático da tradução não foi concluído. Abra Ajustes do Sistema do macOS > Geral > Idioma e Região > Idiomas de tradução e baixe este idioma.",
             "speechResourcesNotSupportedOnMacOS": "Os recursos de reconhecimento de fala não são compatíveis com este idioma nesta versão do macOS.",
+            "speechResourceDownloadTimedOut": "O download automático do recurso de reconhecimento de fala expirou.",
             "translationResourceDownloadTimedOut": "O download automático do recurso de tradução expirou.",
             "translationRequiresMacOS15OrNewer": "A tradução requer macOS 15 ou mais recente.",
             "translationUnsupportedFromToFormat": "A tradução de %@ para %@ não é compatível.",
@@ -1469,6 +1479,7 @@ enum AppLocalization {
             "waitingTranslationResourcesInstalling": "Ожидание завершения установки ресурсов перевода...",
             "manualTranslationDownloadDetail": "Автоматическая загрузка перевода не завершилась. Откройте настройки системы macOS > Основные > Язык и регион > Языки перевода и загрузите этот язык.",
             "speechResourcesNotSupportedOnMacOS": "Ресурсы распознавания речи не поддерживаются для этого языка в этой версии macOS.",
+            "speechResourceDownloadTimedOut": "Время автоматической загрузки ресурса распознавания речи истекло.",
             "translationResourceDownloadTimedOut": "Время автоматической загрузки ресурса перевода истекло.",
             "translationRequiresMacOS15OrNewer": "Перевод требует macOS 15 или новее.",
             "translationUnsupportedFromToFormat": "Перевод с %@ на %@ не поддерживается.",

@@ -645,6 +645,8 @@ final class AppModel: ObservableObject {
         title: String
     ) async throws {
         let detail = localized(.downloadingSpeechResources)
+        let maxPollingRetries = 150 // ~30 seconds at 200ms intervals
+        var pollingRetryCount = 0
 
         while true {
             try Task.checkCancellation()
@@ -665,6 +667,11 @@ final class AppModel: ObservableObject {
                     return
                 }
 
+                pollingRetryCount += 1
+                if pollingRetryCount > maxPollingRetries {
+                    throw LanguageResourcePreparationError.speechDownloadTimedOut
+                }
+
                 upsertLanguageResourceStatus(
                     LanguageResourceStatus(
                         id: statusID,
@@ -676,6 +683,9 @@ final class AppModel: ObservableObject {
                     )
                 )
             case .downloading:
+                // Reset polling count — an active download is making progress
+                pollingRetryCount = 0
+
                 upsertLanguageResourceStatus(
                     LanguageResourceStatus(
                         id: statusID,
@@ -687,6 +697,11 @@ final class AppModel: ObservableObject {
                     )
                 )
             @unknown default:
+                pollingRetryCount += 1
+                if pollingRetryCount > maxPollingRetries {
+                    throw LanguageResourcePreparationError.speechDownloadTimedOut
+                }
+
                 upsertLanguageResourceStatus(
                     LanguageResourceStatus(
                         id: statusID,
@@ -754,6 +769,8 @@ final class AppModel: ObservableObject {
         let downloadingDetail = localized(.downloadingTranslationResources)
         let waitingDetail = localized(.waitingTranslationResourcesInstalling)
         let manualDownloadDetail = localized(.manualTranslationDownloadDetail)
+        let maxAttempts = 3
+        var attemptCount = 0
 
         while Task.isCancelled == false {
             let availabilityStatus = await translationAvailabilityStatus(
@@ -775,6 +792,21 @@ final class AppModel: ObservableObject {
                 )
                 return nil
             case .supported, .installed:
+                attemptCount += 1
+                if attemptCount > maxAttempts {
+                    upsertLanguageResourceStatus(
+                        LanguageResourceStatus(
+                            id: statusID,
+                            kind: .translation,
+                            title: title,
+                            detail: manualDownloadDetail,
+                            progress: nil,
+                            isError: true
+                        )
+                    )
+                    return .translationLanguages
+                }
+
                 upsertLanguageResourceStatus(
                     LanguageResourceStatus(
                         id: statusID,
@@ -881,6 +913,21 @@ final class AppModel: ObservableObject {
                     return nil
                 }
             @unknown default:
+                attemptCount += 1
+                if attemptCount > maxAttempts {
+                    upsertLanguageResourceStatus(
+                        LanguageResourceStatus(
+                            id: statusID,
+                            kind: .translation,
+                            title: title,
+                            detail: manualDownloadDetail,
+                            progress: nil,
+                            isError: true
+                        )
+                    )
+                    return .translationLanguages
+                }
+
                 upsertLanguageResourceStatus(
                     LanguageResourceStatus(
                         id: statusID,
@@ -1776,12 +1823,15 @@ private struct QueuedCaption: Identifiable, Equatable {
 
 private enum LanguageResourcePreparationError: LocalizedError, AppLocalizableError {
     case unsupportedSpeechLanguage
+    case speechDownloadTimedOut
     case translationDownloadTimedOut
 
     func localizedDescription(languageID: String) -> String {
         switch self {
         case .unsupportedSpeechLanguage:
             return AppLocalization.string(.speechResourcesNotSupportedOnMacOS, languageID: languageID)
+        case .speechDownloadTimedOut:
+            return AppLocalization.string(.speechResourceDownloadTimedOut, languageID: languageID)
         case .translationDownloadTimedOut:
             return AppLocalization.string(.translationResourceDownloadTimedOut, languageID: languageID)
         }
