@@ -73,7 +73,7 @@ final class SileroVADEngine {
 
         let sessionOptions = try ORTSessionOptions()
 
-        guard let modelURL = Bundle.module.url(forResource: "silero_vad", withExtension: "onnx") else {
+        guard let modelURL = Self.resourceBundle.url(forResource: "silero_vad", withExtension: "onnx") else {
             throw SileroVADError.modelNotFound
         }
 
@@ -141,6 +141,14 @@ final class SileroVADEngine {
     }
 
     // MARK: - Private
+
+    private static var resourceBundle: Bundle {
+#if SWIFT_PACKAGE
+        Bundle.module
+#else
+        Bundle.main
+#endif
+    }
 
     private func infer(chunk: [Float]) throws -> Float {
         // Build input tensor: [1, 512]
