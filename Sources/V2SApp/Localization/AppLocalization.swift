@@ -135,6 +135,13 @@ enum AppTextKey: String {
     case failedToStageWithReasonFormat
     case failedToReadCapturedAudioStreamFormat
     case scrollToLatestSubtitle
+    case transcript
+    case origin
+    case translation
+    case summarize
+    case copy
+    case transcriptWindowTitle
+    case summarizationRequiresMacOS26
 }
 
 enum AppLocalization {
@@ -323,6 +330,13 @@ enum AppLocalization {
             "failedToStageWithReasonFormat": "Failed to %@: %@",
             "failedToReadCapturedAudioStreamFormat": "Failed to read the captured audio stream for %@.",
             "scrollToLatestSubtitle": "Scroll to latest subtitle",
+            "transcript": "Transcript",
+            "origin": "Origin",
+            "translation": "Translation",
+            "summarize": "Summarize",
+            "copy": "Copy",
+            "transcriptWindowTitle": "Transcript",
+            "summarizationRequiresMacOS26": "Summarization requires macOS 26 or newer.",
         ],
         "zh-Hans": [
             "start": "开始",
@@ -455,6 +469,13 @@ enum AppLocalization {
             "failedToStageWithReasonFormat": "无法%@：%@",
             "failedToReadCapturedAudioStreamFormat": "无法读取 %@ 的采集音频流。",
             "scrollToLatestSubtitle": "滚动到最新字幕",
+            "transcript": "字幕记录",
+            "origin": "原文",
+            "translation": "译文",
+            "summarize": "摘要",
+            "copy": "复制",
+            "transcriptWindowTitle": "字幕记录",
+            "summarizationRequiresMacOS26": "摘要功能需要 macOS 26 或更高版本。",
         ],
         "es": [
             "start": "Iniciar",
@@ -587,6 +608,13 @@ enum AppLocalization {
             "failedToStageWithReasonFormat": "No se pudo %@: %@",
             "failedToReadCapturedAudioStreamFormat": "No se pudo leer el flujo de audio capturado de %@.",
             "scrollToLatestSubtitle": "Ir al subtítulo más reciente",
+            "transcript": "Transcripción",
+            "origin": "Original",
+            "translation": "Traducción",
+            "summarize": "Resumir",
+            "copy": "Copiar",
+            "transcriptWindowTitle": "Transcripción",
+            "summarizationRequiresMacOS26": "El resumen requiere macOS 26 o posterior.",
         ],
         "de": [
             "start": "Starten",
@@ -719,6 +747,13 @@ enum AppLocalization {
             "failedToStageWithReasonFormat": "%@ fehlgeschlagen: %@",
             "failedToReadCapturedAudioStreamFormat": "Der erfasste Audiostream von %@ konnte nicht gelesen werden.",
             "scrollToLatestSubtitle": "Zum neuesten Untertitel scrollen",
+            "transcript": "Transkript",
+            "origin": "Original",
+            "translation": "Übersetzung",
+            "summarize": "Zusammenfassen",
+            "copy": "Kopieren",
+            "transcriptWindowTitle": "Transkript",
+            "summarizationRequiresMacOS26": "Zusammenfassung erfordert macOS 26 oder neuer.",
         ],
         "ja": [
             "start": "開始",
@@ -851,6 +886,13 @@ enum AppLocalization {
             "failedToStageWithReasonFormat": "%@ に失敗しました: %@",
             "failedToReadCapturedAudioStreamFormat": "%@ のキャプチャ音声ストリームを読み取れませんでした。",
             "scrollToLatestSubtitle": "最新の字幕へ移動",
+            "transcript": "トランスクリプト",
+            "origin": "原文",
+            "translation": "翻訳",
+            "summarize": "要約",
+            "copy": "コピー",
+            "transcriptWindowTitle": "トランスクリプト",
+            "summarizationRequiresMacOS26": "要約機能には macOS 26 以降が必要です。",
         ],
         "fr": [
             "start": "Démarrer",
@@ -983,6 +1025,13 @@ enum AppLocalization {
             "failedToStageWithReasonFormat": "Impossible de %@ : %@",
             "failedToReadCapturedAudioStreamFormat": "Impossible de lire le flux audio capturé pour %@.",
             "scrollToLatestSubtitle": "Aller au sous-titre le plus récent",
+            "transcript": "Transcription",
+            "origin": "Original",
+            "translation": "Traduction",
+            "summarize": "Résumer",
+            "copy": "Copier",
+            "transcriptWindowTitle": "Transcription",
+            "summarizationRequiresMacOS26": "Le résumé nécessite macOS 26 ou une version ultérieure.",
         ],
         "ko": [
             "start": "시작",
@@ -1115,6 +1164,13 @@ enum AppLocalization {
             "failedToStageWithReasonFormat": "%@ 실패: %@",
             "failedToReadCapturedAudioStreamFormat": "%@ 의 캡처된 오디오 스트림을 읽을 수 없습니다.",
             "scrollToLatestSubtitle": "최신 자막으로 이동",
+            "transcript": "기록",
+            "origin": "원문",
+            "translation": "번역",
+            "summarize": "요약",
+            "copy": "복사",
+            "transcriptWindowTitle": "기록",
+            "summarizationRequiresMacOS26": "요약 기능은 macOS 26 이상이 필요합니다.",
         ],
         "ar": [
             "start": "ابدأ",
@@ -1247,6 +1303,13 @@ enum AppLocalization {
             "failedToStageWithReasonFormat": "تعذر %@: %@",
             "failedToReadCapturedAudioStreamFormat": "تعذر قراءة دفق الصوت الملتقط لـ %@.",
             "scrollToLatestSubtitle": "الانتقال إلى أحدث ترجمة",
+            "transcript": "النص المكتوب",
+            "origin": "الأصل",
+            "translation": "الترجمة",
+            "summarize": "تلخيص",
+            "copy": "نسخ",
+            "transcriptWindowTitle": "النص المكتوب",
+            "summarizationRequiresMacOS26": "التلخيص يتطلب macOS 26 أو أحدث.",
         ],
         "pt": [
             "start": "Iniciar",
@@ -1379,6 +1442,13 @@ enum AppLocalization {
             "failedToStageWithReasonFormat": "Falha ao %@: %@",
             "failedToReadCapturedAudioStreamFormat": "Não foi possível ler o fluxo de áudio capturado de %@.",
             "scrollToLatestSubtitle": "Ir para a legenda mais recente",
+            "transcript": "Transcrição",
+            "origin": "Original",
+            "translation": "Tradução",
+            "summarize": "Resumir",
+            "copy": "Copiar",
+            "transcriptWindowTitle": "Transcrição",
+            "summarizationRequiresMacOS26": "O resumo requer macOS 26 ou posterior.",
         ],
         "ru": [
             "start": "Запустить",
@@ -1511,6 +1581,13 @@ enum AppLocalization {
             "failedToStageWithReasonFormat": "Не удалось %@: %@",
             "failedToReadCapturedAudioStreamFormat": "Не удалось прочитать захваченный аудиопоток для %@.",
             "scrollToLatestSubtitle": "Прокрутить к последнему субтитру",
+            "transcript": "Транскрипция",
+            "origin": "Оригинал",
+            "translation": "Перевод",
+            "summarize": "Резюме",
+            "copy": "Копировать",
+            "transcriptWindowTitle": "Транскрипция",
+            "summarizationRequiresMacOS26": "Для создания резюме требуется macOS 26 или новее.",
         ],
     ]
 }

@@ -691,59 +691,66 @@ struct OverlayResizeButtonView: View {
 struct OverlayHistoryScrollbarView: View {
     @ObservedObject var model: AppModel
     @ObservedObject var interactionState: OverlayInteractionState
+    var showTranscript: () -> Void = {}
 
     var body: some View {
         let revealProgress = interactionState.scrollbarRevealProgress
         let latestButtonRevealProgress = latestButtonRevealProgress(for: revealProgress)
 
-        GeometryReader { proxy in
-            let trackHeight = resolvedTrackHeight(
-                in: proxy.size.height,
-                latestButtonRevealProgress: latestButtonRevealProgress
-            )
-            let metrics = scrollbarMetrics(trackHeight: trackHeight)
-            let trackWidth = resolvedTrackWidth(for: revealProgress)
+        VStack(spacing: 0) {
+            transcriptButton(revealProgress: revealProgress)
+                .padding(.top, OverlayHistoryScrollbarLayout.verticalPadding)
+                .padding(.bottom, OverlayHistoryScrollbarLayout.buttonSpacing)
 
-            ZStack(alignment: .bottom) {
-                ZStack(alignment: .top) {
-                    Capsule()
-                        .fill(Color.white.opacity(0.035 + (0.055 * revealProgress)))
-                        .frame(width: trackWidth)
-                        .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .top)
+            GeometryReader { proxy in
+                let trackHeight = resolvedTrackHeight(
+                    in: proxy.size.height,
+                    latestButtonRevealProgress: latestButtonRevealProgress
+                )
+                let metrics = scrollbarMetrics(trackHeight: trackHeight)
+                let trackWidth = resolvedTrackWidth(for: revealProgress)
 
-                    Capsule()
-                        .fill(
-                            Color.white.opacity(
-                                metrics.canScroll
-                                    ? (0.28 + (0.32 * revealProgress))
-                                    : (0.12 + (0.10 * revealProgress))
+                ZStack(alignment: .bottom) {
+                    ZStack(alignment: .top) {
+                        Capsule()
+                            .fill(Color.white.opacity(0.035 + (0.055 * revealProgress)))
+                            .frame(width: trackWidth)
+                            .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .top)
+
+                        Capsule()
+                            .fill(
+                                Color.white.opacity(
+                                    metrics.canScroll
+                                        ? (0.28 + (0.32 * revealProgress))
+                                        : (0.12 + (0.10 * revealProgress))
+                                )
                             )
-                        )
-                        .frame(
-                            width: trackWidth,
-                            height: metrics.thumbHeight
-                        )
-                        .frame(maxWidth: .infinity, alignment: .top)
-                        .offset(y: metrics.thumbTop)
+                            .frame(
+                                width: trackWidth,
+                                height: metrics.thumbHeight
+                            )
+                            .frame(maxWidth: .infinity, alignment: .top)
+                            .offset(y: metrics.thumbTop)
 
-                    OverlayHistoryScrollbarInputLayer(
-                        currentOffset: model.overlayHistoryScrollOffset,
-                        maxScrollOffset: metrics.maxScrollOffset,
-                        thumbHeight: metrics.thumbHeight,
-                        onOffsetChange: { model.setOverlayHistoryScrollOffset($0) },
-                        onStepScroll: { model.scrollOverlayHistory(by: $0) }
-                    )
+                        OverlayHistoryScrollbarInputLayer(
+                            currentOffset: model.overlayHistoryScrollOffset,
+                            maxScrollOffset: metrics.maxScrollOffset,
+                            thumbHeight: metrics.thumbHeight,
+                            onOffsetChange: { model.setOverlayHistoryScrollOffset($0) },
+                            onStepScroll: { model.scrollOverlayHistory(by: $0) }
+                        )
+                    }
+                    .frame(height: trackHeight)
+                    .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .top)
+
+                    latestButton(revealProgress: latestButtonRevealProgress)
                 }
-                .frame(height: trackHeight)
-                .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .top)
-
-                latestButton(revealProgress: latestButtonRevealProgress)
+                .animation(.easeOut(duration: 0.16), value: revealProgress)
+                .animation(.easeOut(duration: 0.18), value: latestButtonRevealProgress)
             }
-            .animation(.easeOut(duration: 0.16), value: revealProgress)
-            .animation(.easeOut(duration: 0.18), value: latestButtonRevealProgress)
+            .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .bottom)
+            .padding(.bottom, OverlayHistoryScrollbarLayout.verticalPadding)
         }
-        .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .bottom)
-        .padding(.vertical, OverlayHistoryScrollbarLayout.verticalPadding)
     }
 
     private func scrollbarMetrics(trackHeight: CGFloat) -> OverlayHistoryScrollbarMetrics {
@@ -813,6 +820,26 @@ struct OverlayHistoryScrollbarView: View {
         .allowsHitTesting(revealProgress > 0.05)
         .animation(.easeOut(duration: 0.16), value: revealProgress)
         .accessibilityLabel(model.localized(.scrollToLatestSubtitle))
+    }
+
+    private func transcriptButton(revealProgress: CGFloat) -> some View {
+        Button {
+            showTranscript()
+        } label: {
+            ZStack {
+                Circle().fill(Color.white.opacity(0.12))
+                Image(systemName: "doc.text")
+                    .font(.system(size: 9, weight: .medium))
+                    .foregroundColor(.white.opacity(0.65))
+            }
+        }
+        .buttonStyle(.plain)
+        .frame(width: OverlayControlsLayout.controlSize, height: OverlayControlsLayout.controlSize)
+        .opacity(revealProgress)
+        .scaleEffect(0.9 + (0.1 * revealProgress))
+        .allowsHitTesting(revealProgress > 0.05)
+        .animation(.easeOut(duration: 0.16), value: revealProgress)
+        .accessibilityLabel(model.localized(.transcript))
     }
 }
 

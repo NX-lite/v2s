@@ -16,6 +16,7 @@ final class OverlayWindowController {
     private let subtitleHostingView: NSHostingView<OverlayView>
     private let controlsChromeHostingView: NSHostingView<OverlayControlsChromeView>
     private let scrollbarHostingView: NSHostingView<OverlayHistoryScrollbarView>
+    private lazy var transcriptWindowController = TranscriptWindowController(model: model)
     private let moveButtonHostingView: NSHostingView<OverlayMoveButtonView>
     private let closeButtonHostingView: NSHostingView<OverlayCloseButtonView>
     private let resizeButtonHostingView: NSHostingView<OverlayResizeButtonView>
@@ -115,6 +116,11 @@ final class OverlayWindowController {
             onResizeDragStart: { [weak self] in self?.beginResizeDrag() },
             onResizeDragChanged: { [weak self] translation in self?.updateResizeDrag(with: translation) },
             onResizeDragEnded: { [weak self] in self?.endResizeDrag() }
+        )
+        scrollbarHostingView.rootView = OverlayHistoryScrollbarView(
+            model: model,
+            interactionState: interactionState,
+            showTranscript: { [weak self] in self?.transcriptWindowController.showTranscript() }
         )
         bindModel()
         syncWindow()
