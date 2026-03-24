@@ -13,9 +13,12 @@
 </p>
 
 <p align="center">
-  <img src="https://github.com/user-attachments/assets/b65167ee-ae7e-4e37-8316-ebd200ae89a7" alt="Mar-20-2026 11-08-59">
+  <a href="README.zh-CN.md">中文文档</a>
 </p>
 
+<p align="center">
+  <img src="https://github.com/user-attachments/assets/b65167ee-ae7e-4e37-8316-ebd200ae89a7" alt="Mar-20-2026 11-08-59">
+</p>
 
 ## Why v2s
 
@@ -42,7 +45,7 @@
 
 ## Getting Started
 
-1. Download the latest `.app.zip` from [Releases](https://github.com/user/v2s/releases).
+1. Download the latest `.app.zip` from [Releases](https://github.com/franklioxygen/v2s/releases).
 2. Unzip and move `v2s.app` to your Applications folder.
 3. Launch v2s — it appears as an icon in your menu bar.
 4. Select an input source (a running app or microphone).
@@ -57,13 +60,12 @@ v2s will ask for permissions on first use:
 
 ## Requirements
 
-- macOS 15 or newer
 - Translation requires macOS 26 or newer
 
 ## Building from Source
 
 ```bash
-git clone https://github.com/user/v2s.git
+git clone https://github.com/franklioxygen/v2s.git
 cd v2s
 open v2s.xcodeproj
 ```
