@@ -51,6 +51,10 @@ struct OverlayView: View {
                             liveLayers(state)
                                 .background(liveLayersHeightReader)
                         }
+                        .animation(
+                            Self.captionFlowAnimation,
+                            value: historyLayoutAnimationState(for: state, visibleHistoryEntries: visibleHistoryEntries)
+                        )
                         .fixedSize(horizontal: false, vertical: true)
                         .frame(maxWidth: .infinity, alignment: .bottom)
                     }
@@ -110,6 +114,8 @@ struct OverlayView: View {
         VStack(alignment: .center, spacing: 10) {
             if hasCommittedCaption(state) {
                 committedLayer(state)
+            } else if shouldReserveCommittedSlot(for: state) {
+                committedSlotPlaceholder
             }
 
             draftLayer(state)
@@ -256,12 +262,28 @@ struct OverlayView: View {
         state.translatedText.isEmpty == false || state.sourceText.isEmpty == false
     }
 
+    private func shouldReserveCommittedSlot(for state: OverlayPreviewState) -> Bool {
+        model.sessionState == .running && (hasCommittedCaption(state) || state.history.isEmpty == false)
+    }
+
     private func flowAnimationState(for state: OverlayPreviewState) -> OverlayFlowAnimationState {
         OverlayFlowAnimationState(
             captionEpoch: state.captionEpoch,
             translatedText: state.translatedText,
             sourceText: state.sourceText,
             committedPromotionID: state.committedPromotionID,
+            draftPromotionID: state.draftPromotionID,
+            reservesCommittedSlot: shouldReserveCommittedSlot(for: state)
+        )
+    }
+
+    private func historyLayoutAnimationState(
+        for state: OverlayPreviewState,
+        visibleHistoryEntries: [OverlayHistoryEntry]
+    ) -> OverlayHistoryLayoutAnimationState {
+        OverlayHistoryLayoutAnimationState(
+            historyIDs: visibleHistoryEntries.map(\.id),
+            reservesCommittedSlot: shouldReserveCommittedSlot(for: state),
             draftPromotionID: state.draftPromotionID
         )
     }
@@ -277,7 +299,7 @@ struct OverlayView: View {
     private func estimatedLiveLayersHeight(for state: OverlayPreviewState) -> CGFloat {
         var height = draftSlotHeight(for: state)
 
-        if hasCommittedCaption(state) {
+        if shouldReserveCommittedSlot(for: state) {
             height += committedRowHeight + 10.0
         }
 
@@ -303,6 +325,13 @@ struct OverlayView: View {
             Color.clear
                 .preference(key: DraftSlotHeightPreferenceKey.self, value: proxy.size.height)
         }
+    }
+
+    private var committedSlotPlaceholder: some View {
+        Color.clear
+            .frame(maxWidth: .infinity)
+            .frame(height: committedRowHeight)
+            .accessibilityHidden(true)
     }
 
     private var liveLayersHeightReader: some View {
@@ -575,6 +604,13 @@ private struct OverlayFlowAnimationState: Equatable {
     let translatedText: String
     let sourceText: String
     let committedPromotionID: UUID?
+    let draftPromotionID: UUID?
+    let reservesCommittedSlot: Bool
+}
+
+private struct OverlayHistoryLayoutAnimationState: Equatable {
+    let historyIDs: [UUID]
+    let reservesCommittedSlot: Bool
     let draftPromotionID: UUID?
 }
 

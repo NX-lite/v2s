@@ -24,6 +24,7 @@ final class AppModel: ObservableObject {
     private var usesSystemInterfaceLanguage = true
     private var draftTranslationTask: Task<Void, Never>?
     private var draftClearTask: Task<Void, Never>?
+    private var committedCaptionArchiveTask: Task<Void, Never>?
     private var languageResourcePreparationTask: Task<Void, Never>?
     private var lastDraftStablePrefix = ""
     private var lastDraftTranslationSource = ""
@@ -1054,6 +1055,7 @@ final class AppModel: ObservableObject {
             return
         }
 
+        cancelCommittedCaptionArchive()
         cancelPendingDraftClear()
         overlayState?.draftSourceText = draftText
         overlayState?.draftStablePrefixLength = min(draft?.stablePrefixLength ?? 0, draftText.count)
@@ -1096,6 +1098,7 @@ final class AppModel: ObservableObject {
                   generation == draftClearGeneration else { return }
 
             clearDraftOverlay()
+            scheduleCommittedCaptionArchiveIfNeeded()
         }
     }
 
@@ -1165,12 +1168,13 @@ final class AppModel: ObservableObject {
 
     /// Archives the current committed caption, then clears the live overlay text.
     private func clearOverlayText() {
-        guard let current = overlayState,
-              !current.translatedText.isEmpty else { return }
-        appendOverlayHistoryEntry(
-            translatedText: current.translatedText,
-            sourceText: current.sourceText
-        )
+        if let currentCaption = currentCommittedCaptionHistoryPayload() {
+            appendOverlayHistoryEntry(
+                translatedText: currentCaption.translatedText,
+                sourceText: currentCaption.sourceText
+            )
+        }
+        cancelCommittedCaptionArchive()
         clearDraftOverlay()
         overlayState?.translatedText = ""
         overlayState?.sourceText = ""
@@ -1183,15 +1187,10 @@ final class AppModel: ObservableObject {
     /// Archives the currently committed caption into the scrollback history before
     /// the next sentence replaces it.
     private func capturePreviousCaption() {
-        guard let current = overlayState,
-              displayedCaption != nil,
-              !current.translatedText.isEmpty,
-              current.translatedText != listeningPlaceholderText,
-              current.translatedText != captureStoppedText,
-              current.translatedText != unableToStartText else { return }
+        guard let currentCaption = currentCommittedCaptionHistoryPayload() else { return }
         appendOverlayHistoryEntry(
-            translatedText: current.translatedText,
-            sourceText: current.sourceText
+            translatedText: currentCaption.translatedText,
+            sourceText: currentCaption.sourceText
         )
     }
 
@@ -1255,6 +1254,8 @@ final class AppModel: ObservableObject {
         guard sourceText.isEmpty == false else {
             return
         }
+
+        cancelCommittedCaptionArchive()
 
         if let promotionID = sentence.promotionSegmentID {
             markDraftPromotionFinalized(promotionID)
@@ -1346,6 +1347,8 @@ final class AppModel: ObservableObject {
         draftClearTask = nil
         draftTranslationTask?.cancel()
         draftTranslationTask = nil
+        committedCaptionArchiveTask?.cancel()
+        committedCaptionArchiveTask = nil
         lastDraftStablePrefix = ""
         lastDraftTranslationSource = ""
         draftTranslationGeneration &+= 1
@@ -1382,7 +1385,10 @@ final class AppModel: ObservableObject {
 
     private func processCaptionQueue() async {
         // Guaranteed to run even if we break or the task is cancelled.
-        defer { captionDisplayTask = nil }
+        defer {
+            captionDisplayTask = nil
+            scheduleCommittedCaptionArchiveIfNeeded()
+        }
 
         while Task.isCancelled == false {
             guard liveTranscriptionSession != nil else { break }
@@ -1404,6 +1410,7 @@ final class AppModel: ObservableObject {
             capturePreviousCaption()
 
             // Source-first: show source text immediately while translation is pending
+            cancelCommittedCaptionArchive()
             displayedCaption = caption
 
             // If a draft translation was visible, skip the fade-in so the committed
@@ -1669,6 +1676,64 @@ final class AppModel: ObservableObject {
         captionTranslationTasks.removeAll()
     }
 
+    private func cancelCommittedCaptionArchive() {
+        committedCaptionArchiveTask?.cancel()
+        committedCaptionArchiveTask = nil
+    }
+
+    private func scheduleCommittedCaptionArchiveIfNeeded() {
+        cancelCommittedCaptionArchive()
+
+        guard liveTranscriptionSession != nil,
+              pendingCaptions.isEmpty,
+              hasActiveDraftOverlay == false,
+              currentCommittedCaptionHistoryPayload() != nil else {
+            return
+        }
+
+        let elapsed = max(0, Date().timeIntervalSince(displayedCaptionLastVisualUpdateAt))
+        let remainingDelay = max(0, Self.committedCaptionIdleArchiveDelay - elapsed)
+
+        committedCaptionArchiveTask = Task { @MainActor [weak self] in
+            guard let self else { return }
+
+            if remainingDelay > 0 {
+                do {
+                    try await Task.sleep(nanoseconds: UInt64(remainingDelay * 1_000_000_000))
+                } catch {
+                    return
+                }
+            }
+
+            guard !Task.isCancelled,
+                  liveTranscriptionSession != nil,
+                  pendingCaptions.isEmpty,
+                  hasActiveDraftOverlay == false,
+                  currentCommittedCaptionHistoryPayload() != nil else {
+                return
+            }
+
+            clearOverlayText()
+        }
+    }
+
+    private var hasActiveDraftOverlay: Bool {
+        sanitizedDisplayText(overlayState?.draftSourceText ?? "").isEmpty == false
+    }
+
+    private func currentCommittedCaptionHistoryPayload() -> (translatedText: String, sourceText: String)? {
+        guard let current = overlayState,
+              displayedCaption != nil,
+              current.translatedText.isEmpty == false,
+              current.translatedText != listeningPlaceholderText,
+              current.translatedText != captureStoppedText,
+              current.translatedText != unableToStartText else {
+            return nil
+        }
+
+        return (current.translatedText, current.sourceText)
+    }
+
     private var overlayHistoryCount: Int {
         overlayState?.history.count ?? 0
     }
@@ -1811,6 +1876,7 @@ private enum StatusDescriptor {
 private extension AppModel {
     static let overlayHistoryLimit = 120
     static let draftClearDelayNanoseconds: UInt64 = 150_000_000
+    static let committedCaptionIdleArchiveDelay: TimeInterval = 0.9
     static let finalizedDraftPromotionLimit = 32
 }
 

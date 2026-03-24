@@ -841,7 +841,7 @@ final class OverlayWindowController {
 
     private func updateAttachToSourceLevels() {
         let useHighLevel = !model.overlayStyle.attachToSource || isSourceAppFrontmost()
-        let contentLevel: NSWindow.Level = useHighLevel ? .statusBar : .normal
+        let contentLevel: NSWindow.Level = useHighLevel ? .statusBar : .floating
         let controlLevel = NSWindow.Level(rawValue: contentLevel.rawValue + 1)
 
         let allContentPanels: [OverlayPanel] = [panel, controlsChromePanel]

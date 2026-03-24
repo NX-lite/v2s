@@ -133,6 +133,8 @@ final class LiveTranscriptionSession: NSObject, @unchecked Sendable {
     private var modernAudioConverter: AVAudioConverter?
     private var modernAudioConverterInputSignature: AudioFormatSignature?
     private var committedSegmentCount = 0
+    private let committedBoundaryToleranceSec: TimeInterval = 0.08
+    private var committedAudioBoundaryTime: TimeInterval?
     private var recognitionContextualStrings: [String] = []
     private var recognitionBackend: RecognitionBackend = .legacy
     private var activeLocaleIdentifier: String?
@@ -243,13 +245,11 @@ final class LiveTranscriptionSession: NSObject, @unchecked Sendable {
         speechRecognizer = nil
         activeLocaleIdentifier = nil
         resetAudioProcessingState()
-        committedSegmentCount = 0
+        resetLegacyTranscriptionState()
 
         vadEngine = nil
         lastVADProbability = 0
 
-        latestSegments = []
-        latestFormattedText = ""
         resetModernTranscriptionState()
         partialHandler = nil
         resetDraftState()
@@ -314,9 +314,7 @@ final class LiveTranscriptionSession: NSObject, @unchecked Sendable {
         recognitionTask = task
         recognitionBackend = .legacy
         resetAudioProcessingState()
-        committedSegmentCount = 0
-        latestSegments = []
-        latestFormattedText = ""
+        resetLegacyTranscriptionState()
         resetModernTranscriptionState()
         cancelSilenceTimer()
         resetDraftState()
@@ -420,9 +418,7 @@ final class LiveTranscriptionSession: NSObject, @unchecked Sendable {
         speechRecognizer = nil
         audioConverter = nil
         audioConverterInputSignature = nil
-        committedSegmentCount = 0
-        latestSegments = []
-        latestFormattedText = ""
+        resetLegacyTranscriptionState()
         resetModernTranscriptionState()
         cancelSilenceTimer()
         cancelVADSilenceTimer()
@@ -555,6 +551,13 @@ final class LiveTranscriptionSession: NSObject, @unchecked Sendable {
     private func resetModernTranscriptionState() {
         latestModernText = ""
         modernCommittedPrefixText = ""
+    }
+
+    private func resetLegacyTranscriptionState() {
+        committedSegmentCount = 0
+        committedAudioBoundaryTime = nil
+        latestSegments = []
+        latestFormattedText = ""
     }
 
     private func startMicrophoneCapture(deviceUniqueID: String) throws {
@@ -1217,10 +1220,7 @@ final class LiveTranscriptionSession: NSObject, @unchecked Sendable {
         latestSegments = segments
         latestFormattedText = formattedText
 
-        if committedSegmentCount > segments.count {
-            committedSegmentCount = 0
-            resetDraftState()
-        }
+        alignCommittedSegmentCount(to: segments)
 
         guard committedSegmentCount < segments.count else {
             cancelSilenceTimer()
@@ -1295,6 +1295,7 @@ final class LiveTranscriptionSession: NSObject, @unchecked Sendable {
                 )
             }
 
+            committedAudioBoundaryTime = segmentEndTime(for: segments[commitEndIndex])
             sentenceStartIndex = commitEndIndex + 1
             committedSegmentCount = sentenceStartIndex
             resetDraftState()
@@ -1364,9 +1365,7 @@ final class LiveTranscriptionSession: NSObject, @unchecked Sendable {
         recognitionTask = task
         // Reset the converter — new request may have a different nativeAudioFormat.
         resetAudioProcessingState()
-        committedSegmentCount = 0
-        latestSegments = []
-        latestFormattedText = ""
+        resetLegacyTranscriptionState()
         resetModernTranscriptionState()
         resetDraftState()
         Task { await emitPartialDraft(nil) }
@@ -1708,6 +1707,7 @@ final class LiveTranscriptionSession: NSObject, @unchecked Sendable {
             .trimmingCharacters(in: .whitespacesAndNewlines)
         let committedDraftID = currentDraftId
 
+        committedAudioBoundaryTime = segmentEndTime(for: segments[lastIdx])
         committedSegmentCount = segments.count
         resetDraftState()
         if sentenceText.isEmpty == false {
@@ -1753,6 +1753,33 @@ final class LiveTranscriptionSession: NSObject, @unchecked Sendable {
         }
 
         return settleWindowMs - max(elapsedMs, 0)
+    }
+
+    private func alignCommittedSegmentCount(to segments: [SFTranscriptionSegment]) {
+        if segments.count < committedSegmentCount {
+            resetLegacyTranscriptionState()
+            resetDraftState()
+            return
+        }
+
+        guard let committedAudioBoundaryTime else {
+            return
+        }
+
+        let alignedCount = segments.prefix {
+            segmentEndTime(for: $0) <= committedAudioBoundaryTime + committedBoundaryToleranceSec
+        }.count
+
+        guard alignedCount != committedSegmentCount else {
+            return
+        }
+
+        committedSegmentCount = alignedCount
+        resetDraftState()
+    }
+
+    private func segmentEndTime(for segment: SFTranscriptionSegment) -> TimeInterval {
+        segment.timestamp + segment.duration
     }
 
     // MARK: - Draft helpers (called on captureQueue)
