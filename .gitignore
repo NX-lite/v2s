@@ -25,5 +25,8 @@ dist/
 .claude/worktrees/
 
 
+# Docs (local development notes)
+docs/
+
 #Ignore cursor AI rules
 .cursor/rules/codacy.mdc

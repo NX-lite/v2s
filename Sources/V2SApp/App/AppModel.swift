@@ -1413,6 +1413,7 @@ final class AppModel: ObservableObject {
         displayedCaptionLastVisualUpdateAt = Date.distantPast
         displayedCaptionLastVisualUpdateWasLateTranslation = false
 
+        translationCoordinator.invalidateSession()
         translationCoordinator.reset()
 
         Task {
@@ -1457,17 +1458,25 @@ final class AppModel: ObservableObject {
             // Archive the current caption before the next sentence replaces it.
             capturePreviousCaption()
 
-            // Source-first: show source text immediately while translation is pending
+            // Use the best available translation for the initial committed display:
+            // 1. Pre-computed caption translation (if ready)
+            // 2. Draft translation that was already visible (avoids flash of source text)
+            // 3. Fall back to source text
+            let earlyTranslation = readyCaptionTranslations[caption.id]
+            let draftTranslation = overlayState?.draftTranslatedText
+            let initialTranslation = earlyTranslation
+                ?? (draftTranslation?.isEmpty == false ? draftTranslation : nil)
+
             cancelCommittedCaptionArchive()
             displayedCaption = caption
 
             // If a draft translation was visible, skip the fade-in so the committed
             // text replaces the draft seamlessly instead of flashing.
-            let hadDraftTranslation = overlayState?.draftTranslatedText?.isEmpty == false
+            let hadDraftTranslation = draftTranslation?.isEmpty == false
 
             overlayState?.skipCommittedFadeIn = hadDraftTranslation
             updateCommittedOverlay(
-                translatedText: caption.sourceText,
+                translatedText: initialTranslation ?? caption.sourceText,
                 sourceText: caption.sourceText,
                 promotionID: caption.promotionID,
                 bumpEpoch: true
@@ -1475,11 +1484,39 @@ final class AppModel: ObservableObject {
             overlayState?.sourceName = caption.sourceName
             clearDraftOverlay()
 
-            // Wait up to 1.5 s for translation; fall back to source text
-            let finalText = await waitForTranslatedCaption(id: caption.id, timeout: 1.5)
-                ?? caption.sourceText
+            let finalText: String
+            if let earlyTranslation {
+                finalText = earlyTranslation
+            } else {
+                // Dynamic wait: base 3s + 1s per 30 chars, capped at 15s
+                let captionCharCount = caption.sourceText.count
+                let waitTimeout = min(max(3.0, 3.0 + Double(captionCharCount / 30) * 1.0), 15.0)
+                finalText = await waitForTranslatedCaption(id: caption.id, timeout: waitTimeout)
+                    ?? caption.sourceText
+            }
 
             guard liveTranscriptionSession != nil else { break }
+
+            // Track whether translation actually worked.
+            // If it failed (returned source text), the session may be stuck.
+            let translationExpected = currentSourceLanguageID != outputLanguageID
+            let translationFailed = translationExpected && finalText == caption.sourceText
+                && !caption.sourceText.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+
+            if translationFailed {
+                translationCoordinator.consecutiveTimeouts += 1
+            } else {
+                translationCoordinator.consecutiveTimeouts = 0
+            }
+
+            // After 2 consecutive failed captions, recover the session between captions.
+            // This is safe because no translation is in-flight at this point.
+            if translationCoordinator.consecutiveTimeouts >= 2 {
+                translationCoordinator.recoverSession(
+                    source: currentSourceLanguageID,
+                    target: outputLanguageID
+                )
+            }
 
             updateCommittedOverlay(
                 translatedText: finalText,
@@ -1642,6 +1679,12 @@ final class AppModel: ObservableObject {
             return caption.sourceText
         }
 
+        // Dynamic timeout: base 3s + 1s per 30 chars, capped at 15s.
+        // Chinese/CJK text needs more time since each character carries more meaning.
+        let charCount = caption.sourceText.count
+        let dynamicTimeout = min(max(3.0, 3.0 + Double(charCount / 30) * 1.0), 15.0)
+        let timeoutNanoseconds = UInt64(dynamicTimeout * 1_000_000_000)
+
         let raw = await withTaskGroup(of: String.self, returning: String.self) { group in
             group.addTask {
                 do {
@@ -1656,7 +1699,7 @@ final class AppModel: ObservableObject {
             }
 
             group.addTask {
-                try? await Task.sleep(nanoseconds: 1_500_000_000)
+                try? await Task.sleep(nanoseconds: timeoutNanoseconds)
                 return caption.sourceText
             }
 
@@ -2070,6 +2113,7 @@ private final class TranslationCoordinator: ObservableObject {
     private var activeOperationID: UUID?
     private var cancelledOperationIDs: Set<UUID> = []
     private var generation: Int = 0
+    fileprivate var consecutiveTimeouts: Int = 0
 
     func prepareIfNeeded(
         from sourceIdentifier: String,
@@ -2245,6 +2289,53 @@ private final class TranslationCoordinator: ObservableObject {
         activeOperationID = nil
         currentPair = nil
         configuration = nil
+        consecutiveTimeouts = 0
+    }
+
+    /// Invalidate the current TranslationSession so SwiftUI's `.translationTask()`
+    /// provides a fresh session. Use this to recover from a stuck translation state
+    /// without requiring a full app restart.
+    func invalidateSession() {
+        configuration?.invalidate()
+        activeRunnerID = nil
+        configuration = nil
+    }
+
+    /// Full recovery: invalidate the stuck session, reset all state, then immediately
+    /// create a fresh configuration for the given language pair so a new runner can start.
+    /// The old runner (stuck in session.translate()) will see a generation mismatch and exit.
+    func recoverSession(source: String, target: String) {
+        var oldConfig = configuration
+        // Bump generation so the stuck runner exits when it finally returns
+        generation &+= 1
+        // Cancel all pending operations
+        cancelledOperationIDs.removeAll()
+        if let activeOperationID {
+            cancelledOperationIDs.insert(activeOperationID)
+        }
+        for operation in pendingOperations {
+            switch operation {
+            case .prepare(_, _, _, let continuation):
+                continuation.resume(throwing: CancellationError())
+            case .translate(_, _, _, _, let continuation):
+                continuation.resume(throwing: CancellationError())
+            }
+        }
+        pendingOperations.removeAll()
+        activeRunnerID = nil
+        activeOperationID = nil
+        consecutiveTimeouts = 0
+
+        // Invalidate the old session so SwiftUI provides a fresh one
+        oldConfig?.invalidate()
+
+        // Immediately create a new configuration for the current pair
+        // so SwiftUI's .translationTask() fires with a new session
+        currentPair = LanguagePair(source: source, target: target)
+        configuration = TranslationSession.Configuration(
+            source: Locale.Language(identifier: source),
+            target: Locale.Language(identifier: target)
+        )
     }
 
     private func enqueue(_ operation: PendingOperation) {
