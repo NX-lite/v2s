@@ -20,6 +20,10 @@
   <img src="https://github.com/user-attachments/assets/b65167ee-ae7e-4e37-8316-ebd200ae89a7" alt="Mar-20-2026 11-08-59">
 </p>
 
+
+![Screenshot 2026-03-25 at 1 10 39 PM](https://github.com/user-attachments/assets/449039ee-c329-426e-a55b-ab6660c56ca7)
+
+
 ## Why v2s
 
 - Follow live conversations with translated subtitles pinned at the top of your screen.
