@@ -95,6 +95,14 @@ final class AppModel: ObservableObject {
         }
     }
 
+    @Published var subtitleDisplayMode: SubtitleDisplayMode {
+        didSet {
+            guard oldValue != subtitleDisplayMode else { return }
+            persistSettings()
+            handleSubtitleDisplayModeChange()
+        }
+    }
+
     @Published var glossary: [String: String] {
         didSet {
             persistSettings()
@@ -119,6 +127,7 @@ final class AppModel: ObservableObject {
         let normalizedOverlayStyle = AppModel.normalizedOverlayStyle(settings.overlayStyle)
         self.overlayStyle = normalizedOverlayStyle
         self.subtitleMode = settings.subtitleMode
+        self.subtitleDisplayMode = settings.subtitleDisplayMode
         self.glossary = settings.glossary
         self.translationHostConfiguration = nil
 
@@ -190,6 +199,14 @@ final class AppModel: ObservableObject {
 
     var interfaceLocale: Locale {
         AppLocalization.locale(for: resolvedInterfaceLanguageID)
+    }
+
+    var showsOriginalSubtitle: Bool {
+        subtitleDisplayMode.showsOriginalSubtitle
+    }
+
+    var showsTranslatedSubtitle: Bool {
+        subtitleDisplayMode.showsTranslatedSubtitle
     }
 
     func localized(_ key: AppTextKey, _ arguments: CVarArg...) -> String {
@@ -450,6 +467,7 @@ final class AppModel: ObservableObject {
             interfaceLanguageID: usesSystemInterfaceLanguage ? nil : interfaceLanguageID,
             overlayStyle: overlayStyle,
             subtitleMode: subtitleMode,
+            subtitleDisplayMode: subtitleDisplayMode,
             glossary: glossary
         )
 
@@ -1230,6 +1248,36 @@ final class AppModel: ObservableObject {
         overlayHistoryScrollOffset = 0
     }
 
+    private func handleSubtitleDisplayModeChange() {
+        guard liveTranscriptionSession != nil else {
+            return
+        }
+
+        if showsTranslatedSubtitle {
+            let draftText = sanitizedDisplayText(overlayState?.draftSourceText ?? "")
+            guard draftText.isEmpty == false else {
+                scheduleCommittedCaptionArchiveIfNeeded()
+                return
+            }
+
+            if shouldReserveDraftTranslationSlot {
+                scheduleDraftTranslation(for: draftText)
+            } else {
+                draftTranslationTask?.cancel()
+                draftTranslationTask = nil
+                draftTranslationGeneration &+= 1
+                overlayState?.draftTranslatedText = draftText
+            }
+        } else {
+            draftTranslationTask?.cancel()
+            draftTranslationTask = nil
+            draftTranslationGeneration &+= 1
+            overlayState?.draftTranslatedText = nil
+        }
+
+        scheduleCommittedCaptionArchiveIfNeeded()
+    }
+
     private func makePreviewState(for source: InputSource) -> OverlayPreviewState {
         let sourceText = sampleText(for: inputLanguageID)
         let translatedText: String
@@ -1337,7 +1385,7 @@ final class AppModel: ObservableObject {
     }
 
     var shouldReserveDraftTranslationSlot: Bool {
-        currentSourceLanguageID != outputLanguageID
+        showsTranslatedSubtitle && currentSourceLanguageID != outputLanguageID
     }
 
     private func resetLiveTextPipeline() {
@@ -1807,7 +1855,12 @@ final class AppModel: ObservableObject {
 
     /// max(min_hold, reading_time, audio_span × sync_factor), clamped to [1.2, 4.5] s
     private func computeDisplayDuration(sourceText: String, translatedText: String) -> Double {
-        let displayText = translatedText.isEmpty ? sourceText : translatedText
+        let displayText: String
+        if showsTranslatedSubtitle {
+            displayText = translatedText.isEmpty ? sourceText : translatedText
+        } else {
+            displayText = sourceText.isEmpty ? translatedText : sourceText
+        }
         let charCount = Double(displayText.count)
         let isCJK = displayText.unicodeScalars.contains {
             (0x4E00...0x9FFF).contains($0.value)
@@ -1819,7 +1872,7 @@ final class AppModel: ObservableObject {
         var readingTime = charCount / cps
 
         // Bilingual factor: both source and translation shown simultaneously
-        if inputLanguageID != outputLanguageID {
+        if showsOriginalSubtitle && showsTranslatedSubtitle && inputLanguageID != outputLanguageID {
             readingTime *= 1.15
         }
 

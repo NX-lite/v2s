@@ -7,6 +7,7 @@ struct AppSettings: Codable {
     var interfaceLanguageID: String?
     var overlayStyle: OverlayStyle
     var subtitleMode: SubtitleMode
+    var subtitleDisplayMode: SubtitleDisplayMode
     var glossary: [String: String]
 
     static let `default` = AppSettings(
@@ -16,10 +17,11 @@ struct AppSettings: Codable {
         interfaceLanguageID: nil,
         overlayStyle: .default,
         subtitleMode: .balanced,
+        subtitleDisplayMode: .both,
         glossary: [:]
     )
 
-    // Custom decoder so existing settings files (without subtitleMode/glossary) load cleanly.
+    // Custom decoder so existing settings files load cleanly as new fields are added.
     init(from decoder: Decoder) throws {
         let c = try decoder.container(keyedBy: CodingKeys.self)
         selectedSourceID = try c.decodeIfPresent(String.self, forKey: .selectedSourceID)
@@ -28,6 +30,7 @@ struct AppSettings: Codable {
         interfaceLanguageID = try c.decodeIfPresent(String.self, forKey: .interfaceLanguageID)
         overlayStyle     = try c.decode(OverlayStyle.self, forKey: .overlayStyle)
         subtitleMode     = try c.decodeIfPresent(SubtitleMode.self, forKey: .subtitleMode) ?? .balanced
+        subtitleDisplayMode = try c.decodeIfPresent(SubtitleDisplayMode.self, forKey: .subtitleDisplayMode) ?? .both
         glossary         = try c.decodeIfPresent([String: String].self, forKey: .glossary) ?? [:]
     }
 
@@ -38,6 +41,7 @@ struct AppSettings: Codable {
         interfaceLanguageID: String?,
         overlayStyle: OverlayStyle,
         subtitleMode: SubtitleMode,
+        subtitleDisplayMode: SubtitleDisplayMode,
         glossary: [String: String]
     ) {
         self.selectedSourceID = selectedSourceID
@@ -46,6 +50,7 @@ struct AppSettings: Codable {
         self.interfaceLanguageID = interfaceLanguageID
         self.overlayStyle     = overlayStyle
         self.subtitleMode     = subtitleMode
+        self.subtitleDisplayMode = subtitleDisplayMode
         self.glossary         = glossary
     }
 }

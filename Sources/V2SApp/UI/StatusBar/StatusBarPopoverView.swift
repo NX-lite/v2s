@@ -133,6 +133,15 @@ struct StatusBarPopoverView: View {
                 .pickerStyle(.menu)
                 .labelsHidden()
             }
+            row(model.localized(.displayShort)) {
+                Picker("", selection: subtitleDisplayModeBinding) {
+                    ForEach(SubtitleDisplayMode.allCases, id: \.self) { mode in
+                        Text(mode.displayName(in: model.resolvedInterfaceLanguageID)).tag(mode)
+                    }
+                }
+                .pickerStyle(.menu)
+                .labelsHidden()
+            }
             HStack {
                 Spacer()
                 Button {
@@ -283,6 +292,10 @@ struct StatusBarPopoverView: View {
     }
     private var subtitleModeBinding: Binding<SubtitleMode> {
         Binding(get: { model.subtitleMode }, set: { model.subtitleMode = $0 })
+    }
+
+    private var subtitleDisplayModeBinding: Binding<SubtitleDisplayMode> {
+        Binding(get: { model.subtitleDisplayMode }, set: { model.subtitleDisplayMode = $0 })
     }
     private var overlayOpacityBinding: Binding<Double> {
         Binding(

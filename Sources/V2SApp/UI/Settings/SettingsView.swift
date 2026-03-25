@@ -178,6 +178,16 @@ struct SettingsView: View {
                             .help(model.localized(.subtitleModeHelp))
                         }
                     }
+                    Divider()
+                    settingsRow(model.localized(.subtitleDisplay)) {
+                        Picker("", selection: subtitleDisplayModeBinding) {
+                            ForEach(SubtitleDisplayMode.allCases, id: \.self) { mode in
+                                Text(mode.displayName(in: model.resolvedInterfaceLanguageID)).tag(mode)
+                            }
+                        }
+                        .pickerStyle(.menu)
+                        .labelsHidden()
+                    }
                     HStack {
                         Spacer()
                         Button {
@@ -406,6 +416,13 @@ struct SettingsView: View {
         Binding(
             get: { model.subtitleMode },
             set: { model.subtitleMode = $0 }
+        )
+    }
+
+    private var subtitleDisplayModeBinding: Binding<SubtitleDisplayMode> {
+        Binding(
+            get: { model.subtitleDisplayMode },
+            set: { model.subtitleDisplayMode = $0 }
         )
     }
 

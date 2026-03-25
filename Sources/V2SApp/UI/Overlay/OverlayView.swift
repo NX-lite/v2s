@@ -158,8 +158,8 @@ struct OverlayView: View {
                 fillColor: color
             ),
             rawText: text,
-            fontSize: model.overlayStyle.scaledSourceFontSize,
-            weight: .regular
+            fontSize: displayedSourceFontSize,
+            weight: displayedSourceFontWeight
         )
     }
 
@@ -173,36 +173,40 @@ struct OverlayView: View {
             if let draftText = state.draftSourceText, !draftText.isEmpty {
                 applyingPromotionTransition(
                     to: VStack(spacing: 2) {
-                    if let draftTranslated = state.draftTranslatedText, !draftTranslated.isEmpty {
-                        translatedText(
-                            draftTranslated,
-                            color: subtitleColor(opacity: 0.55)
-                        )
-                    } else if model.shouldReserveDraftTranslationSlot {
-                        Text(" ")
-                            .font(.system(size: model.overlayStyle.scaledTranslatedFontSize, weight: .semibold))
-                            .multilineTextAlignment(.center)
-                            .lineLimit(2)
-                            .frame(maxWidth: .infinity)
-                            .hidden()
-                            .accessibilityHidden(true)
+                        if showsTranslatedSubtitle {
+                            if let draftTranslated = state.draftTranslatedText, !draftTranslated.isEmpty {
+                                translatedText(
+                                    draftTranslated,
+                                    color: subtitleColor(opacity: 0.55)
+                                )
+                            } else if model.shouldReserveDraftTranslationSlot {
+                                Text(" ")
+                                    .font(.system(size: model.overlayStyle.scaledTranslatedFontSize, weight: .semibold))
+                                    .multilineTextAlignment(.center)
+                                    .lineLimit(2)
+                                    .frame(maxWidth: .infinity)
+                                    .hidden()
+                                    .accessibilityHidden(true)
+                            }
+                        }
+
+                        if showsOriginalSubtitle {
+                            let prefixLen = min(state.draftStablePrefixLength, draftText.count)
+                            let stable = String(draftText.prefix(prefixLen))
+                            let mutable = String(draftText.dropFirst(prefixLen))
+
+                            captionText(
+                                draftSourceAttributedText(
+                                    stable: stable,
+                                    mutable: mutable
+                                ),
+                                rawText: draftText,
+                                fontSize: displayedSourceFontSize,
+                                weight: displayedSourceFontWeight
+                            )
+                        }
                     }
-
-                    let prefixLen = min(state.draftStablePrefixLength, draftText.count)
-                    let stable = String(draftText.prefix(prefixLen))
-                    let mutable = String(draftText.dropFirst(prefixLen))
-
-                    captionText(
-                        draftSourceAttributedText(
-                            stable: stable,
-                            mutable: mutable
-                        ),
-                        rawText: draftText,
-                        fontSize: model.overlayStyle.scaledSourceFontSize,
-                        weight: .regular
-                    )
-                }
-                .background(draftSlotHeightReader),
+                    .background(draftSlotHeightReader),
                     key: promotionKey(
                         promotionID: state.draftPromotionID,
                         sourceText: draftText,
@@ -259,7 +263,8 @@ struct OverlayView: View {
     }
 
     private func hasCommittedCaption(_ state: OverlayPreviewState) -> Bool {
-        state.translatedText.isEmpty == false || state.sourceText.isEmpty == false
+        (showsTranslatedSubtitle && state.translatedText.isEmpty == false)
+            || (showsOriginalSubtitle && state.sourceText.isEmpty == false)
     }
 
     private func shouldReserveCommittedSlot(for state: OverlayPreviewState) -> Bool {
@@ -289,7 +294,10 @@ struct OverlayView: View {
     }
 
     private var historyRowHeight: CGFloat {
-        CGFloat(model.overlayStyle.scaledTranslatedFontSize + model.overlayStyle.scaledSourceFontSize + 22.0)
+        estimatedCaptionPairHeight(
+            showsTranslated: showsTranslatedSubtitle,
+            showsSource: showsOriginalSubtitle
+        )
     }
 
     private var committedRowHeight: CGFloat {
@@ -311,12 +319,12 @@ struct OverlayView: View {
     }
 
     private func estimatedDraftRowHeight(for state: OverlayPreviewState) -> CGFloat {
-        let translatedHeight = (
+        let translatedHeight = showsTranslatedSubtitle && (
             (state.draftTranslatedText?.isEmpty == false) || model.shouldReserveDraftTranslationSlot
         )
-            ? CGFloat(model.overlayStyle.scaledTranslatedFontSize + 10.0)
+            ? translatedLineHeight
             : 0
-        let sourceHeight = CGFloat(model.overlayStyle.scaledSourceFontSize + 14.0)
+        let sourceHeight = showsOriginalSubtitle ? sourceLineHeight : 0
         return translatedHeight + sourceHeight
     }
 
@@ -385,31 +393,78 @@ struct OverlayView: View {
     ) -> some View {
         VStack(spacing: Self.captionPairSpacing) {
             if model.overlayStyle.translatedFirst {
-                translatedText(
-                    translated,
-                    color: translatedColor
-                )
+                if showsTranslatedSubtitle {
+                    translatedText(
+                        translated,
+                        color: translatedColor
+                    )
+                }
 
-                if source.isEmpty == false {
+                if showsOriginalSubtitle, source.isEmpty == false {
                     sourceText(
                         source,
                         color: sourceColor
                     )
                 }
             } else {
-                if source.isEmpty == false {
+                if showsOriginalSubtitle, source.isEmpty == false {
                     sourceText(
                         source,
                         color: sourceColor
                     )
                 }
 
-                translatedText(
-                    translated,
-                    color: translatedColor
-                )
+                if showsTranslatedSubtitle {
+                    translatedText(
+                        translated,
+                        color: translatedColor
+                    )
+                }
             }
         }
+    }
+
+    private var showsOriginalSubtitle: Bool {
+        model.showsOriginalSubtitle
+    }
+
+    private var showsTranslatedSubtitle: Bool {
+        model.showsTranslatedSubtitle
+    }
+
+    private var translatedLineHeight: CGFloat {
+        CGFloat(model.overlayStyle.scaledTranslatedFontSize + 10.0)
+    }
+
+    private var sourceLineHeight: CGFloat {
+        if usesTranslatedTypographyForSourceText {
+            return translatedLineHeight
+        }
+
+        return CGFloat(model.overlayStyle.scaledSourceFontSize + 14.0)
+    }
+
+    private var usesTranslatedTypographyForSourceText: Bool {
+        showsOriginalSubtitle && !showsTranslatedSubtitle
+    }
+
+    private var displayedSourceFontSize: Double {
+        usesTranslatedTypographyForSourceText
+            ? model.overlayStyle.scaledTranslatedFontSize
+            : model.overlayStyle.scaledSourceFontSize
+    }
+
+    private var displayedSourceFontWeight: Font.Weight {
+        usesTranslatedTypographyForSourceText ? .semibold : .regular
+    }
+
+    private func estimatedCaptionPairHeight(
+        showsTranslated: Bool,
+        showsSource: Bool
+    ) -> CGFloat {
+        let translatedHeight = showsTranslated ? translatedLineHeight : 0
+        let sourceHeight = showsSource ? sourceLineHeight : 0
+        return translatedHeight + sourceHeight
     }
 
     private var continuousFlowMask: some View {
