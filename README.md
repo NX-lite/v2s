@@ -34,6 +34,7 @@
 - Audio source selection for microphones and running macOS apps.
 - On-device speech transcription powered by Apple Speech.
 - On-device translation powered by Apple Translation.
+- Transcript summarization powered by Apple Intelligence for quick overview of conversations.
 - Overlay styling controls so the subtitle bar stays readable on top of real work.
 
 ## Privacy
