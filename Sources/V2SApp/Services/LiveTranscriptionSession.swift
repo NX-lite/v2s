@@ -63,6 +63,13 @@ final class LiveTranscriptionSession: NSObject, @unchecked Sendable {
         let promotionSegmentID: UUID?
     }
 
+    @MainActor
+    private struct RecentCommittedSentence {
+        let rawText: String
+        let comparableText: String
+        let time: Date
+    }
+
     private struct AudioLevelStats {
         let peak: Float
         let rms: Float
@@ -155,6 +162,7 @@ final class LiveTranscriptionSession: NSObject, @unchecked Sendable {
     private var transcriptHandler: (@MainActor (RecognizedSentence) -> Void)?
     private var partialHandler: (@MainActor (DraftSegment?) -> Void)?
     private var errorHandler: (@MainActor (String) -> Void)?
+    @MainActor private var recentCommittedSentenceHistory: [RecentCommittedSentence] = []
 
     private func localized(_ key: AppTextKey, _ arguments: CVarArg...) -> String {
         AppLocalization.formattedString(key, languageID: interfaceLanguageID, arguments: arguments)
@@ -213,6 +221,9 @@ final class LiveTranscriptionSession: NSObject, @unchecked Sendable {
         self.activeLocaleIdentifier = localeIdentifier
         self.interfaceLanguageID = interfaceLanguageID
         self.errorHandler = errorHandler
+        await MainActor.run {
+            recentCommittedSentenceHistory.removeAll()
+        }
 
         try await requestRequiredPermissions(for: source)
         if try await configureModernSpeechRecognizer(localeIdentifier: localeIdentifier) == false {
@@ -253,6 +264,9 @@ final class LiveTranscriptionSession: NSObject, @unchecked Sendable {
         resetModernTranscriptionState()
         partialHandler = nil
         resetDraftState()
+        Task { @MainActor [weak self] in
+            self?.recentCommittedSentenceHistory.removeAll()
+        }
     }
 
     private func requestRequiredPermissions(for source: InputSource) async throws {
@@ -1044,11 +1058,26 @@ final class LiveTranscriptionSession: NSObject, @unchecked Sendable {
         _ emissions: [CommittedEmission],
         clearDraftAfter: Bool = false
     ) {
+        pruneRecentCommittedSentenceHistory()
+
         for emission in emissions {
-            emitRecognizedText(
-                emission.text,
-                promotionSegmentID: emission.promotionSegmentID
-            )
+            let sentenceTexts = splitRecognizedSentences(in: emission.text)
+            var pendingPromotionID = emission.promotionSegmentID
+
+            for sentenceText in sentenceTexts {
+                guard let preparedSentence = prepareCommittedSentenceForEmission(sentenceText) else {
+                    continue
+                }
+
+                emitRecognizedSentence(
+                    RecognizedSentence(
+                        text: preparedSentence,
+                        promotionSegmentID: pendingPromotionID
+                    )
+                )
+                rememberCommittedSentence(preparedSentence)
+                pendingPromotionID = nil
+            }
         }
 
         if clearDraftAfter {
@@ -1064,6 +1093,130 @@ final class LiveTranscriptionSession: NSObject, @unchecked Sendable {
     @MainActor
     private func emitError(_ message: String) {
         errorHandler?(message)
+    }
+
+    @MainActor
+    private func prepareCommittedSentenceForEmission(_ text: String) -> String? {
+        let trimmed = text.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard trimmed.isEmpty == false else {
+            return nil
+        }
+
+        let comparable = comparableCommittedSentenceText(trimmed)
+        guard comparable.isEmpty == false else {
+            return nil
+        }
+
+        if recentCommittedSentenceHistory.contains(where: { $0.comparableText == comparable }) {
+            return nil
+        }
+
+        let bestOverlap = recentCommittedSentenceHistory
+            .suffix(3)
+            .map { leadingOverlapLength(previous: $0.rawText, current: trimmed) }
+            .max() ?? 0
+
+        let candidateText: String
+        if shouldTrimLeadingOverlap(length: bestOverlap, in: trimmed) {
+            candidateText = dropLeadingCharacters(bestOverlap, from: trimmed)
+                .trimmingCharacters(in: Self.leadingOverlapTrimCharacterSet)
+        } else {
+            candidateText = trimmed
+        }
+
+        guard candidateText.isEmpty == false else {
+            return nil
+        }
+
+        let candidateComparable = comparableCommittedSentenceText(candidateText)
+        guard candidateComparable.isEmpty == false,
+              recentCommittedSentenceHistory.contains(where: { $0.comparableText == candidateComparable }) == false else {
+            return nil
+        }
+
+        return candidateText
+    }
+
+    @MainActor
+    private func rememberCommittedSentence(_ text: String) {
+        let comparable = comparableCommittedSentenceText(text)
+        guard comparable.isEmpty == false else {
+            return
+        }
+
+        recentCommittedSentenceHistory.append(
+            RecentCommittedSentence(
+                rawText: text,
+                comparableText: comparable,
+                time: Date()
+            )
+        )
+        pruneRecentCommittedSentenceHistory()
+    }
+
+    @MainActor
+    private func pruneRecentCommittedSentenceHistory() {
+        let now = Date()
+        recentCommittedSentenceHistory.removeAll { now.timeIntervalSince($0.time) > 8.0 }
+        if recentCommittedSentenceHistory.count > Self.recentCommittedSentenceLimit {
+            recentCommittedSentenceHistory.removeFirst(
+                recentCommittedSentenceHistory.count - Self.recentCommittedSentenceLimit
+            )
+        }
+    }
+
+    private func comparableCommittedSentenceText(_ text: String) -> String {
+        text
+            .components(separatedBy: .whitespacesAndNewlines)
+            .filter { $0.isEmpty == false }
+            .joined(separator: " ")
+            .trimmingCharacters(in: Self.committedComparisonTrimCharacterSet)
+            .folding(options: [.caseInsensitive, .diacriticInsensitive], locale: .current)
+    }
+
+    private func leadingOverlapLength(previous: String, current: String) -> Int {
+        let previousCharacters = Array(previous)
+        let currentCharacters = Array(current)
+        let maxOverlap = min(previousCharacters.count, currentCharacters.count)
+
+        guard maxOverlap > 0 else {
+            return 0
+        }
+
+        for overlap in stride(from: maxOverlap, through: 1, by: -1) {
+            if Array(previousCharacters.suffix(overlap)) == Array(currentCharacters.prefix(overlap)) {
+                return overlap
+            }
+        }
+
+        return 0
+    }
+
+    private func shouldTrimLeadingOverlap(length: Int, in text: String) -> Bool {
+        guard length > 0, text.isEmpty == false else {
+            return false
+        }
+
+        let minimumOverlap = text.containsCJKCharacters
+            ? Self.minimumCJKLeadingOverlapCharacters
+            : Self.minimumLatinLeadingOverlapCharacters
+        let overlapRatio = Double(length) / Double(text.count)
+        return length >= minimumOverlap && overlapRatio >= 0.35
+    }
+
+    private func dropLeadingCharacters(_ count: Int, from text: String) -> String {
+        guard count > 0 else {
+            return text
+        }
+
+        var index = text.startIndex
+        var remaining = count
+        while remaining > 0, index < text.endIndex {
+            index = text.index(after: index)
+            remaining -= 1
+        }
+
+        return String(text[index...])
     }
 
     private func requestSpeechAuthorization() async -> Bool {
@@ -1121,27 +1274,33 @@ final class LiveTranscriptionSession: NSObject, @unchecked Sendable {
         let committedSentences = splitRecognizedSentences(in: modernCommittedPrefixText)
         let nsFullText = fullText as NSString
         let fullSentenceRanges = sentenceRanges(in: nsFullText)
+        let fullSentences = fullSentenceRanges.map {
+            nsFullText.substring(with: $0).trimmingCharacters(in: .whitespacesAndNewlines)
+        }
 
         guard committedSentences.isEmpty == false,
-              fullSentenceRanges.count >= committedSentences.count else {
-            modernCommittedPrefixText = ""
+              fullSentences.isEmpty == false else {
             return fullText
         }
 
-        for (index, committedSentence) in committedSentences.enumerated() {
-            let candidateSentence = nsFullText.substring(with: fullSentenceRanges[index])
-                .trimmingCharacters(in: .whitespacesAndNewlines)
-            guard candidateSentence == committedSentence else {
-                modernCommittedPrefixText = ""
-                return fullText
+        let committedComparable = committedSentences.map(comparableCommittedSentenceText)
+        let fullComparable = fullSentences.map(comparableCommittedSentenceText)
+        let maxOverlap = min(committedComparable.count, fullComparable.count)
+
+        for overlap in stride(from: maxOverlap, through: 1, by: -1) {
+            if Array(committedComparable.suffix(overlap)) == Array(fullComparable.prefix(overlap)) {
+                let matchedRange = fullSentenceRanges[overlap - 1]
+                let nextLocation = matchedRange.location + matchedRange.length
+                guard nextLocation < nsFullText.length else {
+                    return ""
+                }
+
+                return nsFullText.substring(from: nextLocation)
+                    .trimmingCharacters(in: .whitespacesAndNewlines)
             }
         }
 
-        guard committedSentences.count < fullSentenceRanges.count else {
-            return ""
-        }
-
-        return nsFullText.substring(from: fullSentenceRanges[committedSentences.count].location)
+        return fullText
     }
 
     private func committableModernText(in rawText: String) -> (committedRawText: String, remainingRawText: String)? {
@@ -2306,6 +2465,17 @@ private extension String {
                 || (0xAC00...0xD7AF).contains($0.value) // Korean Hangul
         }
     }
+}
+
+private extension LiveTranscriptionSession {
+    static let minimumLatinLeadingOverlapCharacters = 10
+    static let minimumCJKLeadingOverlapCharacters = 4
+    static let recentCommittedSentenceLimit = 6
+    static let committedComparisonTrimCharacterSet = CharacterSet.whitespacesAndNewlines
+        .union(.punctuationCharacters)
+        .union(.symbols)
+    static let leadingOverlapTrimCharacterSet = CharacterSet.whitespacesAndNewlines
+        .union(.punctuationCharacters)
 }
 
 private extension OSStatus {

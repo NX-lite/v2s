@@ -299,7 +299,7 @@ struct OverlayView: View {
     }
 
     private func shouldReserveCommittedSlot(for state: OverlayPreviewState) -> Bool {
-        model.sessionState == .running && (hasCommittedCaption(state) || state.history.isEmpty == false)
+        hasCommittedCaption(state) || model.shouldReserveCommittedCaptionSlot
     }
 
     private func flowAnimationState(for state: OverlayPreviewState) -> OverlayFlowAnimationState {

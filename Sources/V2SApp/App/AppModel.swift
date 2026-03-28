@@ -34,7 +34,7 @@ final class AppModel: ObservableObject {
     private var displayedCaptionLastVisualUpdateWasLateTranslation = false
     // Revision tracking: captionID → (committedTranslation, committedAt, revisionCount)
     private var translationRevisions: [UUID: (text: String, committedAt: Date, count: Int)] = [:]
-    private var recentRecognizedCaptionTexts: [(text: String, time: Date)] = []
+    private var recentRecognizedCaptionTexts: [RecentRecognizedCaption] = []
     private var finalizedDraftPromotionIDs: [(id: UUID, time: Date)] = []
     private var statusDescriptor: StatusDescriptor = .ready
     @Published private(set) var applicationSources: [InputSource] = []
@@ -1298,16 +1298,18 @@ final class AppModel: ObservableObject {
     // MARK: - Caption queue
 
     private func enqueueRecognizedSentence(_ sentence: RecognizedSentence, sourceName: String) {
+        let promotedDraftTranslation = promotedDraftTranslationSnapshot(for: sentence.promotionSegmentID)
+
+        if let promotionID = sentence.promotionSegmentID {
+            markDraftPromotionFinalized(promotionID)
+        }
+
         let sourceText = sanitizedDisplayText(sentence.text)
         guard sourceText.isEmpty == false else {
             return
         }
 
         cancelCommittedCaptionArchive()
-
-        if let promotionID = sentence.promotionSegmentID {
-            markDraftPromotionFinalized(promotionID)
-        }
 
         guard shouldEnqueueRecognizedSentence(sourceText) else {
             return
@@ -1317,7 +1319,8 @@ final class AppModel: ObservableObject {
             id: UUID(),
             promotionID: sentence.promotionSegmentID ?? UUID(),
             sourceText: sourceText,
-            sourceName: sourceName
+            sourceName: sourceName,
+            promotedDraftTranslation: promotedDraftTranslation
         )
 
         rememberRecognizedSentence(sourceText)
@@ -1386,6 +1389,18 @@ final class AppModel: ObservableObject {
 
     var shouldReserveDraftTranslationSlot: Bool {
         showsTranslatedSubtitle && currentSourceLanguageID != outputLanguageID
+    }
+
+    var shouldReserveCommittedCaptionSlot: Bool {
+        guard sessionState == .running else {
+            return false
+        }
+
+        return displayedCaption != nil
+            || pendingCaptions.isEmpty == false
+            || hasActiveDraftOverlay
+            || overlayState?.draftPromotionID != nil
+            || overlayState?.history.isEmpty == false
     }
 
     private func resetLiveTextPipeline() {
@@ -1460,23 +1475,23 @@ final class AppModel: ObservableObject {
 
             // Use the best available translation for the initial committed display:
             // 1. Pre-computed caption translation (if ready)
-            // 2. Draft translation that was already visible (avoids flash of source text)
-            // 3. Fall back to source text
+            // 2. Draft translation captured at the promotion moment
+            // 3. Leave the translated slot empty until the final translation arrives
             let earlyTranslation = readyCaptionTranslations[caption.id]
-            let draftTranslation = overlayState?.draftTranslatedText
             let initialTranslation = earlyTranslation
-                ?? (draftTranslation?.isEmpty == false ? draftTranslation : nil)
+                ?? (caption.promotedDraftTranslation?.isEmpty == false ? caption.promotedDraftTranslation : nil)
+            let translationExpected = currentSourceLanguageID != outputLanguageID
 
             cancelCommittedCaptionArchive()
             displayedCaption = caption
 
             // If a draft translation was visible, skip the fade-in so the committed
             // text replaces the draft seamlessly instead of flashing.
-            let hadDraftTranslation = draftTranslation?.isEmpty == false
+            let hadDraftTranslation = initialTranslation?.isEmpty == false
 
             overlayState?.skipCommittedFadeIn = hadDraftTranslation
             updateCommittedOverlay(
-                translatedText: initialTranslation ?? caption.sourceText,
+                translatedText: initialTranslation ?? (translationExpected ? "" : caption.sourceText),
                 sourceText: caption.sourceText,
                 promotionID: caption.promotionID,
                 bumpEpoch: true
@@ -1499,7 +1514,6 @@ final class AppModel: ObservableObject {
 
             // Track whether translation actually worked.
             // If it failed (returned source text), the session may be stuck.
-            let translationExpected = currentSourceLanguageID != outputLanguageID
             let translationFailed = translationExpected && finalText == caption.sourceText
                 && !caption.sourceText.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
 
@@ -1547,6 +1561,12 @@ final class AppModel: ObservableObject {
             .joined(separator: " ")
     }
 
+    private func comparableCaptionText(_ text: String) -> String {
+        normalizedCaptionText(text)
+            .trimmingCharacters(in: Self.captionComparisonTrimCharacterSet)
+            .folding(options: [.caseInsensitive, .diacriticInsensitive], locale: .current)
+    }
+
     private func sanitizedDisplayText(_ text: String) -> String {
         let trimmed = text.trimmingCharacters(in: .whitespacesAndNewlines)
         guard trimmed.isEmpty == false else {
@@ -1566,29 +1586,45 @@ final class AppModel: ObservableObject {
 
     private func shouldEnqueueRecognizedSentence(_ text: String) -> Bool {
         let now = Date()
-        let normalized = normalizedCaptionText(text)
+        let comparable = comparableCaptionText(text)
         recentRecognizedCaptionTexts.removeAll { now.timeIntervalSince($0.time) > 6.0 }
 
-        if normalized.isEmpty {
+        if comparable.isEmpty {
             return false
         }
 
         if let displayedCaption,
-           normalizedCaptionText(displayedCaption.sourceText) == normalized {
+           comparableCaptionText(displayedCaption.sourceText) == comparable {
             return false
         }
 
-        if pendingCaptions.contains(where: { normalizedCaptionText($0.sourceText) == normalized }) {
+        if pendingCaptions.contains(where: { comparableCaptionText($0.sourceText) == comparable }) {
             return false
         }
 
-        return recentRecognizedCaptionTexts.contains(where: { $0.text == normalized }) == false
+        return recentRecognizedCaptionTexts.contains(where: { $0.comparableText == comparable }) == false
     }
 
     private func rememberRecognizedSentence(_ text: String) {
         let now = Date()
         recentRecognizedCaptionTexts.removeAll { now.timeIntervalSince($0.time) > 6.0 }
-        recentRecognizedCaptionTexts.append((text: normalizedCaptionText(text), time: now))
+        recentRecognizedCaptionTexts.append(
+            RecentRecognizedCaption(
+                rawText: text,
+                comparableText: comparableCaptionText(text),
+                time: now
+            )
+        )
+    }
+
+    private func promotedDraftTranslationSnapshot(for promotionID: UUID?) -> String? {
+        guard let promotionID,
+              overlayState?.draftPromotionID == promotionID else {
+            return nil
+        }
+
+        let draftTranslation = sanitizedDisplayText(overlayState?.draftTranslatedText ?? "")
+        return draftTranslation.isEmpty ? nil : draftTranslation
     }
 
     private func markDraftPromotionFinalized(_ id: UUID) {
@@ -1993,6 +2029,15 @@ private extension AppModel {
     static let draftClearDelayNanoseconds: UInt64 = 150_000_000
     static let committedCaptionIdleArchiveDelay: TimeInterval = 0.9
     static let finalizedDraftPromotionLimit = 32
+    static let captionComparisonTrimCharacterSet = CharacterSet.whitespacesAndNewlines
+        .union(.punctuationCharacters)
+        .union(.symbols)
+}
+
+private struct RecentRecognizedCaption {
+    let rawText: String
+    let comparableText: String
+    let time: Date
 }
 
 private struct QueuedCaption: Identifiable, Equatable {
@@ -2000,6 +2045,7 @@ private struct QueuedCaption: Identifiable, Equatable {
     let promotionID: UUID
     let sourceText: String
     let sourceName: String
+    let promotedDraftTranslation: String?
 }
 
 private enum LanguageResourcePreparationError: LocalizedError, AppLocalizableError {
@@ -2053,6 +2099,8 @@ struct LanguageResourceStatus: Identifiable, Equatable {
 
 @MainActor
 private final class TranslationCoordinator: ObservableObject {
+    private static let runnerIdleTimeout: TimeInterval = 0.35
+
     private struct LanguagePair: Equatable {
         let source: String
         let target: String
@@ -2255,7 +2303,11 @@ private final class TranslationCoordinator: ObservableObject {
                 return
             }
 
-            guard let operation = await nextOperation(for: anchoredPair, generation: runnerGeneration) else {
+            guard let operation = await nextOperation(
+                for: anchoredPair,
+                generation: runnerGeneration,
+                idleTimeout: Self.runnerIdleTimeout
+            ) else {
                 return
             }
 
@@ -2375,6 +2427,10 @@ private final class TranslationCoordinator: ObservableObject {
                 source: Locale.Language(identifier: pair.source),
                 target: Locale.Language(identifier: pair.target)
             )
+        } else if activeRunnerID == nil {
+            // Each TranslationSession is view-anchored and should be refreshed
+            // once the previous runner has drained and exited.
+            configuration?.invalidate()
         }
     }
 
@@ -2411,7 +2467,13 @@ private final class TranslationCoordinator: ObservableObject {
     }
 
     @available(macOS 15.0, *)
-    private func nextOperation(for pair: LanguagePair, generation: Int) async -> PendingOperation? {
+    private func nextOperation(
+        for pair: LanguagePair,
+        generation: Int,
+        idleTimeout: TimeInterval
+    ) async -> PendingOperation? {
+        let deadline = Date().addingTimeInterval(idleTimeout)
+
         while Task.isCancelled == false {
             guard generation == self.generation else {
                 return nil
@@ -2421,6 +2483,10 @@ private final class TranslationCoordinator: ObservableObject {
                 $0.pair == pair && $0.generation == generation
             }) {
                 return pendingOperations.remove(at: index)
+            }
+
+            if Date() >= deadline {
+                return nil
             }
 
             do {
