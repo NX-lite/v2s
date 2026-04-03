@@ -265,7 +265,11 @@ final class OverlayWindowController {
         } else if shouldShow && geniePhase == .idle {
             // Keep a visible overlay in its current Space instead of re-ordering it
             // on every subtitle update.
-            positionPanels(animated: true)
+            // Skip animated repositioning while the user is dragging to prevent jumps.
+            let isDragging = dragStartTopLeft != nil || resizeDragStartTopLeft != nil
+            if !isDragging {
+                positionPanels(animated: true)
+            }
             startMouseTrackingIfNeeded()
             updatePassThroughBubble()
         }
