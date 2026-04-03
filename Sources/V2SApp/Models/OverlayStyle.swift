@@ -20,6 +20,12 @@ struct OverlayColor: Codable, Equatable {
         blue: 0.0,
         alpha: 1.0
     )
+    static let defaultTextOutline = OverlayColor(
+        red: 1.0,
+        green: 1.0,
+        blue: 1.0,
+        alpha: 1.0
+    )
 
     init(
         red: Double,
@@ -64,7 +70,8 @@ struct OverlayStyle: Codable, Equatable {
         case backgroundOpacity
         case subtitleColor
         case backgroundColor
-        case usesWhiteTextOutline
+        case showsTextOutline = "usesWhiteTextOutline"
+        case textOutlineColor
         case translatedFontSize
         case sourceFontSize
         case clickThrough
@@ -85,7 +92,8 @@ struct OverlayStyle: Codable, Equatable {
     var backgroundOpacity: Double
     var subtitleColor: OverlayColor
     var backgroundColor: OverlayColor
-    var usesWhiteTextOutline: Bool
+    var showsTextOutline: Bool
+    var textOutlineColor: OverlayColor
     var translatedFontSize: Double
     var sourceFontSize: Double
     var clickThrough: Bool
@@ -106,7 +114,8 @@ struct OverlayStyle: Codable, Equatable {
         backgroundOpacity: 0.32,
         subtitleColor: .defaultSubtitle,
         backgroundColor: .defaultBackground,
-        usesWhiteTextOutline: false,
+        showsTextOutline: false,
+        textOutlineColor: .defaultTextOutline,
         translatedFontSize: 24,
         sourceFontSize: 18,
         clickThrough: true,
@@ -124,7 +133,8 @@ struct OverlayStyle: Codable, Equatable {
         backgroundOpacity: Double,
         subtitleColor: OverlayColor,
         backgroundColor: OverlayColor,
-        usesWhiteTextOutline: Bool,
+        showsTextOutline: Bool,
+        textOutlineColor: OverlayColor,
         translatedFontSize: Double,
         sourceFontSize: Double,
         clickThrough: Bool,
@@ -140,7 +150,8 @@ struct OverlayStyle: Codable, Equatable {
         self.backgroundOpacity = backgroundOpacity
         self.subtitleColor = subtitleColor
         self.backgroundColor = backgroundColor
-        self.usesWhiteTextOutline = usesWhiteTextOutline
+        self.showsTextOutline = showsTextOutline
+        self.textOutlineColor = textOutlineColor
         self.translatedFontSize = translatedFontSize
         self.sourceFontSize = sourceFontSize
         self.clickThrough = clickThrough
@@ -163,9 +174,11 @@ struct OverlayStyle: Codable, Equatable {
         backgroundColor    = try c.decodeIfPresent(OverlayColor.self, forKey: .backgroundColor)
             ?? .defaultBackground
         let legacyWhiteOutline = try legacy.decodeIfPresent(Bool.self, forKey: .usesHighContrastBorder)
-        usesWhiteTextOutline = try c.decodeIfPresent(Bool.self, forKey: .usesWhiteTextOutline)
+        showsTextOutline = try c.decodeIfPresent(Bool.self, forKey: .showsTextOutline)
             ?? legacyWhiteOutline
             ?? false
+        textOutlineColor  = try c.decodeIfPresent(OverlayColor.self, forKey: .textOutlineColor)
+            ?? .defaultTextOutline
         translatedFontSize = try c.decode(Double.self, forKey: .translatedFontSize)
         sourceFontSize     = try c.decode(Double.self, forKey: .sourceFontSize)
         clickThrough       = try c.decode(Bool.self,   forKey: .clickThrough)

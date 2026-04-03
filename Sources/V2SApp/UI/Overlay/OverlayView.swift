@@ -550,7 +550,7 @@ struct OverlayView: View {
         weight: Font.Weight
     ) -> some View {
         ZStack {
-            if model.overlayStyle.usesWhiteTextOutline, rawText.isEmpty == false {
+            if model.overlayStyle.showsTextOutline, rawText.isEmpty == false {
                 outlineText(
                     rawText,
                     fontSize: fontSize,
@@ -607,7 +607,7 @@ struct OverlayView: View {
                 let offset = Self.textOutlineOffsets[index]
                 Text(text)
                     .font(.system(size: fontSize, weight: weight))
-                    .foregroundStyle(.white)
+                    .foregroundStyle(baseTextOutlineColor)
                     .multilineTextAlignment(.center)
                     .lineLimit(nil)
                     .fixedSize(horizontal: false, vertical: true)
@@ -623,6 +623,10 @@ struct OverlayView: View {
 
     private var baseBackgroundColor: Color {
         model.overlayStyle.backgroundColor.color
+    }
+
+    private var baseTextOutlineColor: Color {
+        model.overlayStyle.textOutlineColor.color
     }
 
     private func subtitleColor(opacity: Double) -> Color {

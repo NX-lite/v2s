@@ -276,9 +276,16 @@ struct SettingsView: View {
                         .font(.caption)
                         .foregroundStyle(.secondary)
                     settingsRow(model.localized(.textOutline)) {
-                        Toggle("", isOn: whiteTextOutlineBinding)
+                        Toggle("", isOn: textOutlineEnabledBinding)
                             .toggleStyle(.switch)
                             .labelsHidden()
+                    }
+                    if model.overlayStyle.showsTextOutline {
+                        Divider()
+                        settingsRow(model.localized(.outlineColor)) {
+                            ColorPicker("", selection: textOutlineColorBinding, supportsOpacity: false)
+                                .labelsHidden()
+                        }
                     }
                     Divider()
                     settingsRow(model.localized(.attachToSource)) {
@@ -530,8 +537,19 @@ struct SettingsView: View {
         )
     }
 
-    private var whiteTextOutlineBinding: Binding<Bool> {
-        overlayBinding(\.usesWhiteTextOutline)
+    private var textOutlineEnabledBinding: Binding<Bool> {
+        overlayBinding(\.showsTextOutline)
+    }
+
+    private var textOutlineColorBinding: Binding<Color> {
+        Binding(
+            get: { model.overlayStyle.textOutlineColor.color },
+            set: { newColor in
+                model.updateOverlayStyle { style in
+                    style.textOutlineColor = OverlayColor(color: newColor)
+                }
+            }
+        )
     }
 
     private var attachToSourceBinding: Binding<Bool> {

@@ -41,6 +41,7 @@ enum AppTextKey: String {
     case subtitleOverlay
     case onlyThreeControlsAcceptClicks
     case textOutline
+    case outlineColor
     case attachToSource
     case subtitleColor
     case backgroundColor
@@ -248,6 +249,7 @@ enum AppLocalization {
             "subtitleOverlay": "Subtitle Overlay",
             "onlyThreeControlsAcceptClicks": "Only the 3 controls accept clicks",
             "textOutline": "Text Outline",
+            "outlineColor": "Outline Color",
             "attachToSource": "Attach to Source",
             "subtitleColor": "Subtitle Color",
             "backgroundColor": "Background Color",
@@ -399,6 +401,7 @@ enum AppLocalization {
             "subtitleOverlay": "字幕浮层",
             "onlyThreeControlsAcceptClicks": "只有这 3 个控件可点击",
             "textOutline": "文字描边",
+            "outlineColor": "描边颜色",
             "attachToSource": "附着到源应用",
             "subtitleColor": "字幕颜色",
             "backgroundColor": "背景颜色",
@@ -550,6 +553,7 @@ enum AppLocalization {
             "subtitleOverlay": "Superposición de subtítulos",
             "onlyThreeControlsAcceptClicks": "Solo los 3 controles aceptan clics",
             "textOutline": "Contorno del texto",
+            "outlineColor": "Color del contorno",
             "attachToSource": "Vincular a la fuente",
             "subtitleColor": "Color del subtítulo",
             "backgroundColor": "Color de fondo",
@@ -701,6 +705,7 @@ enum AppLocalization {
             "subtitleOverlay": "Untertitel-Overlay",
             "onlyThreeControlsAcceptClicks": "Nur diese 3 Bedienelemente nehmen Klicks an",
             "textOutline": "Textkontur",
+            "outlineColor": "Konturfarbe",
             "attachToSource": "An Quelle anheften",
             "subtitleColor": "Untertitelfarbe",
             "backgroundColor": "Hintergrundfarbe",
@@ -852,6 +857,7 @@ enum AppLocalization {
             "subtitleOverlay": "字幕オーバーレイ",
             "onlyThreeControlsAcceptClicks": "クリックできるのは 3 つのコントロールのみです",
             "textOutline": "文字の縁取り",
+            "outlineColor": "縁取りの色",
             "attachToSource": "ソースに追従",
             "subtitleColor": "字幕の色",
             "backgroundColor": "背景色",
@@ -1003,6 +1009,7 @@ enum AppLocalization {
             "subtitleOverlay": "Superposition des sous-titres",
             "onlyThreeControlsAcceptClicks": "Seuls les 3 contrôles acceptent les clics",
             "textOutline": "Contour du texte",
+            "outlineColor": "Couleur du contour",
             "attachToSource": "Attacher à la source",
             "subtitleColor": "Couleur des sous-titres",
             "backgroundColor": "Couleur de fond",
@@ -1154,6 +1161,7 @@ enum AppLocalization {
             "subtitleOverlay": "자막 오버레이",
             "onlyThreeControlsAcceptClicks": "3개의 컨트롤만 클릭할 수 있습니다",
             "textOutline": "텍스트 외곽선",
+            "outlineColor": "외곽선 색상",
             "attachToSource": "소스에 부착",
             "subtitleColor": "자막 색상",
             "backgroundColor": "배경 색상",
@@ -1305,6 +1313,7 @@ enum AppLocalization {
             "subtitleOverlay": "طبقة الترجمة",
             "onlyThreeControlsAcceptClicks": "3 عناصر تحكم فقط تقبل النقر",
             "textOutline": "حد النص",
+            "outlineColor": "لون الحد",
             "attachToSource": "ربط بالمصدر",
             "subtitleColor": "لون الترجمة",
             "backgroundColor": "لون الخلفية",
@@ -1456,6 +1465,7 @@ enum AppLocalization {
             "subtitleOverlay": "Sobreposição de legendas",
             "onlyThreeControlsAcceptClicks": "Apenas os 3 controles aceitam cliques",
             "textOutline": "Contorno do texto",
+            "outlineColor": "Cor do contorno",
             "attachToSource": "Fixar na fonte",
             "subtitleColor": "Cor da legenda",
             "backgroundColor": "Cor de fundo",
@@ -1607,6 +1617,7 @@ enum AppLocalization {
             "subtitleOverlay": "Наложение субтитров",
             "onlyThreeControlsAcceptClicks": "Только 3 элемента управления принимают клики",
             "textOutline": "Контур текста",
+            "outlineColor": "Цвет контура",
             "attachToSource": "Привязать к источнику",
             "subtitleColor": "Цвет субтитров",
             "backgroundColor": "Цвет фона",

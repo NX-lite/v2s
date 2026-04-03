@@ -186,7 +186,7 @@ struct StatusBarPopoverView: View {
             }
             VStack(spacing: 6) {
                 row(model.localized(.textOutline)) {
-                    Toggle("", isOn: whiteTextOutlineBinding)
+                    Toggle("", isOn: textOutlineEnabledBinding)
                         .toggleStyle(.switch)
                         .controlSize(.small)
                         .labelsHidden()
@@ -316,10 +316,10 @@ struct StatusBarPopoverView: View {
             set: { v in model.updateOverlayStyle { $0.translatedFontSize = v } }
         )
     }
-    private var whiteTextOutlineBinding: Binding<Bool> {
+    private var textOutlineEnabledBinding: Binding<Bool> {
         Binding(
-            get: { model.overlayStyle.usesWhiteTextOutline },
-            set: { v in model.updateOverlayStyle { $0.usesWhiteTextOutline = v } }
+            get: { model.overlayStyle.showsTextOutline },
+            set: { v in model.updateOverlayStyle { $0.showsTextOutline = v } }
         )
     }
     private var attachToSourceBinding: Binding<Bool> {
