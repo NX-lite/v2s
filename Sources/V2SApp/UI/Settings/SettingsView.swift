@@ -97,81 +97,53 @@ struct SettingsView: View {
                             .foregroundStyle(.secondary)
                     }
                     Divider()
-                    settingsRow(model.localized(.interfaceLanguage)) {
-                        Picker("", selection: interfaceLanguageBinding) {
-                            ForEach(LanguageCatalog.common) { option in
-                                Text(option.localizedDisplayName(in: model.resolvedInterfaceLanguageID)).tag(option.id)
-                            }
-                        }
-                        .pickerStyle(.menu)
-                        .labelsHidden()
+                    SettingsControlRow(label: model.localized(.interfaceLanguage)) {
+                        CommonLanguageMenuPicker(
+                            interfaceLanguageID: model.resolvedInterfaceLanguageID,
+                            selection: model.interfaceLanguageSelectionBinding
+                        )
                     }
                 }
                 settingsCard {
                     sectionHeader(model.localized(.inputSource), icon: "mic.fill")
-                    settingsRow(model.localized(.selectedSource)) {
-                        Picker("", selection: selectedSourceBinding) {
-                            if model.allSources.isEmpty {
-                                Text(model.localized(.noSourcesDetected)).tag("")
-                            } else {
-                                ForEach(model.allSources) { source in
-                                    Text("\(source.category.displayName(in: model.resolvedInterfaceLanguageID)) · \(source.name)")
-                                        .tag(source.id)
-                                }
-                            }
-                        }
-                        .pickerStyle(.menu)
-                        .labelsHidden()
+                    SettingsControlRow(label: model.localized(.selectedSource)) {
+                        SourceMenuPicker(
+                            sources: model.allSources,
+                            interfaceLanguageID: model.resolvedInterfaceLanguageID,
+                            emptyTitle: model.allSources.isEmpty
+                                ? model.localized(.noSourcesDetected)
+                                : model.localized(.choose),
+                            selection: model.selectedSourceOptionalBinding
+                        )
                     }
-                    HStack {
-                        Spacer()
-                        Button {
-                            model.refreshSources()
-                        } label: {
-                            Label(model.localized(.refreshSources), systemImage: "arrow.clockwise")
-                                .font(.caption)
-                        }
-                        .buttonStyle(.plain)
-                        .foregroundStyle(.secondary)
-                    }
+                    SecondaryRefreshButton(
+                        title: model.localized(.refreshSources),
+                        action: model.refreshSources
+                    )
                 }
                 settingsCard {
                     sectionHeader(model.localized(.languages), icon: "globe")
-                    settingsRow(model.localized(.inputLanguage)) {
-                        Picker("", selection: inputLanguageBinding) {
-                            ForEach(LanguageCatalog.common) { option in
-                                Text(option.localizedDisplayName(in: model.resolvedInterfaceLanguageID)).tag(option.id)
-                            }
-                        }
-                        .pickerStyle(.menu)
-                        .labelsHidden()
+                    SettingsControlRow(label: model.localized(.inputLanguage)) {
+                        CommonLanguageMenuPicker(
+                            interfaceLanguageID: model.resolvedInterfaceLanguageID,
+                            selection: model.inputLanguageSelectionBinding
+                        )
                     }
                     Divider()
-                    settingsRow(model.localized(.subtitleLanguage)) {
-                        Picker("", selection: outputLanguageBinding) {
-                            ForEach(LanguageCatalog.common) { option in
-                                Text(option.localizedDisplayName(in: model.resolvedInterfaceLanguageID)).tag(option.id)
-                            }
-                        }
-                        .pickerStyle(.menu)
-                        .labelsHidden()
+                    SettingsControlRow(label: model.localized(.subtitleLanguage)) {
+                        CommonLanguageMenuPicker(
+                            interfaceLanguageID: model.resolvedInterfaceLanguageID,
+                            selection: model.outputLanguageSelectionBinding
+                        )
                     }
                     Divider()
-                    settingsRow(model.localized(.subtitleMode)) {
+                    SettingsControlRow(label: model.localized(.subtitleMode)) {
                         HStack(spacing: 4) {
-                            Picker("", selection: subtitleModeBinding) {
-                                ForEach(SubtitleMode.allCases, id: \.self) { mode in
-                                    VStack(alignment: .leading) {
-                                        Text(mode.displayName(in: model.resolvedInterfaceLanguageID))
-                                        Text(mode.detail(in: model.resolvedInterfaceLanguageID))
-                                            .font(.caption)
-                                            .foregroundStyle(.secondary)
-                                    }
-                                    .tag(mode)
-                                }
-                            }
-                            .pickerStyle(.menu)
-                            .labelsHidden()
+                            SubtitleModeMenuPicker(
+                                interfaceLanguageID: model.resolvedInterfaceLanguageID,
+                                showsDetail: true,
+                                selection: model.subtitleModeSelectionBinding
+                            )
                             Button(action: openSubtitleModeInfo) {
                                 Image(systemName: "info.circle")
                                     .foregroundStyle(.secondary)
@@ -181,30 +153,13 @@ struct SettingsView: View {
                         }
                     }
                     Divider()
-                    settingsRow(model.localized(.subtitleDisplay)) {
-                        Picker("", selection: subtitleDisplayModeBinding) {
-                            ForEach(SubtitleDisplayMode.allCases, id: \.self) { mode in
-                                Text(mode.displayName(in: model.resolvedInterfaceLanguageID)).tag(mode)
-                            }
-                        }
-                        .pickerStyle(.menu)
-                        .labelsHidden()
+                    SettingsControlRow(label: model.localized(.subtitleDisplay)) {
+                        SubtitleDisplayModeMenuPicker(
+                            interfaceLanguageID: model.resolvedInterfaceLanguageID,
+                            selection: model.subtitleDisplayModeSelectionBinding
+                        )
                     }
-                    HStack {
-                        Spacer()
-                        Button {
-                            model.refreshLanguageResources()
-                        } label: {
-                            Label(model.localized(.refreshLanguageResources), systemImage: "arrow.clockwise")
-                                .font(.caption)
-                        }
-                        .buttonStyle(.plain)
-                        .foregroundStyle(.secondary)
-                    }
-
-                    if !model.languageResourceStatuses.isEmpty {
-                        LanguageResourceStatusListView(statuses: model.languageResourceStatuses)
-                    }
+                    LanguageResourcesFooter(model: model)
                 }
                 settingsCard {
                     sectionHeader(model.localized(.updates), icon: "arrow.triangle.2.circlepath")
@@ -450,50 +405,6 @@ struct SettingsView: View {
         }
         .padding(.horizontal, 20)
         .padding(.vertical, 10)
-    }
-
-    // MARK: - Bindings
-
-    private var selectedSourceBinding: Binding<String> {
-        Binding(
-            get: { model.selectedSourceID ?? "" },
-            set: { model.selectedSourceID = $0.isEmpty ? nil : $0 }
-        )
-    }
-
-    private var inputLanguageBinding: Binding<String> {
-        Binding(
-            get: { model.inputLanguageID },
-            set: { model.inputLanguageID = $0 }
-        )
-    }
-
-    private var outputLanguageBinding: Binding<String> {
-        Binding(
-            get: { model.outputLanguageID },
-            set: { model.outputLanguageID = $0 }
-        )
-    }
-
-    private var subtitleModeBinding: Binding<SubtitleMode> {
-        Binding(
-            get: { model.subtitleMode },
-            set: { model.subtitleMode = $0 }
-        )
-    }
-
-    private var subtitleDisplayModeBinding: Binding<SubtitleDisplayMode> {
-        Binding(
-            get: { model.subtitleDisplayMode },
-            set: { model.subtitleDisplayMode = $0 }
-        )
-    }
-
-    private var interfaceLanguageBinding: Binding<String> {
-        Binding(
-            get: { model.interfaceLanguageID },
-            set: { model.interfaceLanguageID = $0 }
-        )
     }
 
     private var launchAtLoginBinding: Binding<Bool> {
