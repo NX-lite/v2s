@@ -34,6 +34,7 @@ final class OverlayWindowController {
     private var sourceWindowTrackingTimer: Timer?
     private var lastSourceWindowFrame: NSRect?
     private var attachToSourceRefreshTask: Task<Void, Never>?
+    private var lastAttachToSourceUsesHighLevel: Bool?
 
     // MARK: - Genie Animation State
     var trayIconRectProvider: (() -> NSRect?)?
@@ -544,7 +545,8 @@ final class OverlayWindowController {
         let visibleFrame = screen.visibleFrame
         let style = model.overlayStyle
 
-        let overlayFrame: NSRect
+        let persistsUserDefinedPosition = userDefinedTopLeft != nil
+        var overlayFrame: NSRect
 
         // When attached to a source app, lock width & horizontal position to the source window
         if style.attachToSource, let sourceFrame = sourceAppWindowFrame() {
@@ -579,6 +581,17 @@ final class OverlayWindowController {
             overlayFrame = NSRect(x: originX, y: originY, width: width, height: height)
         }
 
+        overlayFrame = clampedOverlayFrame(
+            overlayFrame,
+            within: visibleFrame,
+            clampHorizontally: style.attachToSource == false,
+            clampVertically: true
+        )
+
+        if persistsUserDefinedPosition {
+            userDefinedTopLeft = NSPoint(x: overlayFrame.minX, y: overlayFrame.maxY)
+        }
+
         let chromeFrame = controlsChromeFrame(relativeTo: overlayFrame)
         let scrollbarFrame = historyScrollbarFrame(relativeTo: overlayFrame)
         let buttonFrames = controlButtonFrames(relativeTo: chromeFrame)
@@ -610,6 +623,29 @@ final class OverlayWindowController {
         }
 
         return min(max(visibleFrame.width * style.widthRatio, style.minWidth), style.maxWidth)
+    }
+
+    private func clampedOverlayFrame(
+        _ frame: NSRect,
+        within visibleFrame: NSRect,
+        clampHorizontally: Bool,
+        clampVertically: Bool
+    ) -> NSRect {
+        var clampedFrame = frame
+
+        if clampHorizontally {
+            let minimumX = visibleFrame.minX
+            let maximumX = max(minimumX, visibleFrame.maxX - clampedFrame.width)
+            clampedFrame.origin.x = min(max(clampedFrame.origin.x, minimumX), maximumX)
+        }
+
+        if clampVertically {
+            let minimumY = visibleFrame.minY
+            let maximumY = max(minimumY, visibleFrame.maxY - clampedFrame.height)
+            clampedFrame.origin.y = min(max(clampedFrame.origin.y, minimumY), maximumY)
+        }
+
+        return clampedFrame
     }
 
     private func controlsChromeFrame(relativeTo overlayFrame: NSRect) -> NSRect {
@@ -864,17 +900,19 @@ final class OverlayWindowController {
     }
 
     private func refreshAttachToSourcePresentation(animated: Bool) {
-        updateAttachToSourceLevels()
+        let presentationChanged = updateAttachToSourceLevels()
 
         guard panelsShown else {
             return
         }
 
-        positionPanels(animated: animated)
+        positionPanels(animated: animated && !presentationChanged)
     }
 
-    private func updateAttachToSourceLevels() {
+    @discardableResult
+    private func updateAttachToSourceLevels() -> Bool {
         let useHighLevel = !model.overlayStyle.attachToSource || isSourceAppFrontmost()
+        let presentationChanged = lastAttachToSourceUsesHighLevel != useHighLevel
         let contentLevel: NSWindow.Level = useHighLevel ? .statusBar : .normal
         let controlLevel: NSWindow.Level = useHighLevel
             ? NSWindow.Level(rawValue: contentLevel.rawValue + 1)
@@ -892,17 +930,19 @@ final class OverlayWindowController {
             p.isFloatingPanel = useHighLevel
         }
 
-        if useHighLevel, panelsShown {
-            orderFrontAllPanels()
-        } else if panelsShown {
+        if panelsShown, presentationChanged, useHighLevel == false {
             orderPanelsBelowFrontmostApplication()
         }
+
+        lastAttachToSourceUsesHighLevel = useHighLevel
 
         if model.overlayStyle.attachToSource && panelsShown {
             startSourceWindowTracking()
         } else {
             stopSourceWindowTracking()
         }
+
+        return presentationChanged
     }
 
     private func orderPanelsBelowFrontmostApplication() {

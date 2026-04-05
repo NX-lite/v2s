@@ -29,17 +29,6 @@ final class SileroVADEngine {
     /// LSTM state size: shape [2, 1, 64] = 128 floats.
     private static let stateSize = 2 * 1 * 64
 
-    // MARK: - Hysteresis thresholds
-
-    /// Raw probability must exceed this to count as a "speech frame".
-    private let speechOnsetThreshold: Float = 0.5
-    /// Raw probability must drop below this to count as a "silence frame".
-    private let speechOffsetThreshold: Float = 0.35
-    /// Consecutive speech frames required before declaring onset (~96 ms).
-    private let minSpeechFrames = 3
-    /// Consecutive silence frames required before declaring offset (~256 ms).
-    private let minSilenceFrames = 8
-
     // MARK: - ONNX Runtime objects
 
     private let env: ORTEnv
@@ -62,9 +51,14 @@ final class SileroVADEngine {
 
     // MARK: - Hysteresis state
 
-    private(set) var isSpeaking = false
-    private var consecutiveSpeechFrames = 0
-    private var consecutiveSilenceFrames = 0
+    private var hysteresis = SileroVADHysteresis(
+        speechOnsetThreshold: 0.5,
+        speechOffsetThreshold: 0.35,
+        minSpeechFrames: 3,
+        minSilenceFrames: 8
+    )
+
+    var isSpeaking: Bool { hysteresis.isSpeaking }
 
     // MARK: - Init
 
@@ -116,10 +110,9 @@ final class SileroVADEngine {
             let probability = (try? infer(chunk: chunk)) ?? 0
             if probability > maxProbability { maxProbability = probability }
 
-            let wasSpeaking = isSpeaking
-            updateHysteresis(probability: probability)
-            if !wasSpeaking && isSpeaking { didOnset = true }
-            if wasSpeaking && !isSpeaking { didOffset = true }
+            let transition = hysteresis.apply(probability: probability)
+            if transition.didOnset { didOnset = true }
+            if transition.didOffset { didOffset = true }
         }
 
         return VADResult(
@@ -135,9 +128,7 @@ final class SileroVADEngine {
         hState = [Float](repeating: 0, count: Self.stateSize)
         cState = [Float](repeating: 0, count: Self.stateSize)
         accumulationBuffer.removeAll()
-        isSpeaking = false
-        consecutiveSpeechFrames = 0
-        consecutiveSilenceFrames = 0
+        hysteresis.reset()
     }
 
     // MARK: - Private
@@ -215,25 +206,6 @@ final class SileroVADEngine {
         }
 
         return probability
-    }
-
-    private func updateHysteresis(probability: Float) {
-        if probability >= speechOnsetThreshold {
-            consecutiveSpeechFrames += 1
-            consecutiveSilenceFrames = 0
-        } else if probability < speechOffsetThreshold {
-            consecutiveSilenceFrames += 1
-            consecutiveSpeechFrames = 0
-        } else {
-            // In the ambiguous zone (0.35–0.5): don't reset either counter,
-            // but don't increment either. This prevents rapid toggling.
-        }
-
-        if !isSpeaking && consecutiveSpeechFrames >= minSpeechFrames {
-            isSpeaking = true
-        } else if isSpeaking && consecutiveSilenceFrames >= minSilenceFrames {
-            isSpeaking = false
-        }
     }
 }
 

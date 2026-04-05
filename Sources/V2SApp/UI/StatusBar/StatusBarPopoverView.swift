@@ -82,29 +82,18 @@ struct StatusBarPopoverView: View {
     private var sourceSection: some View {
         VStack(alignment: .leading, spacing: 8) {
             sectionHeader(model.localized(.inputSource), icon: "mic.fill")
-            row(model.localized(.sourceShort)) {
-                Picker("", selection: selectedSourceBinding) {
-                    Text(model.allSources.isEmpty ? model.localized(.noSources) : model.localized(.choose))
-                        .tag(nil as String?)
-                    ForEach(model.allSources) { s in
-                        Text("\(s.category.displayName(in: model.resolvedInterfaceLanguageID)) · \(s.name)")
-                            .tag(Optional(s.id))
-                    }
-                }
-                .pickerStyle(.menu)
-                .labelsHidden()
+            SettingsControlRow(label: model.localized(.sourceShort)) {
+                SourceMenuPicker(
+                    sources: model.allSources,
+                    interfaceLanguageID: model.resolvedInterfaceLanguageID,
+                    emptyTitle: model.allSources.isEmpty ? model.localized(.noSources) : model.localized(.choose),
+                    selection: model.selectedSourceOptionalBinding
+                )
             }
-            HStack {
-                Spacer()
-                Button {
-                    model.refreshSources()
-                } label: {
-                    Label(model.localized(.refreshSources), systemImage: "arrow.clockwise")
-                        .font(.caption)
-                }
-                .buttonStyle(.plain)
-                .foregroundStyle(.secondary)
-            }
+            SecondaryRefreshButton(
+                title: model.localized(.refreshSources),
+                action: model.refreshSources
+            )
         }
     }
 
@@ -113,57 +102,32 @@ struct StatusBarPopoverView: View {
     private var languageSection: some View {
         VStack(alignment: .leading, spacing: 8) {
             sectionHeader(model.localized(.languages), icon: "globe")
-            row(model.localized(.inputShort)) {
-                Picker("", selection: inputLanguageBinding) {
-                    ForEach(LanguageCatalog.common) { option in
-                        Text(option.localizedDisplayName(in: model.resolvedInterfaceLanguageID)).tag(option.id)
-                    }
-                }
-                .pickerStyle(.menu)
-                .labelsHidden()
+            SettingsControlRow(label: model.localized(.inputShort)) {
+                CommonLanguageMenuPicker(
+                    interfaceLanguageID: model.resolvedInterfaceLanguageID,
+                    selection: model.inputLanguageSelectionBinding
+                )
             }
-            row(model.localized(.subtitleShort)) {
-                Picker("", selection: outputLanguageBinding) {
-                    ForEach(LanguageCatalog.common) { option in
-                        Text(option.localizedDisplayName(in: model.resolvedInterfaceLanguageID)).tag(option.id)
-                    }
-                }
-                .pickerStyle(.menu)
-                .labelsHidden()
+            SettingsControlRow(label: model.localized(.subtitleShort)) {
+                CommonLanguageMenuPicker(
+                    interfaceLanguageID: model.resolvedInterfaceLanguageID,
+                    selection: model.outputLanguageSelectionBinding
+                )
             }
-            row(model.localized(.modeShort)) {
-                Picker("", selection: subtitleModeBinding) {
-                    ForEach(SubtitleMode.allCases, id: \.self) { mode in
-                        Text(mode.displayName(in: model.resolvedInterfaceLanguageID)).tag(mode)
-                    }
-                }
-                .pickerStyle(.menu)
-                .labelsHidden()
+            SettingsControlRow(label: model.localized(.modeShort)) {
+                SubtitleModeMenuPicker(
+                    interfaceLanguageID: model.resolvedInterfaceLanguageID,
+                    showsDetail: false,
+                    selection: model.subtitleModeSelectionBinding
+                )
             }
-            row(model.localized(.displayShort)) {
-                Picker("", selection: subtitleDisplayModeBinding) {
-                    ForEach(SubtitleDisplayMode.allCases, id: \.self) { mode in
-                        Text(mode.displayName(in: model.resolvedInterfaceLanguageID)).tag(mode)
-                    }
-                }
-                .pickerStyle(.menu)
-                .labelsHidden()
+            SettingsControlRow(label: model.localized(.displayShort)) {
+                SubtitleDisplayModeMenuPicker(
+                    interfaceLanguageID: model.resolvedInterfaceLanguageID,
+                    selection: model.subtitleDisplayModeSelectionBinding
+                )
             }
-            HStack {
-                Spacer()
-                Button {
-                    model.refreshLanguageResources()
-                } label: {
-                    Label(model.localized(.refreshLanguageResources), systemImage: "arrow.clockwise")
-                        .font(.caption)
-                }
-                .buttonStyle(.plain)
-                .foregroundStyle(.secondary)
-            }
-
-            if !model.languageResourceStatuses.isEmpty {
-                LanguageResourceStatusListView(statuses: model.languageResourceStatuses)
-            }
+            LanguageResourcesFooter(model: model)
         }
     }
 
@@ -185,13 +149,13 @@ struct StatusBarPopoverView: View {
                 .controlSize(.small)
             }
             VStack(spacing: 6) {
-                row(model.localized(.textOutline)) {
+                SettingsControlRow(label: model.localized(.textOutline)) {
                     Toggle("", isOn: textOutlineEnabledBinding)
                         .toggleStyle(.switch)
                         .controlSize(.small)
                         .labelsHidden()
                 }
-                row(model.localized(.attachToSource)) {
+                SettingsControlRow(label: model.localized(.attachToSource)) {
                     Toggle("", isOn: attachToSourceBinding)
                         .toggleStyle(.switch)
                         .controlSize(.small)
@@ -248,17 +212,6 @@ struct StatusBarPopoverView: View {
 
     // MARK: - Layout helpers
 
-    @ViewBuilder
-    private func row<C: View>(_ label: String, @ViewBuilder control: () -> C) -> some View {
-        HStack {
-            Text(label)
-                .font(.callout)
-                .foregroundStyle(.secondary)
-            Spacer()
-            control()
-        }
-    }
-
     private func sectionHeader(_ title: String, icon: String) -> some View {
         Label(title, systemImage: icon)
             .font(.subheadline.weight(.semibold))
@@ -288,22 +241,6 @@ struct StatusBarPopoverView: View {
 
     // MARK: - Bindings
 
-    private var selectedSourceBinding: Binding<String?> {
-        Binding(get: { model.selectedSourceID }, set: { model.selectedSourceID = $0 })
-    }
-    private var inputLanguageBinding: Binding<String> {
-        Binding(get: { model.inputLanguageID }, set: { model.inputLanguageID = $0 })
-    }
-    private var outputLanguageBinding: Binding<String> {
-        Binding(get: { model.outputLanguageID }, set: { model.outputLanguageID = $0 })
-    }
-    private var subtitleModeBinding: Binding<SubtitleMode> {
-        Binding(get: { model.subtitleMode }, set: { model.subtitleMode = $0 })
-    }
-
-    private var subtitleDisplayModeBinding: Binding<SubtitleDisplayMode> {
-        Binding(get: { model.subtitleDisplayMode }, set: { model.subtitleDisplayMode = $0 })
-    }
     private var overlayOpacityBinding: Binding<Double> {
         Binding(
             get: { model.overlayStyle.backgroundOpacity },

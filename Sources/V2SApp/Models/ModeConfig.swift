@@ -7,43 +7,60 @@ enum SubtitleMode: String, Codable, CaseIterable, Sendable {
     case follow
     case reading
 
-    func displayName(in languageID: String) -> String {
+    private var localizationKeys: SubtitleModeLocalizationKeys {
         switch self {
-        case .balanced: return AppLocalization.string(.modeBalancedName, languageID: languageID)
-        case .follow:   return AppLocalization.string(.modeFollowName, languageID: languageID)
-        case .reading:  return AppLocalization.string(.modeReadingName, languageID: languageID)
+        case .balanced:
+            return SubtitleModeLocalizationKeys(
+                name: .modeBalancedName,
+                detail: .modeBalancedDetail,
+                longDescription: .modeBalancedLong,
+                bestFor: .modeBalancedBestFor,
+                tradeoff: .modeBalancedTradeoff
+            )
+        case .follow:
+            return SubtitleModeLocalizationKeys(
+                name: .modeFollowName,
+                detail: .modeFollowDetail,
+                longDescription: .modeFollowLong,
+                bestFor: .modeFollowBestFor,
+                tradeoff: .modeFollowTradeoff
+            )
+        case .reading:
+            return SubtitleModeLocalizationKeys(
+                name: .modeReadingName,
+                detail: .modeReadingDetail,
+                longDescription: .modeReadingLong,
+                bestFor: .modeReadingBestFor,
+                tradeoff: .modeReadingTradeoff
+            )
         }
+    }
+
+    func displayName(in languageID: String) -> String {
+        AppLocalization.string(localizationKeys.name, languageID: languageID)
     }
 
     func detail(in languageID: String) -> String {
-        switch self {
-        case .balanced: return AppLocalization.string(.modeBalancedDetail, languageID: languageID)
-        case .follow:   return AppLocalization.string(.modeFollowDetail, languageID: languageID)
-        case .reading:  return AppLocalization.string(.modeReadingDetail, languageID: languageID)
-        }
+        AppLocalization.string(localizationKeys.detail, languageID: languageID)
     }
 
     func longDescription(in languageID: String) -> String {
-        switch self {
-        case .balanced: return AppLocalization.string(.modeBalancedLong, languageID: languageID)
-        case .follow:   return AppLocalization.string(.modeFollowLong, languageID: languageID)
-        case .reading:  return AppLocalization.string(.modeReadingLong, languageID: languageID)
-        }
+        AppLocalization.string(localizationKeys.longDescription, languageID: languageID)
     }
 
     func bestFor(in languageID: String) -> String {
-        switch self {
-        case .balanced: return AppLocalization.string(.modeBalancedBestFor, languageID: languageID)
-        case .follow:   return AppLocalization.string(.modeFollowBestFor, languageID: languageID)
-        case .reading:  return AppLocalization.string(.modeReadingBestFor, languageID: languageID)
-        }
+        AppLocalization.string(localizationKeys.bestFor, languageID: languageID)
     }
 
     func tradeoff(in languageID: String) -> String {
+        AppLocalization.string(localizationKeys.tradeoff, languageID: languageID)
+    }
+
+    var config: ModeConfig {
         switch self {
-        case .balanced: return AppLocalization.string(.modeBalancedTradeoff, languageID: languageID)
-        case .follow:   return AppLocalization.string(.modeFollowTradeoff, languageID: languageID)
-        case .reading:  return AppLocalization.string(.modeReadingTradeoff, languageID: languageID)
+        case .balanced: return .balanced
+        case .follow: return .follow
+        case .reading: return .reading
         }
     }
 }
@@ -82,11 +99,7 @@ struct ModeConfig: Sendable {
     )
 
     static func config(for mode: SubtitleMode) -> ModeConfig {
-        switch mode {
-        case .balanced: return .balanced
-        case .follow:   return .follow
-        case .reading:  return .reading
-        }
+        mode.config
     }
 }
 
@@ -136,4 +149,12 @@ enum ChunkScorer {
         default:        return 1.0
         }
     }
+}
+
+private struct SubtitleModeLocalizationKeys {
+    let name: AppTextKey
+    let detail: AppTextKey
+    let longDescription: AppTextKey
+    let bestFor: AppTextKey
+    let tradeoff: AppTextKey
 }

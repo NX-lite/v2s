@@ -9,9 +9,8 @@ final class StatusBarController: NSObject, NSPopoverDelegate {
     private let quitApp: () -> Void
     private let statusItem: NSStatusItem
     private let popover = NSPopover()
+    private let outsideClickMonitor = PopoverOutsideClickMonitor()
     private var cancellables = Set<AnyCancellable>()
-    private var localMouseMonitor: Any?
-    private var globalMouseMonitor: Any?
 
     init(
         model: AppModel,
@@ -113,75 +112,26 @@ final class StatusBarController: NSObject, NSPopoverDelegate {
     }
 
     func popoverWillShow(_ notification: Notification) {
-        startClosingMonitorsIfNeeded()
+        outsideClickMonitor.start(
+            shouldIgnoreClick: { [weak self] screenPoint in
+                self?.clickShouldKeepPopoverOpen(at: screenPoint) ?? true
+            },
+            onOutsideClick: { [weak self] in
+                guard let self, self.popover.isShown else {
+                    return
+                }
+
+                self.popover.performClose(nil)
+            }
+        )
     }
 
     func popoverDidClose(_ notification: Notification) {
-        stopClosingMonitors()
-    }
-
-    private func startClosingMonitorsIfNeeded() {
-        guard localMouseMonitor == nil, globalMouseMonitor == nil else {
-            return
-        }
-
-        let mouseEvents: NSEvent.EventTypeMask = [.leftMouseDown, .rightMouseDown, .otherMouseDown]
-
-        localMouseMonitor = NSEvent.addLocalMonitorForEvents(matching: mouseEvents) { [weak self] event in
-            self?.closePopoverIfNeeded(for: event)
-            return event
-        }
-
-        globalMouseMonitor = NSEvent.addGlobalMonitorForEvents(matching: mouseEvents) { [weak self] event in
-            Task { @MainActor [weak self] in
-                self?.closePopoverIfNeeded(for: event)
-            }
-        }
-    }
-
-    private func stopClosingMonitors() {
-        if let localMouseMonitor {
-            NSEvent.removeMonitor(localMouseMonitor)
-            self.localMouseMonitor = nil
-        }
-
-        if let globalMouseMonitor {
-            NSEvent.removeMonitor(globalMouseMonitor)
-            self.globalMouseMonitor = nil
-        }
-    }
-
-    private func closePopoverIfNeeded(for event: NSEvent) {
-        guard popover.isShown else {
-            return
-        }
-
-        let clickPoint = screenPoint(for: event)
-        guard clickShouldKeepPopoverOpen(at: clickPoint) == false else {
-            return
-        }
-
-        popover.performClose(nil)
+        outsideClickMonitor.stop()
     }
 
     private func clickShouldKeepPopoverOpen(at screenPoint: NSPoint) -> Bool {
-        if let buttonRect = statusItemScreenRect, buttonRect.contains(screenPoint) {
-            return true
-        }
-
-        if let popoverWindow = popover.contentViewController?.view.window,
-           popoverWindow.frame.contains(screenPoint) {
-            return true
-        }
-
-        return false
-    }
-
-    private func screenPoint(for event: NSEvent) -> NSPoint {
-        guard let window = event.window else {
-            return NSEvent.mouseLocation
-        }
-
-        return window.convertPoint(toScreen: event.locationInWindow)
+        statusItemScreenRect?.contains(screenPoint) == true
+            || popover.contentViewController?.view.window?.frame.contains(screenPoint) == true
     }
 }
