@@ -34,6 +34,7 @@ final class OverlayWindowController {
     private var sourceWindowTrackingTimer: Timer?
     private var lastSourceWindowFrame: NSRect?
     private var attachToSourceRefreshTask: Task<Void, Never>?
+    private var lastAttachToSourceUsesHighLevel: Bool?
 
     // MARK: - Genie Animation State
     var trayIconRectProvider: (() -> NSRect?)?
@@ -899,17 +900,19 @@ final class OverlayWindowController {
     }
 
     private func refreshAttachToSourcePresentation(animated: Bool) {
-        updateAttachToSourceLevels()
+        let presentationChanged = updateAttachToSourceLevels()
 
         guard panelsShown else {
             return
         }
 
-        positionPanels(animated: animated)
+        positionPanels(animated: animated && !presentationChanged)
     }
 
-    private func updateAttachToSourceLevels() {
+    @discardableResult
+    private func updateAttachToSourceLevels() -> Bool {
         let useHighLevel = !model.overlayStyle.attachToSource || isSourceAppFrontmost()
+        let presentationChanged = lastAttachToSourceUsesHighLevel != useHighLevel
         let contentLevel: NSWindow.Level = useHighLevel ? .statusBar : .normal
         let controlLevel: NSWindow.Level = useHighLevel
             ? NSWindow.Level(rawValue: contentLevel.rawValue + 1)
@@ -927,17 +930,19 @@ final class OverlayWindowController {
             p.isFloatingPanel = useHighLevel
         }
 
-        if useHighLevel, panelsShown {
-            orderFrontAllPanels()
-        } else if panelsShown {
+        if panelsShown, presentationChanged, useHighLevel == false {
             orderPanelsBelowFrontmostApplication()
         }
+
+        lastAttachToSourceUsesHighLevel = useHighLevel
 
         if model.overlayStyle.attachToSource && panelsShown {
             startSourceWindowTracking()
         } else {
             stopSourceWindowTracking()
         }
+
+        return presentationChanged
     }
 
     private func orderPanelsBelowFrontmostApplication() {
