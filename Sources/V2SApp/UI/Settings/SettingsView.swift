@@ -55,6 +55,7 @@ struct SettingsView: View {
             } label: {
                 SessionActionButtonLabel(
                     title: model.sessionButtonTitle,
+                    symbolName: model.sessionButtonSymbolName,
                     showsActivity: model.showsSessionWaitIndicator
                 )
             }
@@ -128,6 +129,7 @@ struct SettingsView: View {
                             interfaceLanguageID: model.resolvedInterfaceLanguageID,
                             selection: model.inputLanguageSelectionBinding
                         )
+                        .disabled(model.isLanguagePairLocked)
                     }
                     Divider()
                     SettingsControlRow(label: model.localized(.subtitleLanguage)) {
@@ -135,6 +137,7 @@ struct SettingsView: View {
                             interfaceLanguageID: model.resolvedInterfaceLanguageID,
                             selection: model.outputLanguageSelectionBinding
                         )
+                        .disabled(model.isLanguagePairLocked)
                     }
                     Divider()
                     SettingsControlRow(label: model.localized(.subtitleMode)) {

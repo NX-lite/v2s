@@ -183,6 +183,10 @@ final class AppModel: ObservableObject {
         return localized(.start)
     }
 
+    var sessionButtonSymbolName: String {
+        sessionState == .running ? "stop.fill" : "play.fill"
+    }
+
     var showsSessionWaitIndicator: Bool {
         sessionState != .running && isPreparingSelectedLanguageResources
     }
@@ -199,6 +203,10 @@ final class AppModel: ObservableObject {
 
     var sessionBadgeText: String {
         sessionState.displayName(in: resolvedInterfaceLanguageID)
+    }
+
+    var isLanguagePairLocked: Bool {
+        sessionState == .running
     }
 
     var resolvedInterfaceLanguageID: String {

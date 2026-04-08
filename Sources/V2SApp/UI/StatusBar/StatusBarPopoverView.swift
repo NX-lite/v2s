@@ -66,6 +66,7 @@ struct StatusBarPopoverView: View {
             } label: {
                 SessionActionButtonLabel(
                     title: model.sessionButtonTitle,
+                    symbolName: model.sessionButtonSymbolName,
                     showsActivity: model.showsSessionWaitIndicator
                 )
                 .frame(maxWidth: .infinity)
@@ -107,12 +108,14 @@ struct StatusBarPopoverView: View {
                     interfaceLanguageID: model.resolvedInterfaceLanguageID,
                     selection: model.inputLanguageSelectionBinding
                 )
+                .disabled(model.isLanguagePairLocked)
             }
             SettingsControlRow(label: model.localized(.subtitleShort)) {
                 CommonLanguageMenuPicker(
                     interfaceLanguageID: model.resolvedInterfaceLanguageID,
                     selection: model.outputLanguageSelectionBinding
                 )
+                .disabled(model.isLanguagePairLocked)
             }
             SettingsControlRow(label: model.localized(.modeShort)) {
                 SubtitleModeMenuPicker(
