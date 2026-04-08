@@ -1166,7 +1166,8 @@ final class LiveTranscriptionSession: NSObject, @unchecked Sendable {
     }
 
     private func shouldSplitDialogueClauses(left: String, right: String) -> Bool {
-        guard left.isEmpty == false,
+        guard activeHeuristicLanguage == .japanese,
+              left.isEmpty == false,
               right.isEmpty == false,
               left.containsCJKCharacters || right.containsCJKCharacters else {
             return false
@@ -1178,9 +1179,9 @@ final class LiveTranscriptionSession: NSObject, @unchecked Sendable {
             return false
         }
 
-        let leftLooksComplete = Self.dialogueClauseEndingSuffixes.contains(where: { left.hasSuffix($0) })
+        let leftLooksComplete = Self.japaneseDialogueClauseEndingSuffixes.contains(where: { left.hasSuffix($0) })
             || left.containsSentenceTerminator
-        let rightLooksLikeNewTurn = Self.dialogueClauseLeadingPhrases.contains(where: { right.hasPrefix($0) })
+        let rightLooksLikeNewTurn = Self.japaneseDialogueClauseLeadingPhrases.contains(where: { right.hasPrefix($0) })
 
         return leftLooksComplete || rightLooksLikeNewTurn
     }
@@ -1837,12 +1838,38 @@ final class LiveTranscriptionSession: NSObject, @unchecked Sendable {
             return false
         }
 
-        if text.containsCJKCharacters {
-            return Self.modernVADDeferredCJKCommitSuffixes.contains(where: { text.hasSuffix($0) })
+        switch activeHeuristicLanguage {
+        case .japanese:
+            return Self.modernVADDeferredJapaneseCommitSuffixes.contains(where: { text.hasSuffix($0) })
+        case .english:
+            let normalized = text.lowercased()
+            return Self.modernVADDeferredEnglishCommitSuffixes.contains(where: { normalized.hasSuffix($0) })
+        case .other:
+            return false
+        }
+    }
+
+    private var activeHeuristicLanguage: RecognitionHeuristicLanguage {
+        switch activeLanguageCode {
+        case "ja":
+            return .japanese
+        case "en":
+            return .english
+        default:
+            return .other
+        }
+    }
+
+    private var activeLanguageCode: String? {
+        guard let activeLocaleIdentifier else {
+            return nil
         }
 
-        let normalized = text.lowercased()
-        return Self.modernVADDeferredLatinCommitSuffixes.contains(where: { normalized.hasSuffix($0) })
+        let separators = CharacterSet(charactersIn: "-_")
+        return activeLocaleIdentifier
+            .components(separatedBy: separators)
+            .first?
+            .lowercased()
     }
 
     @available(macOS 26.0, *)
@@ -2636,22 +2663,28 @@ private extension String {
 }
 
 private extension LiveTranscriptionSession {
+    enum RecognitionHeuristicLanguage {
+        case japanese
+        case english
+        case other
+    }
+
     static let minimumLatinLeadingOverlapCharacters = 10
     static let minimumCJKLeadingOverlapCharacters = 4
     static let recentCommittedSentenceLimit = 6
     static let committedPrefixContinuationWindow: TimeInterval = 3.0
     static let dialogueClauseSeparators: Set<Character> = ["、", ",", "，"]
-    static let dialogueClauseEndingSuffixes = [
+    static let japaneseDialogueClauseEndingSuffixes = [
         "ね", "よ", "の", "な", "さ", "わ", "ぞ", "ぜ", "かな", "かも", "だよ", "だね"
     ]
-    static let dialogueClauseLeadingPhrases = [
+    static let japaneseDialogueClauseLeadingPhrases = [
         "俺", "私", "僕", "うん", "いや", "や", "でも", "じゃ", "ただいま", "おかえり", "ありがとう", "ごめん"
     ]
-    static let modernVADDeferredCJKCommitSuffixes = [
+    static let modernVADDeferredJapaneseCommitSuffixes = [
         "けど", "けれど", "けれども", "から", "ので", "のに", "とか", "って",
         "で", "て", "が", "を", "に", "へ", "と", "し"
     ]
-    static let modernVADDeferredLatinCommitSuffixes = [
+    static let modernVADDeferredEnglishCommitSuffixes = [
         " and", " or", " but", " so", " because", " if", " when", " that", " to"
     ]
     static let committedComparisonTrimCharacterSet = CharacterSet.whitespacesAndNewlines
