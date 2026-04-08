@@ -1468,6 +1468,10 @@ final class AppModel: ObservableObject {
         showsTranslatedSubtitle && currentSourceLanguageID != outputLanguageID
     }
 
+    var transcriptSourceLanguageID: String {
+        currentSourceLanguageID
+    }
+
     var shouldReserveCommittedCaptionSlot: Bool {
         guard sessionState == .running else {
             return false
