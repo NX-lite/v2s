@@ -82,6 +82,12 @@ struct TranscriptView: View {
             // Reset summary when switching tabs so user can summarize per-tab
             summarizeError = nil
         }
+        .onChange(of: model.transcriptGeneration) { _, _ in
+            cancelSummarization()
+            isSummarizeEnabled = false
+            summarizedText = [:]
+            summarizeError = nil
+        }
         .onDisappear {
             cancelSummarization()
         }
@@ -150,6 +156,13 @@ struct TranscriptView: View {
 
             Spacer()
 
+            Button(model.localized(.clear)) {
+                model.clearTranscript()
+            }
+            .buttonStyle(.bordered)
+            .controlSize(.regular)
+            .disabled(model.hasTranscript == false)
+
             Button(model.localized(.copy)) {
                 copyCurrentText()
             }
@@ -176,20 +189,7 @@ struct TranscriptView: View {
     // MARK: - Data Helpers
 
     private func fullText(for tab: TranscriptTab) -> String {
-        guard let state = model.overlayState else { return "" }
-        let historyTexts: [String]
-        let currentText: String
-        switch tab {
-        case .origin:
-            historyTexts = state.history.map(\.sourceText)
-            currentText = state.sourceText
-        case .translation:
-            historyTexts = state.history.map(\.translatedText)
-            currentText = state.translatedText
-        }
-        return (historyTexts + [currentText])
-            .filter { !$0.isEmpty }
-            .joined(separator: "\n")
+        model.transcriptText(isTranslation: tab == .translation)
     }
 
     private func summaryLanguageID(for tab: TranscriptTab) -> String {
@@ -197,7 +197,7 @@ struct TranscriptView: View {
         case .origin:
             return model.transcriptSourceLanguageID
         case .translation:
-            return model.outputLanguageID
+            return model.transcriptTargetLanguageID
         }
     }
 

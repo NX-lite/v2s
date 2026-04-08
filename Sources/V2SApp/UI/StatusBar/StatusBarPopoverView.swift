@@ -4,6 +4,7 @@ struct StatusBarPopoverView: View {
     @ObservedObject var model: AppModel
     let closePopover: () -> Void
     let openAdvancedSettings: () -> Void
+    let showTranscript: () -> Void
     let quitApp: () -> Void
 
     var body: some View {
@@ -141,6 +142,14 @@ struct StatusBarPopoverView: View {
             HStack {
                 sectionHeader(model.localized(.overlay), icon: "rectangle.on.rectangle")
                 Spacer()
+                Button {
+                    showTranscript()
+                } label: {
+                    Text(model.localized(.transcript))
+                        .font(.caption)
+                }
+                .buttonStyle(.bordered)
+                .controlSize(.small)
                 Button {
                     if model.isOverlayVisible { model.toggleOverlayVisibility() }
                     else { model.showOverlayPreview() }

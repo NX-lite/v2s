@@ -8,6 +8,7 @@ struct SettingsView: View {
     let closeSettings: () -> Void
     let quitApp: () -> Void
     let openSubtitleModeInfo: () -> Void
+    let showTranscript: () -> Void
 
     var body: some View {
         VStack(spacing: 0) {
@@ -64,6 +65,11 @@ struct SettingsView: View {
             .disabled(model.isSessionButtonDisabled)
             Button(model.localized(.showSubtitlePreview)) {
                 model.showOverlayPreview()
+            }
+            .buttonStyle(.bordered)
+            .controlSize(.regular)
+            Button(model.localized(.transcript)) {
+                showTranscript()
             }
             .buttonStyle(.bordered)
             .controlSize(.regular)

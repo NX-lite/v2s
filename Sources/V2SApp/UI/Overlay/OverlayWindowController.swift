@@ -6,6 +6,7 @@ import SwiftUI
 @MainActor
 final class OverlayWindowController {
     private let model: AppModel
+    private let showTranscript: () -> Void
     private let interactionState = OverlayInteractionState()
     private let panel: OverlayPanel
     private let controlsChromePanel: OverlayPanel
@@ -16,7 +17,6 @@ final class OverlayWindowController {
     private let subtitleHostingView: NSHostingView<OverlayView>
     private let controlsChromeHostingView: NSHostingView<OverlayControlsChromeView>
     private let scrollbarHostingView: NSHostingView<OverlayHistoryScrollbarView>
-    private lazy var transcriptWindowController = TranscriptWindowController(model: model)
     private let moveButtonHostingView: NSHostingView<OverlayMoveButtonView>
     private let closeButtonHostingView: NSHostingView<OverlayCloseButtonView>
     private let resizeButtonHostingView: NSHostingView<OverlayResizeButtonView>
@@ -62,8 +62,9 @@ final class OverlayWindowController {
         }
     }
 
-    init(model: AppModel) {
+    init(model: AppModel, showTranscript: @escaping () -> Void) {
         self.model = model
+        self.showTranscript = showTranscript
         self.panel = OverlayPanel(
             contentRect: NSRect(x: 0, y: 0, width: 1024, height: 120),
             styleMask: [.borderless, .nonactivatingPanel],
@@ -141,7 +142,7 @@ final class OverlayWindowController {
         scrollbarHostingView.rootView = OverlayHistoryScrollbarView(
             model: model,
             interactionState: interactionState,
-            showTranscript: { [weak self] in self?.transcriptWindowController.showTranscript() }
+            showTranscript: showTranscript
         )
         bindModel()
         syncWindow()

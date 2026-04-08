@@ -7,6 +7,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     private let updaterService = UpdaterService()
     private let launchAtLoginService = LaunchAtLoginService()
     private let dockVisibilityController = DockVisibilityController()
+    private lazy var transcriptWindowController = TranscriptWindowController(model: appModel)
     private var statusBarController: StatusBarController?
     private var settingsWindowController: SettingsWindowController?
     private var overlayWindowController: OverlayWindowController?
@@ -21,18 +22,31 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             updaterService: updaterService,
             launchAtLoginService: launchAtLoginService,
             dockVisibilityController: dockVisibilityController,
+            showTranscript: { [weak self] in
+                self?.transcriptWindowController.showTranscript()
+            },
             quitApp: {
                 NSApp.terminate(nil)
             }
         )
-        let overlayWindowController = OverlayWindowController(model: appModel)
+        let overlayWindowController = OverlayWindowController(
+            model: appModel,
+            showTranscript: { [weak self] in
+                self?.transcriptWindowController.showTranscript()
+            }
+        )
         let statusBarController = StatusBarController(
-            model: appModel
-        ) { [weak settingsWindowController] in
-            settingsWindowController?.showSettings()
-        } quitApp: {
+            model: appModel,
+            openAdvancedSettings: { [weak settingsWindowController] in
+                settingsWindowController?.showSettings()
+            },
+            showTranscript: { [weak self] in
+                self?.transcriptWindowController.showTranscript()
+            },
+            quitApp: {
             NSApp.terminate(nil)
-        }
+            }
+        )
 
         self.settingsWindowController = settingsWindowController
         self.overlayWindowController = overlayWindowController

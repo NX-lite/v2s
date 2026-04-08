@@ -8,6 +8,7 @@ final class SettingsWindowController: NSWindowController, NSWindowDelegate {
         var closeSettings: () -> Void = {}
         var quitApp: () -> Void = {}
         var openSubtitleModeInfo: () -> Void = {}
+        var showTranscript: () -> Void = {}
     }
 
     private let model: AppModel
@@ -22,6 +23,7 @@ final class SettingsWindowController: NSWindowController, NSWindowDelegate {
         updaterService: UpdaterService,
         launchAtLoginService: LaunchAtLoginService,
         dockVisibilityController: DockVisibilityController,
+        showTranscript: @escaping () -> Void,
         quitApp: @escaping () -> Void
     ) {
         self.model = model
@@ -37,7 +39,8 @@ final class SettingsWindowController: NSWindowController, NSWindowDelegate {
                 launchAtLoginService: launchAtLoginService,
                 closeSettings: { actions.closeSettings() },
                 quitApp: { actions.quitApp() },
-                openSubtitleModeInfo: { actions.openSubtitleModeInfo() }
+                openSubtitleModeInfo: { actions.openSubtitleModeInfo() },
+                showTranscript: { actions.showTranscript() }
             )
         )
         window.contentViewController = hostingController
@@ -57,6 +60,7 @@ final class SettingsWindowController: NSWindowController, NSWindowDelegate {
         actions.openSubtitleModeInfo = { [weak self] in
             self?.showSubtitleModeInfo()
         }
+        actions.showTranscript = showTranscript
     }
 
     @available(*, unavailable)

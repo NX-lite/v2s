@@ -45,6 +45,8 @@ final class AppModel: ObservableObject {
     private var recentRecognizedCaptionTexts: [RecentRecognizedCaption] = []
     private var recentArchivedCaption: RecentArchivedCaption?
     private var finalizedDraftPromotionIDs: [(id: UUID, time: Date)] = []
+    private var transcriptInputLanguageID: String?
+    private var transcriptOutputLanguageID: String?
     private var statusDescriptor: StatusDescriptor = .ready
     @Published private(set) var applicationSources: [InputSource] = []
     @Published private(set) var microphoneSources: [InputSource] = []
@@ -53,6 +55,8 @@ final class AppModel: ObservableObject {
     @Published private(set) var overlayState: OverlayPreviewState?
     @Published private(set) var languageResourceStatuses: [LanguageResourceStatus] = []
     @Published private(set) var translationHostConfiguration: TranslationSession.Configuration?
+    @Published private(set) var transcriptEntries: [TranscriptEntry] = []
+    @Published private(set) var transcriptGeneration: Int = 0
     @Published var isOverlayVisible = false
     @Published private(set) var overlayHistoryVisibleCount = 0
     @Published private(set) var overlayHistoryScrollOffset = 0
@@ -391,6 +395,14 @@ final class AppModel: ObservableObject {
             return
         }
 
+        let previousTranscriptEntries = transcriptEntries
+        let previousTranscriptInputLanguageID = transcriptInputLanguageID
+        let previousTranscriptOutputLanguageID = transcriptOutputLanguageID
+        resetTranscript(
+            sourceLanguageID: inputLanguageID,
+            targetLanguageID: outputLanguageID
+        )
+
         activeInputLanguageID = inputLanguageID
         isOverlayVisible = true
         overlayState = OverlayPreviewState(
@@ -436,6 +448,11 @@ final class AppModel: ObservableObject {
         } catch {
             resetLiveTextPipeline()
             liveTranscriptionSession = nil
+            restoreTranscript(
+                entries: previousTranscriptEntries,
+                sourceLanguageID: previousTranscriptInputLanguageID,
+                targetLanguageID: previousTranscriptOutputLanguageID
+            )
             sessionState = .error
             let localizedError = localizedErrorDescription(error)
             setStatus(.custom(localizedError))
@@ -1464,6 +1481,11 @@ final class AppModel: ObservableObject {
                     sourceText: displayedCaption.sourceText,
                     lateTranslation: translationExpected && resolvedTranslation.isEmpty == false
                 )
+                upsertTranscriptEntry(
+                    id: displayedCaption.id,
+                    sourceText: displayedCaption.sourceText,
+                    translatedText: resolvedTranslation
+                )
             }
         }
     }
@@ -1477,7 +1499,27 @@ final class AppModel: ObservableObject {
     }
 
     var transcriptSourceLanguageID: String {
-        currentSourceLanguageID
+        transcriptInputLanguageID ?? currentSourceLanguageID
+    }
+
+    var transcriptTargetLanguageID: String {
+        transcriptOutputLanguageID ?? outputLanguageID
+    }
+
+    var hasTranscript: Bool {
+        transcriptEntries.isEmpty == false
+    }
+
+    func transcriptText(isTranslation: Bool) -> String {
+        transcriptEntries
+            .map { isTranslation ? $0.translatedText : $0.sourceText }
+            .filter { $0.isEmpty == false }
+            .joined(separator: "\n")
+    }
+
+    func clearTranscript() {
+        transcriptEntries.removeAll()
+        transcriptGeneration &+= 1
     }
 
     var shouldReserveCommittedCaptionSlot: Bool {
@@ -1587,6 +1629,11 @@ final class AppModel: ObservableObject {
                 promotionID: caption.promotionID,
                 bumpEpoch: true
             )
+            upsertTranscriptEntry(
+                id: caption.id,
+                sourceText: caption.sourceText,
+                translatedText: initialTranslation ?? (translationExpected ? "" : caption.sourceText)
+            )
             overlayState?.sourceName = caption.sourceName
             clearDraftOverlay()
 
@@ -1633,6 +1680,11 @@ final class AppModel: ObservableObject {
                 translatedText: resolvedTranslation,
                 sourceText: caption.sourceText,
                 lateTranslation: translationExpected && resolvedTranslation.isEmpty == false
+            )
+            upsertTranscriptEntry(
+                id: caption.id,
+                sourceText: caption.sourceText,
+                translatedText: resolvedTranslation
             )
             if resolvedTranslation.isEmpty == false {
                 translationRevisions[caption.id] = (text: resolvedTranslation, committedAt: Date(), count: 0)
@@ -2097,6 +2149,50 @@ final class AppModel: ObservableObject {
                 lateTranslation: true
             )
         }
+
+        if let sourceText = transcriptEntries.first(where: { $0.id == captionId })?.sourceText {
+            upsertTranscriptEntry(
+                id: captionId,
+                sourceText: sourceText,
+                translatedText: revised
+            )
+        }
+    }
+
+    private func resetTranscript(sourceLanguageID: String, targetLanguageID: String) {
+        transcriptEntries.removeAll()
+        transcriptInputLanguageID = sourceLanguageID
+        transcriptOutputLanguageID = targetLanguageID
+        transcriptGeneration &+= 1
+    }
+
+    private func restoreTranscript(
+        entries: [TranscriptEntry],
+        sourceLanguageID: String?,
+        targetLanguageID: String?
+    ) {
+        transcriptEntries = entries
+        transcriptInputLanguageID = sourceLanguageID
+        transcriptOutputLanguageID = targetLanguageID
+        transcriptGeneration &+= 1
+    }
+
+    private func upsertTranscriptEntry(
+        id: UUID,
+        sourceText: String,
+        translatedText: String
+    ) {
+        let entry = TranscriptEntry(
+            id: id,
+            sourceText: sourceText,
+            translatedText: translatedText
+        )
+
+        if let existingIndex = transcriptEntries.firstIndex(where: { $0.id == id }) {
+            transcriptEntries[existingIndex] = entry
+        } else {
+            transcriptEntries.append(entry)
+        }
     }
 
     private func levenshteinDistanceRatio(_ a: String, _ b: String) -> Double {
@@ -2390,6 +2486,12 @@ private struct QueuedCaption: Identifiable, Equatable {
     let sourceText: String
     let sourceName: String
     let promotedDraftTranslation: String?
+}
+
+struct TranscriptEntry: Identifiable, Equatable {
+    let id: UUID
+    var sourceText: String
+    var translatedText: String
 }
 
 private enum LanguageResourcePreparationError: LocalizedError, AppLocalizableError {
