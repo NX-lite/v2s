@@ -36,6 +36,7 @@ final class AppModel: ObservableObject {
     private var languageResourcePreparationTask: Task<Void, Never>?
     private var lastDraftStablePrefix = ""
     private var lastDraftTranslationSource = ""
+    private var lastDraftTranslationPromotionID: UUID?
     private var draftTranslationGeneration: Int = 0
     private var draftClearGeneration: Int = 0
     private var displayedCaptionLastVisualUpdateAt = Date.distantPast
@@ -1133,6 +1134,7 @@ final class AppModel: ObservableObject {
         }
 
         let draftText = sanitizedDisplayText(draft?.sourceText ?? "")
+        let draftPromotionID = draft?.segmentId
         if draftText.isEmpty {
             if isDraftPromotionPending() {
                 return
@@ -1145,23 +1147,35 @@ final class AppModel: ObservableObject {
         cancelPendingDraftClear()
         overlayState?.draftSourceText = draftText
         overlayState?.draftStablePrefixLength = min(draft?.stablePrefixLength ?? 0, draftText.count)
-        overlayState?.draftPromotionID = draft?.segmentId
+        overlayState?.draftPromotionID = draftPromotionID
+        overlayState?.clearDraftTranslationIfMismatched(
+            sourceText: draftText,
+            promotionID: draftPromotionID
+        )
 
         dismissListeningPlaceholderIfNeeded()
 
         let stablePrefix = String(draftText.prefix(min(draft?.stablePrefixLength ?? 0, draftText.count)))
         lastDraftStablePrefix = stablePrefix
 
-        guard draftText != lastDraftTranslationSource else { return }
+        guard draftText != lastDraftTranslationSource
+                || draftPromotionID != lastDraftTranslationPromotionID else {
+            return
+        }
         lastDraftTranslationSource = draftText
+        lastDraftTranslationPromotionID = draftPromotionID
 
         if shouldReserveDraftTranslationSlot {
-            scheduleDraftTranslation(for: draftText)
+            scheduleDraftTranslation(for: draftText, promotionID: draftPromotionID)
         } else {
             draftTranslationTask?.cancel()
             draftTranslationTask = nil
             draftTranslationGeneration &+= 1
-            overlayState?.draftTranslatedText = draftText
+            overlayState?.setDraftTranslation(
+                draftText,
+                sourceText: draftText,
+                promotionID: draftPromotionID
+            )
         }
     }
 
@@ -1199,16 +1213,17 @@ final class AppModel: ObservableObject {
         draftClearTask = nil
         overlayState?.draftSourceText = nil
         overlayState?.draftStablePrefixLength = 0
-        overlayState?.draftTranslatedText = nil
         overlayState?.draftPromotionID = nil
+        overlayState?.clearDraftTranslation()
         lastDraftStablePrefix = ""
         lastDraftTranslationSource = ""
+        lastDraftTranslationPromotionID = nil
         draftTranslationTask?.cancel()
         draftTranslationTask = nil
         draftTranslationGeneration &+= 1
     }
 
-    private func scheduleDraftTranslation(for text: String) {
+    private func scheduleDraftTranslation(for text: String, promotionID: UUID?) {
         draftTranslationTask?.cancel()
         draftTranslationGeneration &+= 1
         let generation = draftTranslationGeneration
@@ -1223,7 +1238,15 @@ final class AppModel: ObservableObject {
             guard generation == draftTranslationGeneration else { return }
 
             guard sourceID != targetID else {
-                overlayState?.draftTranslatedText = text
+                guard overlayState?.draftSourceText == text,
+                      overlayState?.draftPromotionID == promotionID else {
+                    return
+                }
+                overlayState?.setDraftTranslation(
+                    text,
+                    sourceText: text,
+                    promotionID: promotionID
+                )
                 return
             }
 
@@ -1243,11 +1266,17 @@ final class AppModel: ObservableObject {
 
             guard !Task.isCancelled,
                   liveTranscriptionSession != nil,
-                  generation == draftTranslationGeneration else { return }
+                  generation == draftTranslationGeneration,
+                  overlayState?.draftSourceText == text,
+                  overlayState?.draftPromotionID == promotionID else { return }
             if let translated {
                 let resolvedTranslation = glossaryService.apply(to: translated, glossary: glossary)
                 if shouldTreatAsMissingTranslation(resolvedTranslation, sourceText: text) == false {
-                    overlayState?.draftTranslatedText = resolvedTranslation
+                    overlayState?.setDraftTranslation(
+                        resolvedTranslation,
+                        sourceText: text,
+                        promotionID: promotionID
+                    )
                 }
             }
         }
@@ -1340,18 +1369,25 @@ final class AppModel: ObservableObject {
             }
 
             if shouldReserveDraftTranslationSlot {
-                scheduleDraftTranslation(for: draftText)
+                scheduleDraftTranslation(
+                    for: draftText,
+                    promotionID: overlayState?.draftPromotionID
+                )
             } else {
                 draftTranslationTask?.cancel()
                 draftTranslationTask = nil
                 draftTranslationGeneration &+= 1
-                overlayState?.draftTranslatedText = draftText
+                overlayState?.setDraftTranslation(
+                    draftText,
+                    sourceText: draftText,
+                    promotionID: overlayState?.draftPromotionID
+                )
             }
         } else {
             draftTranslationTask?.cancel()
             draftTranslationTask = nil
             draftTranslationGeneration &+= 1
-            overlayState?.draftTranslatedText = nil
+            overlayState?.clearDraftTranslation()
         }
 
         scheduleCommittedCaptionArchiveIfNeeded()
@@ -1547,6 +1583,7 @@ final class AppModel: ObservableObject {
         committedCaptionArchiveTask = nil
         lastDraftStablePrefix = ""
         lastDraftTranslationSource = ""
+        lastDraftTranslationPromotionID = nil
         draftTranslationGeneration &+= 1
         draftClearGeneration &+= 1
         cancelCaptionTranslations()
@@ -1841,11 +1878,17 @@ final class AppModel: ObservableObject {
 
     private func promotedDraftTranslationSnapshot(for promotionID: UUID?) -> String? {
         guard let promotionID,
-              overlayState?.draftPromotionID == promotionID else {
+              let state = overlayState,
+              let draftText = state.draftSourceText,
+              state.draftPromotionID == promotionID,
+              let currentDraftTranslation = state.visibleDraftTranslatedText(
+                  for: draftText,
+                  promotionID: promotionID
+              ) else {
             return nil
         }
 
-        let draftTranslation = sanitizedDisplayText(overlayState?.draftTranslatedText ?? "")
+        let draftTranslation = sanitizedDisplayText(currentDraftTranslation)
         return draftTranslation.isEmpty ? nil : draftTranslation
     }
 

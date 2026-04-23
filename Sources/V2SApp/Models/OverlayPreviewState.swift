@@ -22,7 +22,9 @@ struct OverlayPreviewState: Equatable {
     var draftSourceText: String? = nil
     var draftStablePrefixLength: Int = 0
     /// Incremental translation of the current draft text (updates as stable prefix grows).
-    var draftTranslatedText: String? = nil
+    private(set) var draftTranslatedText: String? = nil
+    private(set) var draftTranslationSourceText: String? = nil
+    private(set) var draftTranslationPromotionID: UUID? = nil
     var draftPromotionID: UUID? = nil
 
     // MARK: History layer — committed captions the user can scroll back through
@@ -44,5 +46,57 @@ struct OverlayPreviewState: Equatable {
 
     var hasHistory: Bool {
         history.isEmpty == false
+    }
+
+    mutating func setDraftTranslation(_ translatedText: String?, sourceText: String, promotionID: UUID?) {
+        guard let translatedText, translatedText.isEmpty == false else {
+            clearDraftTranslation()
+            return
+        }
+
+        self.draftTranslatedText = translatedText
+        self.draftTranslationSourceText = sourceText
+        self.draftTranslationPromotionID = promotionID
+    }
+
+    mutating func clearDraftTranslation() {
+        draftTranslatedText = nil
+        draftTranslationSourceText = nil
+        draftTranslationPromotionID = nil
+    }
+
+    mutating func clearDraftTranslationIfMismatched(sourceText: String, promotionID: UUID?) {
+        guard draftTranslatedText != nil else {
+            return
+        }
+
+        if visibleDraftTranslatedText(for: sourceText, promotionID: promotionID) == nil {
+            clearDraftTranslation()
+        }
+    }
+
+    func currentDraftTranslatedText(for sourceText: String, promotionID: UUID?) -> String? {
+        guard let draftTranslatedText,
+              draftTranslatedText.isEmpty == false,
+              draftTranslationSourceText == sourceText,
+              draftTranslationPromotionID == promotionID else {
+            return nil
+        }
+
+        return draftTranslatedText
+    }
+
+    func visibleDraftTranslatedText(for sourceText: String, promotionID: UUID?) -> String? {
+        guard let draftTranslatedText,
+              draftTranslatedText.isEmpty == false,
+              draftTranslationPromotionID == promotionID else {
+            return nil
+        }
+
+        if promotionID != nil {
+            return draftTranslatedText
+        }
+
+        return draftTranslationSourceText == sourceText ? draftTranslatedText : nil
     }
 }

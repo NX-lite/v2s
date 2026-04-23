@@ -365,8 +365,12 @@ struct OverlayView: View {
     }
 
     private func estimatedDraftRowHeight(for state: OverlayPreviewState) -> CGFloat {
+        let currentDraftTranslation = state.visibleDraftTranslatedText(
+            for: state.draftSourceText ?? "",
+            promotionID: state.draftPromotionID
+        )
         let translatedHeight = showsTranslatedSubtitle && (
-            (state.draftTranslatedText?.isEmpty == false) || model.shouldReserveDraftTranslationSlot
+            (currentDraftTranslation?.isEmpty == false) || model.shouldReserveDraftTranslationSlot
         )
             ? translatedLineHeight
             : 0
@@ -382,7 +386,10 @@ struct OverlayView: View {
             return draftText
         }
 
-        guard let draftTranslated = state.draftTranslatedText,
+        guard let draftTranslated = state.visibleDraftTranslatedText(
+            for: draftText,
+            promotionID: state.draftPromotionID
+        ),
               draftTranslated.isEmpty == false else {
             return nil
         }
