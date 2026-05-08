@@ -9,7 +9,7 @@ on:
 
 jobs:
   build:
-    runs-on: macos-latest
+    runs-on: macos-26
 
     steps:
       - name: Checkout
@@ -18,18 +18,23 @@ jobs:
       - name: Show Xcode version
         run: |
           xcodebuild -version
+          xcrun --sdk macosx --show-sdk-version
           swift --version
+          uname -m
+          sw_vers
 
       - name: List schemes
         run: |
           xcodebuild -list -project v2s.xcodeproj
 
-      - name: Build
+      - name: Build Apple Silicon App
         run: |
           xcodebuild \
             -project v2s.xcodeproj \
             -scheme v2s \
-            -configuration Release \
-            -destination 'platform=macOS' \
+            -configuration Debug \
+            -destination 'platform=macOS,arch=arm64' \
             CODE_SIGNING_ALLOWED=NO \
+            CODE_SIGNING_REQUIRED=NO \
+            CODE_SIGN_IDENTITY="" \
             clean build
