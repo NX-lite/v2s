@@ -68,7 +68,14 @@ jobs:
           echo "checksum=$CHECKSUM_PATH" >> "$GITHUB_OUTPUT"
 
       - name: Generate appcast
+        env:
+          SPARKLE_PRIVATE_KEY: ${{ secrets.SPARKLE_PRIVATE_KEY }}
         run: |
+          if [ -z "$SPARKLE_PRIVATE_KEY" ]; then
+            echo "::warning::SPARKLE_PRIVATE_KEY is not configured; skipping appcast generation"
+            exit 0
+          fi
+
           # Find Sparkle bin directory from SPM build artifacts
           SPARKLE_BIN=""
           for candidate in \
@@ -80,46 +87,49 @@ jobs:
           done
 
           if [ -z "$SPARKLE_BIN" ]; then
-            echo "::error::Could not find generate_appcast in .build artifacts"
-            exit 1
+            echo "::warning::Could not find generate_appcast in .build artifacts; skipping appcast generation"
+            exit 0
           fi
 
           echo "Sparkle bin: $SPARKLE_BIN"
 
           # Write EdDSA private key to a temporary file
           KEY_FILE="$(mktemp)"
-          echo "${{ secrets.SPARKLE_PRIVATE_KEY }}" > "$KEY_FILE"
+          trap 'rm -f "$KEY_FILE"' EXIT
+          printf '%s' "$SPARKLE_PRIVATE_KEY" > "$KEY_FILE"
 
           # Download previous appcast if it exists, so generate_appcast can append
           curl -fsSL \
             "https://github.com/${{ github.repository }}/releases/latest/download/appcast.xml" \
             -o dist/appcast.xml 2>/dev/null || true
 
-          "$SPARKLE_BIN/generate_appcast" \
+          if ! "$SPARKLE_BIN/generate_appcast" \
             --ed-key-file "$KEY_FILE" \
             --download-url-prefix "https://github.com/${{ github.repository }}/releases/download/${{ steps.version.outputs.tag }}/" \
             --link "https://github.com/${{ github.repository }}" \
-            dist/
-
-          rm -f "$KEY_FILE"
+            dist/; then
+            echo "::warning::generate_appcast failed; continuing without appcast.xml"
+            rm -f dist/appcast.xml
+          fi
 
       - name: Create or update GitHub release
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
           TAG="${{ steps.version.outputs.tag }}"
+          ASSETS=(
+            "${{ steps.package.outputs.zip }}"
+            "${{ steps.package.outputs.checksum }}"
+          )
+
+          if [ -f dist/appcast.xml ]; then
+            ASSETS+=(dist/appcast.xml)
+          fi
 
           if gh release view "$TAG" >/dev/null 2>&1; then
-            gh release upload "$TAG" \
-              "${{ steps.package.outputs.zip }}" \
-              "${{ steps.package.outputs.checksum }}" \
-              dist/appcast.xml \
-              --clobber
+            gh release upload "$TAG" "${ASSETS[@]}" --clobber
           else
-            gh release create "$TAG" \
-              "${{ steps.package.outputs.zip }}" \
-              "${{ steps.package.outputs.checksum }}" \
-              dist/appcast.xml \
+            gh release create "$TAG" "${ASSETS[@]}" \
               --title "$TAG" \
               --generate-notes \
               --verify-tag
