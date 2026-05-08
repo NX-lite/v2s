@@ -1,0 +1,35 @@
+name: macOS Build
+
+on:
+  push:
+    branches: [ "main" ]
+  pull_request:
+    branches: [ "main" ]
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: macos-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Show Xcode version
+        run: |
+          xcodebuild -version
+          swift --version
+
+      - name: List schemes
+        run: |
+          xcodebuild -list -project v2s.xcodeproj
+
+      - name: Build
+        run: |
+          xcodebuild \
+            -project v2s.xcodeproj \
+            -scheme v2s \
+            -configuration Release \
+            -destination 'platform=macOS' \
+            CODE_SIGNING_ALLOWED=NO \
+            clean build
