@@ -36,17 +36,23 @@
 - Menu bar app built for always-available subtitle access.
 - Live subtitle overlay with translated text on the first line and source text on the second.
 - Audio source selection for microphones and running macOS apps.
-- On-device speech transcription powered by Apple Speech.
+- On-device speech transcription powered by Apple SpeechAnalyzer.
 - On-device translation powered by Apple Translation.
 - Transcript summarization powered by Apple Intelligence for quick overview of conversations.
 - Overlay styling controls so the subtitle bar stays readable on top of real work.
+
+## Input Languages
+
+v2s only lists input languages supported by Apple's SpeechAnalyzer/SpeechTranscriber path. Regional variants are not exposed in the UI; v2s chooses a default supported region for each language.
+
+Supported input languages: Cantonese, Chinese (Simplified), English, French, German, Italian, Japanese, Korean, Portuguese, and Spanish.
 
 ## Privacy
 
 - No account, cloud backend, analytics, or telemetry.
 - Audio and subtitle text never leave your Mac through v2s.
 - Translation uses Apple's on-device Translation framework. Some language packs may need to be downloaded first through System Settings.
-- Speech recognition uses Apple's on-device Speech framework. Some locales may fall back to Apple's servers unless on-device recognition is explicitly configured.
+- Speech recognition uses Apple's on-device SpeechAnalyzer/SpeechTranscriber resources for the listed input languages.
 
 ## Getting Started
 
@@ -65,7 +71,7 @@ v2s will ask for permissions on first use:
 
 ## Requirements
 
-- Translation requires macOS 26 or newer
+- Speech transcription and translation require macOS 26 or newer
 
 ## Building from Source
 

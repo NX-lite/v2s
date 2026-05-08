@@ -17,11 +17,22 @@ struct SettingsControlRow<Content: View>: View {
 
 struct CommonLanguageMenuPicker: View {
     let interfaceLanguageID: String
+    let options: [LanguageOption]
     @Binding var selection: String
+
+    init(
+        interfaceLanguageID: String,
+        options: [LanguageOption] = LanguageCatalog.common,
+        selection: Binding<String>
+    ) {
+        self.interfaceLanguageID = interfaceLanguageID
+        self.options = options
+        self._selection = selection
+    }
 
     var body: some View {
         Picker("", selection: $selection) {
-            ForEach(LanguageCatalog.common) { option in
+            ForEach(options) { option in
                 Text(option.localizedDisplayName(in: interfaceLanguageID)).tag(option.id)
             }
         }
@@ -135,7 +146,7 @@ extension AppModel {
             get: { self.inputLanguageID },
             set: {
                 guard self.isLanguagePairLocked == false else { return }
-                self.inputLanguageID = $0
+                self.inputLanguageID = LanguageCatalog.supportedSpeechInputLanguageID(for: $0)
             }
         )
     }

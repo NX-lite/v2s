@@ -133,6 +133,7 @@ struct SettingsView: View {
                     SettingsControlRow(label: model.localized(.inputLanguage)) {
                         CommonLanguageMenuPicker(
                             interfaceLanguageID: model.resolvedInterfaceLanguageID,
+                            options: LanguageCatalog.speechInput,
                             selection: model.inputLanguageSelectionBinding
                         )
                         .disabled(model.isLanguagePairLocked)

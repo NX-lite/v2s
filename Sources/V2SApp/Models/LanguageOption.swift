@@ -23,8 +23,21 @@ enum LanguageCatalog {
         LanguageOption(id: "ru", displayName: "Russian"),
     ]
 
+    static let speechInput: [LanguageOption] = [
+        LanguageOption(id: "en", displayName: "English"),
+        LanguageOption(id: "zh-Hans", displayName: "Chinese (Simplified)"),
+        LanguageOption(id: "yue", displayName: "Cantonese"),
+        LanguageOption(id: "es", displayName: "Spanish"),
+        LanguageOption(id: "de", displayName: "German"),
+        LanguageOption(id: "ja", displayName: "Japanese"),
+        LanguageOption(id: "fr", displayName: "French"),
+        LanguageOption(id: "it", displayName: "Italian"),
+        LanguageOption(id: "ko", displayName: "Korean"),
+        LanguageOption(id: "pt", displayName: "Portuguese"),
+    ]
+
     static func displayName(for identifier: String) -> String {
-        common.first(where: { $0.id == identifier })?.displayName ?? identifier
+        (speechInput + common).first(where: { $0.id == identifier })?.displayName ?? identifier
     }
 
     static func displayName(for identifier: String, in interfaceLanguageID: String) -> String {
@@ -37,14 +50,20 @@ enum LanguageCatalog {
         AppLocalization.resolvedInterfaceLanguageID(storedIdentifier: storedIdentifier)
     }
 
+    static func supportedSpeechInputLanguageID(for identifier: String) -> String {
+        speechInput.contains(where: { $0.id == identifier }) ? identifier : "en"
+    }
+
     static func speechLocaleIdentifier(for identifier: String) -> String {
         switch identifier {
         case "en": return "en-US"
         case "zh-Hans": return "zh-CN"
+        case "yue": return "yue-CN"
         case "es": return "es-ES"
         case "de": return "de-DE"
         case "ja": return "ja-JP"
         case "fr": return "fr-FR"
+        case "it": return "it-IT"
         case "ko": return "ko-KR"
         case "ar": return "ar-SA"
         case "pt": return "pt-BR"

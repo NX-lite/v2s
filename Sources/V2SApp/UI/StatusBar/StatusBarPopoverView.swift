@@ -107,6 +107,7 @@ struct StatusBarPopoverView: View {
             SettingsControlRow(label: model.localized(.inputShort)) {
                 CommonLanguageMenuPicker(
                     interfaceLanguageID: model.resolvedInterfaceLanguageID,
+                    options: LanguageCatalog.speechInput,
                     selection: model.inputLanguageSelectionBinding
                 )
                 .disabled(model.isLanguagePairLocked)

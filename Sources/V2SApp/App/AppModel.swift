@@ -133,7 +133,7 @@ final class AppModel: ObservableObject {
 
         let settings = settingsStore.load()
         self.selectedSourceID = settings.selectedSourceID
-        self.inputLanguageID = settings.inputLanguageID
+        self.inputLanguageID = LanguageCatalog.supportedSpeechInputLanguageID(for: settings.inputLanguageID)
         self.outputLanguageID = settings.outputLanguageID
         self.usesSystemInterfaceLanguage = settings.interfaceLanguageID == nil
         self.interfaceLanguageID = LanguageCatalog.preferredInterfaceLanguageID(
@@ -2470,8 +2470,12 @@ final class AppModel: ObservableObject {
             return "v2s へようこそ。字幕バーの準備ができました。"
         case "fr":
             return "Bienvenue dans v2s. La barre de sous-titres est prete."
+        case "it":
+            return "Benvenuto in v2s. La barra dei sottotitoli e pronta."
         case "ko":
             return "v2s에 오신 것을 환영합니다. 자막 바가 준비되었습니다."
+        case "yue":
+            return "歡迎使用 v2s，字幕列已經準備好。"
         case "ar":
             return "مرحبا بك في v2s. شريط الترجمة جاهز."
         case "pt":
