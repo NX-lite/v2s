@@ -1292,6 +1292,7 @@ final class AppModel: ObservableObject {
                 promotionID: displayedCaption?.promotionID
             )
             appendOverlayHistoryEntry(
+                captionID: displayedCaption?.id,
                 translatedText: currentCaption.translatedText,
                 sourceText: currentCaption.sourceText
             )
@@ -1315,6 +1316,7 @@ final class AppModel: ObservableObject {
             promotionID: displayedCaption?.promotionID
         )
         appendOverlayHistoryEntry(
+            captionID: displayedCaption?.id,
             translatedText: currentCaption.translatedText,
             sourceText: currentCaption.sourceText
         )
@@ -1683,7 +1685,11 @@ final class AppModel: ObservableObject {
                 // Dynamic wait: base 3s + 1s per 30 chars, capped at 15s
                 let captionCharCount = caption.sourceText.count
                 let waitTimeout = min(max(3.0, 3.0 + Double(captionCharCount / 30) * 1.0), 15.0)
-                finalTranslation = await waitForTranslatedCaption(id: caption.id, timeout: waitTimeout)
+                let waited = await waitForTranslatedCaption(id: caption.id, timeout: waitTimeout)
+                // Race fallback: the timeout may have resumed our waiter with nil at the
+                // same moment the translation finished and ran applyLateCaptionTranslation.
+                // Re-read the ready map so we don't clobber a just-applied backfill below.
+                finalTranslation = waited ?? readyCaptionTranslations[caption.id]
             }
 
             guard liveTranscriptionSession != nil else { break }
@@ -2048,6 +2054,53 @@ final class AppModel: ObservableObject {
         }
 
         resumeCaptionTranslationWaiters(for: captionID, translatedText: translatedText)
+
+        if let translatedText, translatedText.isEmpty == false {
+            applyLateCaptionTranslation(translatedText, for: captionID)
+        }
+    }
+
+    /// Backfills a translation that finished after `processCaptionQueue` already moved on.
+    /// Without this, captions whose translation arrived after the wait timeout would stay
+    /// permanently untranslated in the live overlay, scrollback history, and transcript.
+    private func applyLateCaptionTranslation(_ translatedText: String, for captionID: UUID) {
+        var didApplyTranslation = false
+
+        if displayedCaption?.id == captionID,
+           let state = overlayState,
+           shouldReplaceCommittedTranslation(state.translatedText, for: captionID),
+           state.sourceText.isEmpty == false {
+            updateCommittedOverlay(
+                translatedText: translatedText,
+                sourceText: state.sourceText,
+                lateTranslation: true
+            )
+            didApplyTranslation = true
+        }
+
+        if let index = overlayState?.history.lastIndex(where: { $0.id == captionID }),
+           shouldReplaceCommittedTranslation(overlayState?.history[index].translatedText ?? "", for: captionID) {
+            overlayState?.history[index].translatedText = translatedText
+            didApplyTranslation = true
+        }
+
+        if let index = transcriptEntries.firstIndex(where: { $0.id == captionID }),
+           shouldReplaceCommittedTranslation(transcriptEntries[index].translatedText, for: captionID) {
+            transcriptEntries[index].translatedText = translatedText
+            didApplyTranslation = true
+        }
+
+        if didApplyTranslation {
+            translationRevisions[captionID] = (text: translatedText, committedAt: Date(), count: 0)
+        }
+    }
+
+    private func shouldReplaceCommittedTranslation(_ currentText: String, for captionID: UUID) -> Bool {
+        if currentText.isEmpty {
+            return true
+        }
+
+        return translationRevisions[captionID]?.text == currentText
     }
 
     private func resumeCaptionTranslationWaiter(
@@ -2346,7 +2399,11 @@ final class AppModel: ObservableObject {
         overlayHistoryScrollOffset = min(max(overlayHistoryScrollOffset, 0), overlayHistoryMaxScrollOffset)
     }
 
-    private func appendOverlayHistoryEntry(translatedText: String, sourceText: String) {
+    private func appendOverlayHistoryEntry(
+        captionID: UUID? = nil,
+        translatedText: String,
+        sourceText: String
+    ) {
         guard shouldStoreOverlayHistory(translatedText: translatedText, sourceText: sourceText) else {
             return
         }
@@ -2363,6 +2420,7 @@ final class AppModel: ObservableObject {
 
         overlayState?.history.append(
             OverlayHistoryEntry(
+                id: captionID ?? UUID(),
                 translatedText: translatedText,
                 sourceText: sourceText
             )

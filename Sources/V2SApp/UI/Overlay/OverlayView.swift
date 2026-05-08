@@ -547,7 +547,8 @@ struct OverlayView: View {
     ) -> CGFloat {
         let translatedHeight = showsTranslated ? translatedLineHeight : 0
         let sourceHeight = showsSource ? sourceLineHeight : 0
-        return translatedHeight + sourceHeight
+        let spacingHeight = (showsTranslated && showsSource) ? Self.captionPairSpacing : 0
+        return translatedHeight + spacingHeight + sourceHeight
     }
 
     private var continuousFlowMask: some View {
