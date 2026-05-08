@@ -69,6 +69,16 @@ v2s will ask for permissions on first use:
 - **Microphone** — when using a microphone as the input source.
 - **Audio Capture** — when capturing audio from another app.
 
+> **"Apple cannot verify v2s" warning**
+>
+> If macOS shows _"Apple cannot verify that this app is free from malware"_ or blocks the app from opening, run this command in Terminal once, then open the app normally:
+>
+> ```bash
+> sudo xattr -dr com.apple.quarantine /Applications/v2s.app
+> ```
+>
+> This removes the quarantine flag that macOS adds to apps downloaded outside the Mac App Store. It is safe to run for apps you trust.
+
 ## Requirements
 
 - Speech transcription and translation require macOS 26 or newer

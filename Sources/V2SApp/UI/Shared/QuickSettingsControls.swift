@@ -60,6 +60,50 @@ struct SourceMenuPicker: View {
     }
 }
 
+struct SourceMultiSelectPicker: View {
+    let sources: [InputSource]
+    let interfaceLanguageID: String
+    let emptyTitle: String
+    @Binding var selection: Set<String>
+
+    var body: some View {
+        Menu {
+            if sources.isEmpty {
+                Text(emptyTitle)
+            } else {
+                ForEach(sources) { source in
+                    Button {
+                        toggle(source.id)
+                    } label: {
+                        Label(
+                            "\(source.category.displayName(in: interfaceLanguageID)) · \(source.name)",
+                            systemImage: selection.contains(source.id) ? "checkmark.circle.fill" : "circle"
+                        )
+                    }
+                }
+            }
+        } label: {
+            Text(menuTitle)
+                .lineLimit(1)
+        }
+        .fixedSize(horizontal: true, vertical: false)
+    }
+
+    private var menuTitle: String {
+        let selected = sources.filter { selection.contains($0.id) }
+        switch selected.count {
+        case 0: return emptyTitle
+        case 1: return selected[0].name
+        default: return AppLocalization.string(.multipleSourcesFormat, languageID: interfaceLanguageID, selected.count)
+        }
+    }
+
+    private func toggle(_ id: String) {
+        if selection.contains(id) { selection.remove(id) }
+        else { selection.insert(id) }
+    }
+}
+
 struct SubtitleModeMenuPicker: View {
     let interfaceLanguageID: String
     let showsDetail: Bool
@@ -134,6 +178,13 @@ struct LanguageResourcesFooter: View {
 }
 
 extension AppModel {
+    var selectedSourcesBinding: Binding<Set<String>> {
+        Binding(
+            get: { self.selectedSourceIDs },
+            set: { self.selectedSourceIDs = $0 }
+        )
+    }
+
     var selectedSourceOptionalBinding: Binding<String?> {
         Binding(
             get: { self.selectedSourceID },

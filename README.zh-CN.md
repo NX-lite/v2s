@@ -62,6 +62,16 @@ v2s 的输入语言列表仅包含 Apple SpeechAnalyzer/SpeechTranscriber 路径
 - **Microphone**：当输入源为麦克风时需要。
 - **Audio Capture**：当输入源为其他应用时需要。
 
+> **出现「Apple 无法验证 v2s」提示**
+>
+> 如果 macOS 提示 _"Apple 无法验证此 App 是否包含可能危害 Mac 安全或泄漏隐私的恶意软件"_ 或阻止应用打开，在终端运行以下命令一次，之后正常打开应用即可：
+>
+> ```bash
+> sudo xattr -dr com.apple.quarantine /Applications/v2s.app
+> ```
+>
+> 此命令会移除 macOS 为从 App Store 以外渠道下载的应用添加的隔离标志。对于你信任的应用，运行该命令是安全的。
+
 ## 环境要求
 
 - 语音转写和翻译功能需要 macOS 26 或更高版本

@@ -85,11 +85,11 @@ struct StatusBarPopoverView: View {
         VStack(alignment: .leading, spacing: 8) {
             sectionHeader(model.localized(.inputSource), icon: "mic.fill")
             SettingsControlRow(label: model.localized(.sourceShort)) {
-                SourceMenuPicker(
+                SourceMultiSelectPicker(
                     sources: model.allSources,
                     interfaceLanguageID: model.resolvedInterfaceLanguageID,
                     emptyTitle: model.allSources.isEmpty ? model.localized(.noSources) : model.localized(.choose),
-                    selection: model.selectedSourceOptionalBinding
+                    selection: model.selectedSourcesBinding
                 )
             }
             SecondaryRefreshButton(

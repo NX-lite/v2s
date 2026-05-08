@@ -2,6 +2,13 @@ import Foundation
 
 struct AppSettings: Codable {
     var selectedSourceID: String?
+    /// All currently selected input sources (supports multi-source sessions).
+    /// Falls back to `selectedSourceID` when loading older settings files.
+    var selectedSourceIDs: [String]
+    /// Per-source speech recognition language override. Key = source ID, value = language ID.
+    var sourceLanguageOverrides: [String: String]
+    /// Per-source subtitle output language override. Key = source ID, value = language ID.
+    var sourceOutputLanguageOverrides: [String: String]
     var inputLanguageID: String
     var outputLanguageID: String
     var interfaceLanguageID: String?
@@ -12,6 +19,9 @@ struct AppSettings: Codable {
 
     static let `default` = AppSettings(
         selectedSourceID: nil,
+        selectedSourceIDs: [],
+        sourceLanguageOverrides: [:],
+        sourceOutputLanguageOverrides: [:],
         inputLanguageID: "en",
         outputLanguageID: "zh-Hans",
         interfaceLanguageID: nil,
@@ -25,6 +35,13 @@ struct AppSettings: Codable {
     init(from decoder: Decoder) throws {
         let c = try decoder.container(keyedBy: CodingKeys.self)
         selectedSourceID = try? c.decodeIfPresent(String.self, forKey: .selectedSourceID)
+        selectedSourceIDs = (try? c.decodeIfPresent([String].self, forKey: .selectedSourceIDs))
+            ?? selectedSourceID.map { [$0] }
+            ?? AppSettings.default.selectedSourceIDs
+        sourceLanguageOverrides = (try? c.decodeIfPresent([String: String].self, forKey: .sourceLanguageOverrides))
+            ?? AppSettings.default.sourceLanguageOverrides
+        sourceOutputLanguageOverrides = (try? c.decodeIfPresent([String: String].self, forKey: .sourceOutputLanguageOverrides))
+            ?? AppSettings.default.sourceOutputLanguageOverrides
         inputLanguageID = (try? c.decodeIfPresent(String.self, forKey: .inputLanguageID))
             ?? AppSettings.default.inputLanguageID
         outputLanguageID = (try? c.decodeIfPresent(String.self, forKey: .outputLanguageID))
@@ -42,6 +59,9 @@ struct AppSettings: Codable {
 
     init(
         selectedSourceID: String?,
+        selectedSourceIDs: [String],
+        sourceLanguageOverrides: [String: String],
+        sourceOutputLanguageOverrides: [String: String],
         inputLanguageID: String,
         outputLanguageID: String,
         interfaceLanguageID: String?,
@@ -51,6 +71,9 @@ struct AppSettings: Codable {
         glossary: [String: String]
     ) {
         self.selectedSourceID = selectedSourceID
+        self.selectedSourceIDs = selectedSourceIDs
+        self.sourceLanguageOverrides = sourceLanguageOverrides
+        self.sourceOutputLanguageOverrides = sourceOutputLanguageOverrides
         self.inputLanguageID  = inputLanguageID
         self.outputLanguageID = outputLanguageID
         self.interfaceLanguageID = interfaceLanguageID

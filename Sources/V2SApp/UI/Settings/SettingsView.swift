@@ -114,15 +114,16 @@ struct SettingsView: View {
                 settingsCard {
                     sectionHeader(model.localized(.inputSource), icon: "mic.fill")
                     SettingsControlRow(label: model.localized(.selectedSource)) {
-                        SourceMenuPicker(
+                        SourceMultiSelectPicker(
                             sources: model.allSources,
                             interfaceLanguageID: model.resolvedInterfaceLanguageID,
                             emptyTitle: model.allSources.isEmpty
                                 ? model.localized(.noSourcesDetected)
                                 : model.localized(.choose),
-                            selection: model.selectedSourceOptionalBinding
+                            selection: model.selectedSourcesBinding
                         )
                     }
+                    selectedSourceLanguageRows
                     SecondaryRefreshButton(
                         title: model.localized(.refreshSources),
                         action: model.refreshSources
@@ -474,6 +475,57 @@ struct SettingsView: View {
     private var colorsUseDefaultValues: Bool {
         model.overlayStyle.subtitleColor == .defaultSubtitle
             && model.overlayStyle.backgroundColor == .defaultBackground
+    }
+
+    @ViewBuilder private var selectedSourceLanguageRows: some View {
+        let sources = model.selectedSources
+        if sources.isEmpty == false {
+            ForEach(sources) { source in
+                Divider()
+                VStack(alignment: .leading, spacing: 6) {
+                    Text(source.name)
+                        .font(.callout.weight(.medium))
+                        .foregroundStyle(.primary)
+                    HStack(spacing: 12) {
+                        Label(model.localized(.inputLanguage), systemImage: "mic")
+                            .font(.caption)
+                            .foregroundStyle(.secondary)
+                            .frame(width: 110, alignment: .leading)
+                        CommonLanguageMenuPicker(
+                            interfaceLanguageID: model.resolvedInterfaceLanguageID,
+                            options: LanguageCatalog.speechInput,
+                            selection: sourceLanguageBinding(for: source)
+                        )
+                        .disabled(model.isLanguagePairLocked)
+                    }
+                    HStack(spacing: 12) {
+                        Label(model.localized(.subtitleLanguage), systemImage: "captions.bubble")
+                            .font(.caption)
+                            .foregroundStyle(.secondary)
+                            .frame(width: 110, alignment: .leading)
+                        CommonLanguageMenuPicker(
+                            interfaceLanguageID: model.resolvedInterfaceLanguageID,
+                            selection: sourceOutputLanguageBinding(for: source)
+                        )
+                        .disabled(model.isLanguagePairLocked)
+                    }
+                }
+            }
+        }
+    }
+
+    private func sourceLanguageBinding(for source: InputSource) -> Binding<String> {
+        Binding(
+            get: { model.languageID(for: source) },
+            set: { model.setLanguageID($0, for: source) }
+        )
+    }
+
+    private func sourceOutputLanguageBinding(for source: InputSource) -> Binding<String> {
+        Binding(
+            get: { model.outputLanguageIDForSource(source) },
+            set: { model.setOutputLanguageID($0, for: source) }
+        )
     }
 
     private func overlayBinding<Value>(_ keyPath: WritableKeyPath<OverlayStyle, Value>) -> Binding<Value> {

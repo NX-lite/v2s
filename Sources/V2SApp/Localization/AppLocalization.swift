@@ -17,6 +17,7 @@ enum AppTextKey: String {
     case showSubtitlePreview
     case inputSource
     case selectedSource
+    case multipleSourcesFormat
     case noSourcesDetected
     case noSources
     case choose
@@ -231,6 +232,7 @@ enum AppLocalization {
             "showSubtitlePreview": "Show Subtitle Preview",
             "inputSource": "Input Source",
             "selectedSource": "Selected Source",
+            "multipleSourcesFormat": "%d Sources",
             "noSourcesDetected": "No sources detected",
             "noSources": "No sources",
             "choose": "Choose...",
@@ -384,6 +386,7 @@ enum AppLocalization {
             "showSubtitlePreview": "显示字幕预览",
             "inputSource": "输入源",
             "selectedSource": "已选输入源",
+            "multipleSourcesFormat": "%d 个来源",
             "noSourcesDetected": "未检测到输入源",
             "noSources": "没有可用输入源",
             "choose": "选择...",
@@ -537,6 +540,7 @@ enum AppLocalization {
             "showSubtitlePreview": "Mostrar vista previa de subtítulos",
             "inputSource": "Fuente de entrada",
             "selectedSource": "Fuente seleccionada",
+            "multipleSourcesFormat": "%d fuentes",
             "noSourcesDetected": "No se detectaron fuentes",
             "noSources": "Sin fuentes",
             "choose": "Elegir...",
@@ -690,6 +694,7 @@ enum AppLocalization {
             "showSubtitlePreview": "Untertitelvorschau anzeigen",
             "inputSource": "Eingabequelle",
             "selectedSource": "Ausgewählte Quelle",
+            "multipleSourcesFormat": "%d Quellen",
             "noSourcesDetected": "Keine Quellen erkannt",
             "noSources": "Keine Quellen",
             "choose": "Auswählen...",
@@ -843,6 +848,7 @@ enum AppLocalization {
             "showSubtitlePreview": "字幕プレビューを表示",
             "inputSource": "入力ソース",
             "selectedSource": "選択中のソース",
+            "multipleSourcesFormat": "%d 個のソース",
             "noSourcesDetected": "ソースが見つかりません",
             "noSources": "ソースなし",
             "choose": "選択...",
@@ -996,6 +1002,7 @@ enum AppLocalization {
             "showSubtitlePreview": "Afficher l'aperçu des sous-titres",
             "inputSource": "Source d'entrée",
             "selectedSource": "Source sélectionnée",
+            "multipleSourcesFormat": "%d sources",
             "noSourcesDetected": "Aucune source détectée",
             "noSources": "Aucune source",
             "choose": "Choisir...",
@@ -1149,6 +1156,7 @@ enum AppLocalization {
             "showSubtitlePreview": "자막 미리보기 표시",
             "inputSource": "입력 소스",
             "selectedSource": "선택한 소스",
+            "multipleSourcesFormat": "%d개 소스",
             "noSourcesDetected": "감지된 소스 없음",
             "noSources": "소스 없음",
             "choose": "선택...",
@@ -1302,6 +1310,7 @@ enum AppLocalization {
             "showSubtitlePreview": "إظهار معاينة الترجمة",
             "inputSource": "مصدر الإدخال",
             "selectedSource": "المصدر المحدد",
+            "multipleSourcesFormat": "%d مصادر",
             "noSourcesDetected": "لم يتم اكتشاف أي مصادر",
             "noSources": "لا توجد مصادر",
             "choose": "اختر...",
@@ -1455,6 +1464,7 @@ enum AppLocalization {
             "showSubtitlePreview": "Mostrar prévia das legendas",
             "inputSource": "Fonte de entrada",
             "selectedSource": "Fonte selecionada",
+            "multipleSourcesFormat": "%d fontes",
             "noSourcesDetected": "Nenhuma fonte detectada",
             "noSources": "Sem fontes",
             "choose": "Escolher...",
@@ -1608,6 +1618,7 @@ enum AppLocalization {
             "showSubtitlePreview": "Показать предпросмотр субтитров",
             "inputSource": "Источник ввода",
             "selectedSource": "Выбранный источник",
+            "multipleSourcesFormat": "%d источника",
             "noSourcesDetected": "Источники не обнаружены",
             "noSources": "Нет источников",
             "choose": "Выбрать...",
