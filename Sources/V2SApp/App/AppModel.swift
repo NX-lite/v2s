@@ -917,7 +917,33 @@ final class AppModel: ObservableObject {
             instructions += "\nFor Ask, answer the user's likely question from the visible screen and transcript. If intent is ambiguous, state the best interpretation first."
         }
 
+        instructions += """
+
+        Interpretation guidance: Fields such as "Conversation participants", "Original conversation name", and "Screen text (OCR)" are metadata describing where each piece of context came from — they tell you who is speaking and what is on screen. Do NOT treat them as topics the user wants explained. Never produce general explanations of how multiple audio sources are captured, how OCR works, or how the v2s tool labels speakers, unless the user has explicitly asked about those internals. Focus on the actual conversation content and the user's likely question.
+        """
+
         return instructions
+    }
+
+    private func makeParticipantsBlock() -> String {
+        let sources = selectedSources
+        guard sources.isEmpty == false else {
+            return "Conversation participants: (none currently configured — rely on the transcript and screenshot for context.)"
+        }
+        let lines = sources.map { source -> String in
+            let roleHint: String
+            switch source.category {
+            case .microphone:
+                roleHint = "user / respondent — audio captured from this microphone is the v2s operator speaking"
+            case .application:
+                roleHint = "other party / interlocutor — audio captured from this running application (meeting partner, interviewer, video being watched, etc.)"
+            }
+            return "- \"\(source.name)\" → \(roleHint)"
+        }
+        return """
+        Conversation participants (audio sources currently active; these labels describe WHO is being captured, not topics to explain):
+        \(lines.joined(separator: "\n"))
+        """
     }
 
     private func makeGPTPrompt(
@@ -945,6 +971,8 @@ final class AppModel: ObservableObject {
         Input language setting: \(languageName(for: inputLanguageID)) (\(inputLanguageID))
         Subtitle language setting: \(languageName(for: outputLanguageID)) (\(outputLanguageID))
 
+        \(makeParticipantsBlock())
+
         Previous conversation content:
         \(transcriptLines.isEmpty ? "(No transcript yet.)" : transcriptLines)
 
@@ -955,7 +983,7 @@ final class AppModel: ObservableObject {
             prompt += """
 
 
-        Screen text (OCR):
+        Screen text (OCR — text the v2s tool extracted from the screenshot above so you can read it directly. This is reference content from the user's screen, NOT a topic to explain.):
         \(ocrText)
         """
         }
