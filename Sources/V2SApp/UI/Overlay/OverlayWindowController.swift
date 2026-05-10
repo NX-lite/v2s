@@ -38,6 +38,13 @@ final class OverlayWindowController {
     private var attachToSourceRefreshTask: Task<Void, Never>?
     private var lastAttachToSourceUsesHighLevel: Bool?
 
+    // Scroll-wheel monitors that forward events to the GPT reply NSScrollView when
+    // the cursor is over the main panel. Needed because the panel is non-interactive
+    // (so button panels above it can receive clicks); without these monitors, scroll
+    // wheel events can't reach the NSScrollView hosting the GPT reply text.
+    private var localScrollMonitor: Any?
+    private var globalScrollMonitor: Any?
+
     // MARK: - Genie Animation State
     var trayIconRectProvider: (() -> NSRect?)?
     private var geniePhase: GeniePhase = .idle
@@ -154,6 +161,8 @@ final class OverlayWindowController {
         mouseTrackingTimer?.invalidate()
         sourceWindowTrackingTimer?.invalidate()
         attachToSourceRefreshTask?.cancel()
+        if let m = localScrollMonitor { NSEvent.removeMonitor(m) }
+        if let m = globalScrollMonitor { NSEvent.removeMonitor(m) }
     }
 
     private func configurePanels() {
@@ -210,6 +219,7 @@ final class OverlayWindowController {
                 self.captureHideSnapshotIfNeeded(
                     newVisible: newVisible, newState: self.model.overlayState)
                 self.scheduleWindowSync()
+                DispatchQueue.main.async { [weak self] in self?.syncScrollWheelMonitors() }
             }
             .store(in: &cancellables)
 
@@ -231,7 +241,12 @@ final class OverlayWindowController {
             .store(in: &cancellables)
 
         model.$overlayViewMode
-            .sink { [weak self] _ in self?.syncPanelInputMode() }
+            // @Published fires on willSet, so model.overlayViewMode still reads the OLD
+            // value inside this sink. Defer to the next run loop so the property has
+            // updated before syncPanelInputMode/syncScrollWheelMonitors read it.
+            .sink { [weak self] _ in
+                DispatchQueue.main.async { [weak self] in self?.syncPanelInputMode() }
+            }
             .store(in: &cancellables)
 
         NotificationCenter.default.publisher(for: NSApplication.didChangeScreenParametersNotification)
@@ -313,17 +328,63 @@ final class OverlayWindowController {
     }
 
     private func syncPanelInputMode() {
-        let acceptsMainPanelInput = model.overlayViewMode == .gptReplies
-        panel.ignoresMouseEvents = !acceptsMainPanelInput
-        panel.acceptsMouseMovedEvents = acceptsMainPanelInput
+        // Main panel is always non-interactive so the button panels (move/close/resize/
+        // scrollbar) above it reliably receive clicks. Scroll wheel events for the GPT
+        // reply view are routed through `syncScrollWheelMonitors` instead.
+        panel.ignoresMouseEvents = true
+        panel.acceptsMouseMovedEvents = false
 
-        if acceptsMainPanelInput {
+        if model.overlayViewMode == .gptReplies {
             interactionState.updatePassThroughBubble(nil)
         }
+
+        syncScrollWheelMonitors()
 
         if panelsShown {
             updatePassThroughBubble()
         }
+    }
+
+    private func syncScrollWheelMonitors() {
+        let shouldMonitor = model.overlayViewMode == .gptReplies && model.isOverlayVisible
+
+        if shouldMonitor, localScrollMonitor == nil {
+            localScrollMonitor = NSEvent.addLocalMonitorForEvents(matching: .scrollWheel) { [weak self] event in
+                guard let self else { return event }
+                return self.handleGPTScrollWheelEvent(event) ? nil : event
+            }
+            globalScrollMonitor = NSEvent.addGlobalMonitorForEvents(matching: .scrollWheel) { [weak self] event in
+                _ = self?.handleGPTScrollWheelEvent(event)
+            }
+        } else if !shouldMonitor, localScrollMonitor != nil {
+            if let m = localScrollMonitor { NSEvent.removeMonitor(m) }
+            if let m = globalScrollMonitor { NSEvent.removeMonitor(m) }
+            localScrollMonitor = nil
+            globalScrollMonitor = nil
+        }
+    }
+
+    /// Forwards scroll wheel events to the GPT reply NSScrollView when the cursor is
+    /// over the main panel. Returns true when the event was consumed.
+    @discardableResult
+    private func handleGPTScrollWheelEvent(_ event: NSEvent) -> Bool {
+        guard model.overlayViewMode == .gptReplies,
+              model.isOverlayVisible,
+              panel.frame.contains(NSEvent.mouseLocation),
+              let scrollView = Self.findScrollView(in: panel.contentView) else {
+            return false
+        }
+        scrollView.scrollWheel(with: event)
+        return true
+    }
+
+    private static func findScrollView(in view: NSView?) -> NSScrollView? {
+        guard let view else { return nil }
+        if let s = view as? NSScrollView { return s }
+        for sub in view.subviews {
+            if let found = findScrollView(in: sub) { return found }
+        }
+        return nil
     }
 
     // MARK: - Genie Effect Animation

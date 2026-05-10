@@ -202,26 +202,15 @@ struct OverlayView: View {
     private var gptCurrentEntryView: some View {
         let clampedOffset = min(max(model.gptReplyScrollOffset, 0), max(0, model.gptReplyHistory.count - 1))
         let entry = model.gptReplyHistory[model.gptReplyHistory.count - 1 - clampedOffset]
-        return ScrollView(.vertical, showsIndicators: false) {
-            VStack(alignment: .center, spacing: Self.captionPairSpacing) {
-                Text(entry.title)
-                    .font(.system(size: displayedSourceFontSize, weight: .regular))
-                    .multilineTextAlignment(.center)
-                    .lineLimit(nil)
-                    .fixedSize(horizontal: false, vertical: true)
-                    .frame(maxWidth: .infinity)
-                    .foregroundStyle(subtitleColor(opacity: 0.72))
-                Text(entry.message)
-                    .font(.system(size: model.overlayStyle.scaledTranslatedFontSize, weight: .semibold))
-                    .multilineTextAlignment(.center)
-                    .lineLimit(nil)
-                    .fixedSize(horizontal: false, vertical: true)
-                    .frame(maxWidth: .infinity)
-                    .foregroundStyle(baseSubtitleColor)
-            }
-            .padding(.vertical, 8)
-            .frame(maxWidth: .infinity)
-        }
+        return GPTReplyScrollableTextView(
+            title: entry.title,
+            message: entry.message,
+            titleFontSize: displayedSourceFontSize,
+            messageFontSize: model.overlayStyle.scaledTranslatedFontSize,
+            titleColor: NSColor(subtitleColor(opacity: 0.72)),
+            messageColor: NSColor(baseSubtitleColor),
+            entryID: entry.id
+        )
         .frame(maxWidth: .infinity, maxHeight: .infinity)
         .onAppear { model.updateGPTReplyVisibleCount(1) }
         .onChange(of: model.gptReplyHistory.count) { _, _ in model.updateGPTReplyVisibleCount(1) }
@@ -1484,3 +1473,96 @@ private extension OverlayView {
     static let passThroughTransitionDuration: Double = 0.18
     static let passThroughTransitionAnimation = Animation.easeOut(duration: passThroughTransitionDuration)
 }
+
+// MARK: - GPT reply scrollable text view
+//
+// SwiftUI's ScrollView only delivers scroll wheel events to its underlying NSScrollView
+// when the host window is the key window. Our overlay panel is intentionally non-key
+// (canBecomeKey returns false) so it never steals focus from the conversation app
+// underneath. NSScrollView running inside an NSViewRepresentable receives scrollWheel
+// events directly via the responder chain regardless of key-window status, so this
+// wrapper unblocks scrolling for long GPT replies.
+
+struct GPTReplyScrollableTextView: NSViewRepresentable {
+    let title: String
+    let message: String
+    let titleFontSize: CGFloat
+    let messageFontSize: CGFloat
+    let titleColor: NSColor
+    let messageColor: NSColor
+    let entryID: UUID
+
+    func makeNSView(context: Context) -> NSScrollView {
+        let textView = NSTextView()
+        textView.isEditable = false
+        textView.isSelectable = true
+        textView.drawsBackground = false
+        textView.backgroundColor = .clear
+        textView.textContainerInset = NSSize(width: 0, height: 8)
+        textView.textContainer?.lineFragmentPadding = 0
+        textView.textContainer?.widthTracksTextView = true
+        textView.isHorizontallyResizable = false
+        textView.isVerticallyResizable = true
+        textView.autoresizingMask = [.width]
+        textView.alignment = .center
+
+        let scrollView = NSScrollView()
+        scrollView.hasVerticalScroller = false
+        scrollView.hasHorizontalScroller = false
+        scrollView.drawsBackground = false
+        scrollView.backgroundColor = .clear
+        scrollView.borderType = .noBorder
+        scrollView.scrollerStyle = .overlay
+        scrollView.documentView = textView
+        scrollView.contentView.postsBoundsChangedNotifications = false
+
+        applyAttributedString(to: textView)
+        context.coordinator.textView = textView
+        context.coordinator.lastEntryID = entryID
+        return scrollView
+    }
+
+    func updateNSView(_ scrollView: NSScrollView, context: Context) {
+        guard let textView = context.coordinator.textView else { return }
+        applyAttributedString(to: textView)
+        if context.coordinator.lastEntryID != entryID {
+            context.coordinator.lastEntryID = entryID
+            scrollView.contentView.scroll(to: .zero)
+            scrollView.reflectScrolledClipView(scrollView.contentView)
+        }
+    }
+
+    func makeCoordinator() -> Coordinator { Coordinator() }
+
+    final class Coordinator {
+        weak var textView: NSTextView?
+        var lastEntryID: UUID?
+    }
+
+    private func applyAttributedString(to textView: NSTextView) {
+        let paragraph = NSMutableParagraphStyle()
+        paragraph.alignment = .center
+        paragraph.lineSpacing = 2
+
+        let combined = NSMutableAttributedString()
+        combined.append(NSAttributedString(
+            string: title,
+            attributes: [
+                .font: NSFont.systemFont(ofSize: titleFontSize, weight: .regular),
+                .foregroundColor: titleColor,
+                .paragraphStyle: paragraph
+            ]
+        ))
+        if title.isEmpty == false { combined.append(NSAttributedString(string: "\n\n")) }
+        combined.append(NSAttributedString(
+            string: message,
+            attributes: [
+                .font: NSFont.systemFont(ofSize: messageFontSize, weight: .semibold),
+                .foregroundColor: messageColor,
+                .paragraphStyle: paragraph
+            ]
+        ))
+        textView.textStorage?.setAttributedString(combined)
+    }
+}
+
