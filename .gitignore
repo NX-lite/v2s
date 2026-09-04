@@ -24,6 +24,7 @@ tmp/
 dist/
 reports/
 .claude/worktrees/
+.worktrees/
 
 
 # Optional local notes under docs/ (GitHub Pages site lives in docs/)
