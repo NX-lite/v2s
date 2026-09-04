@@ -1,9 +1,13 @@
 # Mainline Rebuild Design
 
-**Date:** 2026-09-04  
-**Status:** Approved in conversation  
-**Integration branch:** `codex/upstream-rebuild`  
-**Fork baseline:** `origin/main` at `75b4f938bc15cf9e96e03ee20e11487bf06c0cae`  
+**Date:** 2026-09-04
+
+**Status:** Approved in conversation
+
+**Integration branch:** `codex/upstream-rebuild`
+
+**Fork baseline:** `origin/main` at `75b4f938bc15cf9e96e03ee20e11487bf06c0cae`
+
 **Upstream baseline:** `upstream/main` at `3aaaaa199bccddddb354bd9d2ee1a17e6b1f714c` (`v0.3.38`)
 
 ## Objective
@@ -70,15 +74,17 @@ from the older fork.
 ### Settings and migration
 
 Add an `AssistantSettings` value containing the GPT endpoint, model, skills prompt,
-automatic language-context choice, and the three hotkey bindings. `AppSettings`
-stores this value plus the window privacy flag.
+automatic language-context choice, and the three hotkey bindings. The upstream
+`OverlayStyle.invisibleInRecording` value remains the single privacy setting for all
+app windows.
 
 `AppSettings.init(from:)` supports both formats:
 
 - the new nested `assistant` object; and
 - the fork's legacy flat keys (`gptAPIKey`, `gptAPIBaseURL`, `gptModel`, `gptSkills`,
   `autoDetectConversationLanguages`, `hotKeyFollowUp`, `hotKeyAsk`, and
-  `hotKeySwitchMode`).
+  `hotKeySwitchMode`). The legacy `privacyModeEnabled` key migrates into
+  `OverlayStyle.invisibleInRecording`.
 
 Valid fields are migrated independently. A missing or malformed field falls back
 only to that field's default. The next normal settings save writes the new format.
@@ -203,7 +209,7 @@ test under `Tests/Docs/i18n.test.cjs`.
 - `ScreenContextProviderTests`: complete, image-only after OCR failure,
   permission-denied, and capture/OCR failure outcomes using injected fakes.
 - `WindowPrivacyPolicyTests`: settings window and every overlay panel receive the same
-  privacy policy.
+  policy derived from `OverlayStyle.invisibleInRecording`.
 - Existing `AppSettingsTests`, `LiveTranscriptionSessionTests`, and overlay tests gain
   integration cases where the rebuilt feature crosses their boundaries.
 
