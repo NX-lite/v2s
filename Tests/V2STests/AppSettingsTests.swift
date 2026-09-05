@@ -140,6 +140,18 @@ import Testing
         #expect(settings.assistant.skills == "kept-skill")
     }
 
+    @Test func invalidNestedAssistantDoesNotFallBackToLegacySettings() throws {
+        for invalidAssistant in ["42", "null"] {
+            let json = """
+            {"assistant":\(invalidAssistant),"gptAPIKey":"legacy-placeholder"}
+            """
+
+            let settings = try JSONDecoder().decode(AppSettings.self, from: Data(json.utf8))
+
+            #expect(settings.assistant == .default)
+        }
+    }
+
     @Test func newEncodingContainsNestedAssistantAndNoLegacySecretsKey() throws {
         let data = try JSONEncoder().encode(AppSettings.default)
         let object = try #require(JSONSerialization.jsonObject(with: data) as? [String: Any])

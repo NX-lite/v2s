@@ -67,8 +67,8 @@ struct AppSettings: Codable {
             ?? AppSettings.default.glossary
 
         let legacy = try decoder.container(keyedBy: LegacyCodingKeys.self)
-        if let nestedAssistant = try? c.decodeIfPresent(AssistantSettings.self, forKey: .assistant) {
-            assistant = nestedAssistant
+        if c.contains(.assistant) {
+            assistant = (try? c.decode(AssistantSettings.self, forKey: .assistant)) ?? .default
         } else {
             assistant = AssistantSettings(
                 apiKey: (try? legacy.decodeIfPresent(String.self, forKey: .gptAPIKey))
