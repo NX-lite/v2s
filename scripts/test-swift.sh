@@ -36,8 +36,7 @@ clt_cache_dir="$repo_root/.build/clt-cache-v2"
 clt_config_dir="$repo_root/.build/clt-config-v2"
 clt_security_dir="$repo_root/.build/clt-security-v2"
 clt_scratch_dir="$repo_root/.build/clt-scratch-v2"
-clt_home_dir="$repo_root/.build/clt-home-v2"
-mkdir -p "$CLANG_MODULE_CACHE_PATH" "$clt_cache_dir" "$clt_config_dir" "$clt_security_dir" "$clt_scratch_dir" "$clt_home_dir/Library/Caches"
+mkdir -p "$CLANG_MODULE_CACHE_PATH" "$clt_cache_dir" "$clt_config_dir" "$clt_security_dir" "$clt_scratch_dir"
 
 clt_swiftpm_local_cache_args=(
     --scratch-path "$clt_scratch_dir"
@@ -50,8 +49,8 @@ clt_swiftpm_local_cache_args=(
 for required_path in \
     "$manifest_sdk" \
     "$target_sdk" \
-    "$frameworks_dir/Testing.framework" \
-    "$developer_lib_dir" \
+    "$frameworks_dir/Testing.framework/Testing" \
+    "$developer_lib_dir/lib_TestingInterop.dylib" \
     "/usr/lib/swift"; do
     if [[ ! -e "$required_path" ]]; then
         echo "error: Command Line Tools Swift Testing compatibility requires: $required_path" >&2
@@ -61,7 +60,7 @@ for required_path in \
 done
 
 echo "Using Command Line Tools Swift Testing compatibility path." >&2
-HOME="$clt_home_dir" SDKROOT="$manifest_sdk" exec swift test \
+SDKROOT="$manifest_sdk" exec swift test \
     "${clt_swiftpm_local_cache_args[@]}" \
     --disable-sandbox \
     --sdk "$target_sdk" \
