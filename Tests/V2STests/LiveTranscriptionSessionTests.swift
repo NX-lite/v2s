@@ -1,59 +1,56 @@
-import XCTest
+import Foundation
+import Testing
 @testable import v2s
 
-final class LiveTranscriptionSessionTests: XCTestCase {
-    func testLegacyRecognitionErrorDispositionIgnoresCancellationErrors() {
-        XCTAssertEqual(disposition(code: 216), .ignore)
-        XCTAssertEqual(disposition(code: 301), .ignore)
+@Suite struct LiveTranscriptionSessionTests {
+    @Test func legacyRecognitionErrorDispositionIgnoresCancellationErrors() {
+        #expect(disposition(code: 216) == .ignore)
+        #expect(disposition(code: 301) == .ignore)
     }
 
-    func testLegacyRecognitionErrorDispositionRestartsAfterSilence() {
-        XCTAssertEqual(disposition(code: 1110), .restartImmediately)
+    @Test func legacyRecognitionErrorDispositionRestartsAfterSilence() {
+        #expect(disposition(code: 1110) == .restartImmediately)
     }
 
-    func testLegacyRecognitionErrorDispositionStopsAfterServerQuotaError() {
-        XCTAssertEqual(
+    @Test func legacyRecognitionErrorDispositionStopsAfterServerQuotaError() {
+        #expect(
             disposition(
                 code: 203,
                 message: "Quota limit reached for resource: speech_api, actor_type: user"
-            ),
-            .stopAndSurface
+            ) == .stopAndSurface
         )
     }
 
     // Code 203 also covers transient faults that a restart clears, so the code alone
     // must not end the session.
-    func testLegacyRecognitionErrorDispositionRetriesNonQuotaCode203() {
-        XCTAssertEqual(disposition(code: 203, message: "Retry"), .retryWithBackoff)
-        XCTAssertEqual(disposition(code: 203, message: "Corrupt"), .retryWithBackoff)
+    @Test func legacyRecognitionErrorDispositionRetriesNonQuotaCode203() {
+        #expect(disposition(code: 203, message: "Retry") == .retryWithBackoff)
+        #expect(disposition(code: 203, message: "Corrupt") == .retryWithBackoff)
     }
 
-    func testLegacyRecognitionErrorDispositionStopsOnQuotaRegardlessOfCode() {
-        XCTAssertEqual(
-            disposition(code: 1700, message: "Quota limit reached for resource: speech_api"),
-            .stopAndSurface
+    @Test func legacyRecognitionErrorDispositionStopsOnQuotaRegardlessOfCode() {
+        #expect(
+            disposition(code: 1700, message: "Quota limit reached for resource: speech_api") == .stopAndSurface
         )
     }
 
-    func testLegacyRecognitionErrorDispositionBacksOffOtherErrors() {
-        XCTAssertEqual(disposition(code: 999), .retryWithBackoff)
-        XCTAssertEqual(
+    @Test func legacyRecognitionErrorDispositionBacksOffOtherErrors() {
+        #expect(disposition(code: 999) == .retryWithBackoff)
+        #expect(
             LiveTranscriptionSession.legacyRecognitionErrorDisposition(
                 domain: NSURLErrorDomain,
                 code: NSURLErrorNotConnectedToInternet
-            ),
-            .retryWithBackoff
+            ) == .retryWithBackoff
         )
     }
 
     // A cancellation code from another domain is a real failure, not our own teardown.
-    func testLegacyRecognitionErrorDispositionDoesNotIgnoreForeignDomains() {
-        XCTAssertEqual(
+    @Test func legacyRecognitionErrorDispositionDoesNotIgnoreForeignDomains() {
+        #expect(
             LiveTranscriptionSession.legacyRecognitionErrorDisposition(
                 domain: NSURLErrorDomain,
                 code: 216
-            ),
-            .retryWithBackoff
+            ) == .retryWithBackoff
         )
     }
 

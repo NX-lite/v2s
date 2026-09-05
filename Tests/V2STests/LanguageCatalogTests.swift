@@ -1,30 +1,31 @@
-import XCTest
+import Foundation
+import Testing
 @testable import v2s
 
-final class LanguageCatalogTests: XCTestCase {
+@Suite struct LanguageCatalogTests {
     // A language keeps a single locale, and the winner used to be whichever identifier
     // sorted first — which can be a variant with no on-device model.
-    func testOptionsKeepPreferredLocaleForALanguage() {
+    @Test func optionsKeepPreferredLocaleForALanguage() {
         let locales = [Locale(identifier: "fr-BE"), Locale(identifier: "fr-FR")]
 
         let unprioritized = LanguageCatalog.options(for: locales)
-        XCTAssertEqual(unprioritized.first(where: { $0.id == "fr" })?.localeIdentifier, "fr-BE")
+        #expect(unprioritized.first(where: { $0.id == "fr" })?.localeIdentifier == "fr-BE")
 
         let prioritized = LanguageCatalog.options(for: locales, preferring: ["fr-FR"])
-        XCTAssertEqual(prioritized.first(where: { $0.id == "fr" })?.localeIdentifier, "fr-FR")
+        #expect(prioritized.first(where: { $0.id == "fr" })?.localeIdentifier == "fr-FR")
     }
 
-    func testOptionsIgnorePreferenceForOtherLanguages() {
+    @Test func optionsIgnorePreferenceForOtherLanguages() {
         let options = LanguageCatalog.options(
             for: [Locale(identifier: "fr-BE"), Locale(identifier: "fr-FR"), Locale(identifier: "it-CH")],
             preferring: ["fr-FR"]
         )
 
-        XCTAssertEqual(options.first(where: { $0.id == "it" })?.localeIdentifier, "it-CH")
-        XCTAssertEqual(options.filter { $0.id == "fr" }.count, 1)
+        #expect(options.first(where: { $0.id == "it" })?.localeIdentifier == "it-CH")
+        #expect(options.filter { $0.id == "fr" }.count == 1)
     }
 
-    func testSpeechInputLanguagesUseSpeechAnalyzerSupportedDefaults() {
+    @Test func speechInputLanguagesUseSpeechAnalyzerSupportedDefaults() {
         let expectedLocaleIdentifiers: [String: String] = [
             "en": "en-US",
             "zh-Hans": "zh-CN",
@@ -62,39 +63,30 @@ final class LanguageCatalogTests: XCTestCase {
             "vi": "vi-VN",
         ]
 
-        XCTAssertEqual(
-            Set(LanguageCatalog.speechInput.map(\.id)),
-            Set(expectedLocaleIdentifiers.keys)
-        )
+        #expect(Set(LanguageCatalog.speechInput.map(\.id)) == Set(expectedLocaleIdentifiers.keys))
 
         for option in LanguageCatalog.speechInput {
-            XCTAssertEqual(
-                LanguageCatalog.speechLocaleIdentifier(for: option.id),
-                expectedLocaleIdentifiers[option.id]
-            )
+            #expect(LanguageCatalog.speechLocaleIdentifier(for: option.id) == expectedLocaleIdentifiers[option.id])
         }
     }
 
-    func testTranslationCatalogIncludesAdditionalDestinationLanguages() {
+    @Test func translationCatalogIncludesAdditionalDestinationLanguages() {
         let expectedLanguageIDs = [
             "en", "zh-Hans", "zh-Hant", "es", "de", "ja", "fr", "ko", "ar", "pt", "ru",
             "it", "nl", "id", "th", "tr", "pl", "uk", "vi", "hi", "da", "nb", "sv",
         ]
 
-        XCTAssertEqual(
-            Set(LanguageCatalog.common.map(\.id)),
-            Set(expectedLanguageIDs)
-        )
+        #expect(Set(LanguageCatalog.common.map(\.id)) == Set(expectedLanguageIDs))
     }
 
-    func testTranslationLocaleIdentifiersUseStableRegionalDefaults() {
-        XCTAssertEqual(LanguageCatalog.translationLocaleIdentifier(for: "zh-Hans"), "zh-CN")
-        XCTAssertEqual(LanguageCatalog.translationLocaleIdentifier(for: "zh-Hant"), "zh-TW")
-        XCTAssertEqual(LanguageCatalog.translationLocaleIdentifier(for: "nb"), "nb-NO")
-        XCTAssertEqual(LanguageCatalog.translationLocaleIdentifier(for: "en"), "en-US")
+    @Test func translationLocaleIdentifiersUseStableRegionalDefaults() {
+        #expect(LanguageCatalog.translationLocaleIdentifier(for: "zh-Hans") == "zh-CN")
+        #expect(LanguageCatalog.translationLocaleIdentifier(for: "zh-Hant") == "zh-TW")
+        #expect(LanguageCatalog.translationLocaleIdentifier(for: "nb") == "nb-NO")
+        #expect(LanguageCatalog.translationLocaleIdentifier(for: "en") == "en-US")
     }
 
-    func testRuntimeLocaleOptionsCollapseRegionsAndPreserveChineseScripts() {
+    @Test func runtimeLocaleOptionsCollapseRegionsAndPreserveChineseScripts() {
         let options = LanguageCatalog.options(for: [
             Locale(identifier: "en-US"),
             Locale(identifier: "en-GB"),
@@ -105,38 +97,38 @@ final class LanguageCatalogTests: XCTestCase {
             Locale(identifier: "fa-IR"),
         ])
 
-        XCTAssertEqual(options.filter { $0.id == "en" }.count, 1)
-        XCTAssertNotNil(options.first(where: { $0.id == "en" })?.localeIdentifier)
-        XCTAssertTrue(options.contains(where: { $0.id == "zh-Hans" }))
-        XCTAssertTrue(options.contains(where: { $0.id == "zh-Hant" }))
-        XCTAssertTrue(options.contains(where: { $0.id == "sr-Latn" }))
-        XCTAssertTrue(options.contains(where: { $0.id == "fa" }))
+        #expect(options.filter { $0.id == "en" }.count == 1)
+        #expect(options.first(where: { $0.id == "en" })?.localeIdentifier != nil)
+        #expect(options.contains(where: { $0.id == "zh-Hans" }))
+        #expect(options.contains(where: { $0.id == "zh-Hant" }))
+        #expect(options.contains(where: { $0.id == "sr-Latn" }))
+        #expect(options.contains(where: { $0.id == "fa" }))
     }
 
-    func testRuntimeTranslationOptionsRetainFrameworkLocaleIdentifier() throws {
+    @Test func runtimeTranslationOptionsRetainFrameworkLocaleIdentifier() throws {
         let options = LanguageCatalog.options(for: [
             Locale.Language(identifier: "pt-BR"),
             Locale.Language(identifier: "zh-TW"),
         ])
 
-        let portugueseIdentifier = try XCTUnwrap(
+        let portugueseIdentifier = try #require(
             options.first(where: { $0.id == "pt" })?.localeIdentifier
         )
-        let traditionalChineseIdentifier = try XCTUnwrap(
+        let traditionalChineseIdentifier = try #require(
             options.first(where: { $0.id == "zh-Hant" })?.localeIdentifier
         )
-        XCTAssertTrue(
+        #expect(
             Locale.Language(identifier: portugueseIdentifier)
                 .isEquivalent(to: Locale.Language(identifier: "pt-BR"))
         )
-        XCTAssertTrue(
+        #expect(
             Locale.Language(identifier: traditionalChineseIdentifier)
                 .isEquivalent(to: Locale.Language(identifier: "zh-TW"))
         )
     }
 
-    func testUnsupportedStoredSpeechInputFallsBackToEnglish() {
-        XCTAssertEqual(LanguageCatalog.supportedSpeechInputLanguageID(for: "xx"), "en")
-        XCTAssertEqual(LanguageCatalog.supportedSpeechInputLanguageID(for: "it"), "it")
+    @Test func unsupportedStoredSpeechInputFallsBackToEnglish() {
+        #expect(LanguageCatalog.supportedSpeechInputLanguageID(for: "xx") == "en")
+        #expect(LanguageCatalog.supportedSpeechInputLanguageID(for: "it") == "it")
     }
 }

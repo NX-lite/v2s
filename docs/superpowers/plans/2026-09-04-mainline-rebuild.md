@@ -6,7 +6,7 @@
 
 **Architecture:** Keep upstream speech, translation, VAD, transcript, overlay, multi-source, and single-instance code authoritative. Add a separate assistant domain whose coordinator consumes immutable transcript snapshots, uses injected screen-context and HTTP providers, and publishes reply-only UI state. Persist it through a nested settings value with legacy flat-key migration.
 
-**Tech Stack:** Swift 5.10 package manifest, Swift 6/Xcode 26 compiler, AppKit, SwiftUI, Combine, Vision, ScreenCaptureKit, Carbon hotkeys, XCTest, Node test runner, GitHub Actions macOS 26.
+**Tech Stack:** Swift 5.10 package manifest, Swift 6/Xcode 26 compiler, AppKit, SwiftUI, Combine, Vision, ScreenCaptureKit, Carbon hotkeys, Swift Testing, Node test runner, GitHub Actions macOS 26.
 
 ---
 
@@ -16,22 +16,24 @@ The repository is on `codex/upstream-rebuild`, based on upstream commit
 `3aaaaa199bccddddb354bd9d2ee1a17e6b1f714c`. The design is in
 `docs/superpowers/specs/2026-09-04-mainline-rebuild-design.md`.
 
-The current local machine has Command Line Tools only. On 2026-09-04 the baseline
-`swift test` failed before loading the package because the installed Swift 6.3.1
-compiler does not match the 6.3.0 macOS SDK, and `xcodebuild` reported that no full
-Xcode is selected. The Node documentation suite passed 17/17. Do not begin the TDD
-tasks until one of these two verification paths is approved and available:
+The current local machine has Command Line Tools only. `xcodebuild` reports that no
+full Xcode is selected, so do not claim an Xcode build was run locally. Use Swift
+Testing for Swift package tests; any XCTest assertions in the examples below are
+behavior pseudocode and must be translated to `#expect`/`#require` before adding the
+test. The verified local Command Line Tools compatibility path is:
 
-1. install/select a compatible Xcode 26 toolchain locally; or
-2. push the integration branch with user approval and use the `macos-26` CI runner
+1. use `scripts/test-swift.sh`, which keeps SwiftPM caches below `.build`, runs
+   normal `swift test` when full Xcode is selected, and otherwise uses the verified
+   manifest SDK `MacOSX15.4.sdk`, target SDK `MacOSX26.4.sdk`, Swift Testing import
+   and framework paths, link rpaths, and `--disable-sandbox`; or
+2. install/select a compatible Xcode 26 toolchain locally; or
+3. push the integration branch with user approval and use the `macos-26` CI runner
    for every required red/green verification.
 
-Use workspace-local caches when running SwiftPM:
+Use the repository test entry point for local SwiftPM work:
 
 ```bash
-export CLANG_MODULE_CACHE_PATH="$PWD/.build/clang-module-cache"
-export SWIFTPM_MODULECACHE_OVERRIDE="$CLANG_MODULE_CACHE_PATH"
-swift test
+scripts/test-swift.sh
 ```
 
 ## File Responsibility Map
@@ -103,24 +105,23 @@ xcodebuild -version
 swift --version
 ```
 
-Expected: `xcode-select` points inside an Xcode 26 application, `xcodebuild` exits 0,
-and the Swift compiler can load the selected macOS SDK. If this fails, stop and use
-the separately approved CI verification path.
+Expected with full Xcode: `xcode-select` points inside an Xcode 26 application and
+`xcodebuild` exits 0. With CLT-only machines, use `scripts/test-swift.sh`; its
+verified compatibility path replaces this precondition for package tests.
 
 - [ ] **Step 3: Run the upstream baseline**
 
 Run:
 
 ```bash
-export CLANG_MODULE_CACHE_PATH="$PWD/.build/clang-module-cache"
-export SWIFTPM_MODULECACHE_OVERRIDE="$CLANG_MODULE_CACHE_PATH"
-swift test
+scripts/test-swift.sh
 node --test Tests/Docs/i18n.test.cjs
 xcodebuild -project v2s.xcodeproj -scheme v2s -configuration Debug CODE_SIGNING_ALLOWED=NO build
 ```
 
-Expected: Swift tests pass, Node reports 17 passed and 0 failed, and Xcode exits 0.
-Record any genuine upstream failure before changing production code.
+Expected: Swift tests pass and Node reports 17 passed and 0 failed. Run the Xcode
+build only when full Xcode is available; CLT-only machines instead verify the
+production target with the compatibility `swift build` invocation.
 
 ## Task 1: Assistant Settings and Legacy Migration
 
@@ -184,7 +185,7 @@ Use `example.invalid` and placeholder values only.
 
 - [ ] **Step 2: Run the focused tests and verify RED**
 
-Run: `swift test --filter 'AssistantSettingsTests|AppSettingsTests'`
+Run: `scripts/test-swift.sh --filter 'AssistantSettingsTests|AppSettingsTests'`
 
 Expected: compile failures for missing `AssistantSettings` and `AppSettings.assistant`.
 
@@ -268,7 +269,7 @@ valid legacy `privacyModeEnabled` Boolean to `overlayStyle.invisibleInRecording`
 
 - [ ] **Step 4: Verify GREEN and regression coverage**
 
-Run: `swift test --filter 'AssistantSettingsTests|AppSettingsTests'`
+Run: `scripts/test-swift.sh --filter 'AssistantSettingsTests|AppSettingsTests'`
 
 Expected: all focused tests pass, including the existing multi-source and recording-
 visibility cases.
@@ -327,7 +328,7 @@ actor StubHTTPTransport: HTTPTransport {
 
 - [ ] **Step 2: Run the provider tests and verify RED**
 
-Run: `swift test --filter OpenAIResponsesClientTests`
+Run: `scripts/test-swift.sh --filter OpenAIResponsesClientTests`
 
 Expected: compile failure because `HTTPTransport` and `OpenAIResponsesClient` do not exist.
 
@@ -400,8 +401,8 @@ never interpolate `apiKey` or a full request body.
 Run:
 
 ```bash
-swift test --filter OpenAIResponsesClientTests
-swift test
+scripts/test-swift.sh --filter OpenAIResponsesClientTests
+scripts/test-swift.sh
 git add Sources/V2SApp/Services/HTTPTransport.swift Sources/V2SApp/Services/OpenAIResponsesClient.swift Tests/V2STests/OpenAIResponsesClientTests.swift
 git commit -m "feat: add testable assistant provider client"
 ```
@@ -431,7 +432,7 @@ func testEmptyTranscriptThrowsBeforeAnyProviderWork() throws
 
 - [ ] **Step 2: Run and verify RED**
 
-Run: `swift test --filter AssistantPromptBuilderTests`
+Run: `scripts/test-swift.sh --filter AssistantPromptBuilderTests`
 
 Expected: missing model/builder compile errors.
 
@@ -479,7 +480,7 @@ has empty source and translation text.
 - [ ] **Step 5: Verify GREEN and commit**
 
 ```bash
-swift test --filter AssistantPromptBuilderTests
+scripts/test-swift.sh --filter AssistantPromptBuilderTests
 git add Sources/V2SApp/Models/AssistantModels.swift Sources/V2SApp/Services/AssistantPromptBuilder.swift Tests/V2STests/AssistantPromptBuilderTests.swift
 git commit -m "feat: build deterministic assistant prompts"
 ```
@@ -500,7 +501,7 @@ image.
 
 - [ ] **Step 2: Run and verify RED**
 
-Run: `swift test --filter ScreenContextProviderTests`
+Run: `scripts/test-swift.sh --filter ScreenContextProviderTests`
 
 Expected: missing protocols and provider compile errors.
 
@@ -553,7 +554,7 @@ assistant request.
 - [ ] **Step 4: Verify GREEN and commit**
 
 ```bash
-swift test --filter ScreenContextProviderTests
+scripts/test-swift.sh --filter ScreenContextProviderTests
 git add Sources/V2SApp/Services/ScreenContextProvider.swift Tests/V2STests/ScreenContextProviderTests.swift Config/Info.plist
 git commit -m "feat: add assistant screen context provider"
 ```
@@ -582,7 +583,7 @@ func testMissingConfigurationFailsBeforeScreenCapture() async
 
 - [ ] **Step 2: Run and verify RED**
 
-Run: `swift test --filter AssistantCoordinatorTests`
+Run: `scripts/test-swift.sh --filter AssistantCoordinatorTests`
 
 Expected: missing coordinator compile error.
 
@@ -637,7 +638,7 @@ Run the focused test with the fallback branch temporarily disabled and confirm
 `testImageUnsupportedRetriesExactlyOnceWithoutImage` fails; restore the branch and
 rerun.
 
-Run: `swift test --filter AssistantCoordinatorTests`
+Run: `scripts/test-swift.sh --filter AssistantCoordinatorTests`
 
 Expected: all coordinator tests pass.
 
@@ -665,7 +666,7 @@ saved with existing source/language fields unchanged.
 
 - [ ] **Step 2: Run and verify RED**
 
-Run: `swift test --filter AppModelAssistantIntegrationTests`
+Run: `scripts/test-swift.sh --filter AppModelAssistantIntegrationTests`
 
 Expected: missing `assistant` and `assistantTranscriptSnapshot()` members.
 
@@ -705,8 +706,8 @@ translation methods.
 - [ ] **Step 4: Verify GREEN and commit**
 
 ```bash
-swift test --filter 'AppModelAssistantIntegrationTests|AppSettingsTests'
-swift test
+scripts/test-swift.sh --filter 'AppModelAssistantIntegrationTests|AppSettingsTests'
+scripts/test-swift.sh
 git add Sources/V2SApp/App/AppModel.swift Tests/V2STests/AppModelAssistantIntegrationTests.swift Tests/V2STests/AppSettingsTests.swift
 git commit -m "feat: connect assistant to transcript snapshots"
 ```
@@ -727,7 +728,7 @@ Carbon calls are outside the unit test.
 
 - [ ] **Step 2: Run and verify RED**
 
-Run: `swift test --filter GlobalHotKeyControllerTests`
+Run: `scripts/test-swift.sh --filter GlobalHotKeyControllerTests`
 
 Expected: missing planner/controller compile errors.
 
@@ -761,8 +762,8 @@ byte-for-byte except adjacent initialization/termination wiring.
 - [ ] **Step 5: Verify GREEN and commit**
 
 ```bash
-swift test --filter GlobalHotKeyControllerTests
-swift test
+scripts/test-swift.sh --filter GlobalHotKeyControllerTests
+scripts/test-swift.sh
 git add Sources/V2SApp/Services/GlobalHotKeyController.swift Tests/V2STests/GlobalHotKeyControllerTests.swift Sources/V2SApp/App/AppDelegate.swift
 git commit -m "feat: restore validated assistant hotkeys"
 ```
@@ -791,7 +792,7 @@ supported interface dictionaries and assert non-empty values for:
 
 - [ ] **Step 2: Run and verify RED**
 
-Run: `swift test --filter AppLocalizationTests`
+Run: `scripts/test-swift.sh --filter AppLocalizationTests`
 
 Expected: missing key/dictionary failures.
 
@@ -810,7 +811,7 @@ upstream `invisibleInRecording` toggle as the sole privacy toggle.
 - [ ] **Step 4: Verify GREEN and commit**
 
 ```bash
-swift test --filter AppLocalizationTests
+scripts/test-swift.sh --filter AppLocalizationTests
 node --test Tests/Docs/i18n.test.cjs
 git add Sources/V2SApp/UI/Settings/AssistantSettingsSection.swift Sources/V2SApp/UI/Settings/SettingsView.swift Sources/V2SApp/Localization/AppLocalization.swift Tests/V2STests/AppLocalizationTests.swift
 git commit -m "feat: add localized assistant settings"
@@ -837,7 +838,7 @@ mouse/scroll input and subtitle mode preserves the upstream click-through behavi
 
 - [ ] **Step 2: Run and verify RED**
 
-Run: `swift test --filter 'OverlayWindowControllerTests|SettingsWindowControllerTests'`
+Run: `scripts/test-swift.sh --filter 'OverlayWindowControllerTests|SettingsWindowControllerTests'`
 
 Expected: settings-window privacy assertion fails and reply-mode APIs are absent.
 
@@ -880,8 +881,8 @@ during `willSet`.
 - [ ] **Step 5: Verify GREEN and commit**
 
 ```bash
-swift test --filter 'OverlayWindowControllerTests|SettingsWindowControllerTests|AssistantCoordinatorTests'
-swift test
+scripts/test-swift.sh --filter 'OverlayWindowControllerTests|SettingsWindowControllerTests|AssistantCoordinatorTests'
+scripts/test-swift.sh
 git add Sources/V2SApp/UI/Overlay/AssistantReplyView.swift Sources/V2SApp/UI/Overlay/OverlayView.swift Sources/V2SApp/UI/Overlay/OverlayWindowController.swift Sources/V2SApp/UI/Settings/SettingsWindowController.swift Sources/V2SApp/UI/Shared/QuickSettingsControls.swift Sources/V2SApp/UI/StatusBar/StatusBarPopoverView.swift Tests/V2STests/OverlayWindowControllerTests.swift Tests/V2STests/SettingsWindowControllerTests.swift
 git commit -m "feat: restore assistant overlay and unified privacy"
 ```
@@ -1016,9 +1017,7 @@ regression test beside the affected suite.
 - [ ] **Step 1: Run the complete automated suite**
 
 ```bash
-export CLANG_MODULE_CACHE_PATH="$PWD/.build/clang-module-cache"
-export SWIFTPM_MODULECACHE_OVERRIDE="$CLANG_MODULE_CACHE_PATH"
-swift test
+scripts/test-swift.sh
 node --test Tests/Docs/*.test.cjs
 xcodebuild -project v2s.xcodeproj -scheme v2s -configuration Debug CODE_SIGNING_ALLOWED=NO build
 xcodebuild -project v2s.xcodeproj -scheme v2s -configuration Release -derivedDataPath .build/final-release CODE_SIGNING_ALLOWED=NO build
@@ -1029,7 +1028,7 @@ Expected: all Swift/Node tests pass; both builds exit 0; `lipo` reports `arm64 x
 
 - [ ] **Step 2: Fix each reproduced failure test-first**
 
-For every failure, reduce it to one focused XCTest or Node test, run it to observe the
+For every failure, reduce it to one focused Swift Testing or Node test, run it to observe the
 expected failure, make the smallest production fix, rerun the focused test, then rerun
 Step 1. Commit each unrelated bug separately as `fix: <observable behavior>`.
 

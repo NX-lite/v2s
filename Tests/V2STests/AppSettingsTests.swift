@@ -1,9 +1,9 @@
 import Foundation
-import XCTest
+import Testing
 @testable import v2s
 
-final class AppSettingsTests: XCTestCase {
-    func testLegacySingleSourceSettingsDecodeIntoMultiSourceFields() throws {
+@Suite struct AppSettingsTests {
+    @Test func legacySingleSourceSettingsDecodeIntoMultiSourceFields() throws {
         let json = """
         {
           "selectedSourceID": "mic-1",
@@ -29,13 +29,13 @@ final class AppSettingsTests: XCTestCase {
 
         let settings = try JSONDecoder().decode(AppSettings.self, from: Data(json.utf8))
 
-        XCTAssertEqual(settings.selectedSourceID, "mic-1")
-        XCTAssertEqual(settings.selectedSourceIDs, ["mic-1"])
-        XCTAssertTrue(settings.sourceLanguageOverrides.isEmpty)
-        XCTAssertTrue(settings.sourceOutputLanguageOverrides.isEmpty)
+        #expect(settings.selectedSourceID == "mic-1")
+        #expect(settings.selectedSourceIDs == ["mic-1"])
+        #expect(settings.sourceLanguageOverrides.isEmpty)
+        #expect(settings.sourceOutputLanguageOverrides.isEmpty)
     }
 
-    func testMultiSourceSettingsRoundTripPreservesOverrides() throws {
+    @Test func multiSourceSettingsRoundTripPreservesOverrides() throws {
         let settings = AppSettings(
             selectedSourceID: "mic-1",
             selectedSourceIDs: ["mic-1", "app-1"],
@@ -53,20 +53,17 @@ final class AppSettingsTests: XCTestCase {
         let data = try JSONEncoder().encode(settings)
         let decoded = try JSONDecoder().decode(AppSettings.self, from: data)
 
-        XCTAssertEqual(decoded.selectedSourceID, "mic-1")
-        XCTAssertEqual(decoded.selectedSourceIDs, ["mic-1", "app-1"])
-        XCTAssertEqual(decoded.sourceLanguageOverrides, ["app-1": "fr"])
-        XCTAssertEqual(
-            decoded.sourceOutputLanguageOverrides,
-            ["mic-1": "zh-Hans", "app-1": "de"]
-        )
-        XCTAssertEqual(decoded.inputLanguageID, "en")
-        XCTAssertEqual(decoded.outputLanguageID, "ja")
-        XCTAssertEqual(decoded.interfaceLanguageID, "en")
-        XCTAssertEqual(decoded.glossary, ["CEO": "Chief Executive Officer"])
+        #expect(decoded.selectedSourceID == "mic-1")
+        #expect(decoded.selectedSourceIDs == ["mic-1", "app-1"])
+        #expect(decoded.sourceLanguageOverrides == ["app-1": "fr"])
+        #expect(decoded.sourceOutputLanguageOverrides == ["mic-1": "zh-Hans", "app-1": "de"])
+        #expect(decoded.inputLanguageID == "en")
+        #expect(decoded.outputLanguageID == "ja")
+        #expect(decoded.interfaceLanguageID == "en")
+        #expect(decoded.glossary == ["CEO": "Chief Executive Officer"])
     }
 
-    func testInvisibleInRecordingDefaultsToOffForSettingsSavedBeforeTheToggleExisted() throws {
+    @Test func invisibleInRecordingDefaultsToOffForSettingsSavedBeforeTheToggleExisted() throws {
         let json = """
         {
           "selectedSourceID": "mic-1",
@@ -91,16 +88,16 @@ final class AppSettingsTests: XCTestCase {
 
         let settings = try JSONDecoder().decode(AppSettings.self, from: Data(json.utf8))
 
-        XCTAssertFalse(settings.overlayStyle.invisibleInRecording)
+        #expect(!settings.overlayStyle.invisibleInRecording)
     }
 
-    func testInvisibleInRecordingSurvivesAnEncodeDecodeRoundTrip() throws {
+    @Test func invisibleInRecordingSurvivesAnEncodeDecodeRoundTrip() throws {
         var style = OverlayStyle.default
         style.invisibleInRecording = true
 
         let data = try JSONEncoder().encode(style)
         let decoded = try JSONDecoder().decode(OverlayStyle.self, from: data)
 
-        XCTAssertTrue(decoded.invisibleInRecording)
+        #expect(decoded.invisibleInRecording)
     }
 }

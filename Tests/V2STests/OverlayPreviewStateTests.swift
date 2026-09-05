@@ -1,9 +1,9 @@
 import Foundation
-import XCTest
+import Testing
 @testable import v2s
 
-final class OverlayPreviewStateTests: XCTestCase {
-    func testDraftTranslationIsOnlyReturnedForMatchingDraft() {
+@Suite struct OverlayPreviewStateTests {
+    @Test func draftTranslationIsOnlyReturnedForMatchingDraft() {
         let firstPromotionID = UUID()
         let secondPromotionID = UUID()
         var state = OverlayPreviewState(
@@ -20,22 +20,21 @@ final class OverlayPreviewStateTests: XCTestCase {
             promotionID: firstPromotionID
         )
 
-        XCTAssertEqual(
+        #expect(
             state.currentDraftTranslatedText(
                 for: "Change type is not at all.",
                 promotionID: firstPromotionID
-            ),
-            "Old translation"
+            ) == "Old translation"
         )
-        XCTAssertNil(
+        #expect(
             state.currentDraftTranslatedText(
                 for: "Okay.",
                 promotionID: secondPromotionID
-            )
+            ) == nil
         )
     }
 
-    func testMismatchedDraftTranslationIsCleared() {
+    @Test func mismatchedDraftTranslationIsCleared() {
         let firstPromotionID = UUID()
         let secondPromotionID = UUID()
         var state = OverlayPreviewState(
@@ -54,12 +53,12 @@ final class OverlayPreviewStateTests: XCTestCase {
             promotionID: secondPromotionID
         )
 
-        XCTAssertNil(state.draftTranslatedText)
-        XCTAssertNil(state.draftTranslationSourceText)
-        XCTAssertNil(state.draftTranslationPromotionID)
+        #expect(state.draftTranslatedText == nil)
+        #expect(state.draftTranslationSourceText == nil)
+        #expect(state.draftTranslationPromotionID == nil)
     }
 
-    func testSamePromotionDraftTranslationStaysVisibleDuringSourceUpdate() {
+    @Test func samePromotionDraftTranslationStaysVisibleDuringSourceUpdate() {
         let promotionID = UUID()
         var state = OverlayPreviewState(
             translatedText: "",
@@ -77,22 +76,21 @@ final class OverlayPreviewStateTests: XCTestCase {
             promotionID: promotionID
         )
 
-        XCTAssertEqual(
+        #expect(
             state.visibleDraftTranslatedText(
                 for: "Change type is not at all.",
                 promotionID: promotionID
-            ),
-            "Old translation"
+            ) == "Old translation"
         )
-        XCTAssertNil(
+        #expect(
             state.currentDraftTranslatedText(
                 for: "Change type is not at all.",
                 promotionID: promotionID
-            )
+            ) == nil
         )
     }
 
-    func testNilPromotionDraftTranslationStillRequiresExactSourceMatch() {
+    @Test func nilPromotionDraftTranslationStillRequiresExactSourceMatch() {
         var state = OverlayPreviewState(
             translatedText: "",
             sourceText: "",
@@ -105,11 +103,11 @@ final class OverlayPreviewStateTests: XCTestCase {
             promotionID: nil
         )
 
-        XCTAssertNil(
+        #expect(
             state.visibleDraftTranslatedText(
                 for: "Change type is not at all.",
                 promotionID: nil
-            )
+            ) == nil
         )
     }
 }

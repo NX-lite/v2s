@@ -188,6 +188,14 @@ All behavior changes follow a red-green-refactor cycle: add a focused failing te
 confirm the expected failure, implement the smallest change, and rerun the focused
 and complete suites.
 
+Swift package tests use Swift Testing (`@Suite`, `@Test`, `#expect`, and
+`#require`) rather than XCTest. Locally, run `scripts/test-swift.sh`, which uses
+normal `swift test` under full Xcode and otherwise the verified Command Line Tools
+compatibility path: manifest SDK `MacOSX15.4.sdk`, target SDK `MacOSX26.4.sdk`,
+Swift Testing import/framework paths and rpaths, `--disable-sandbox`, and
+repository-local `.build` caches. XCTest-style examples in the implementation plan
+are behavioral pseudocode and must be converted when implemented.
+
 ### Existing suites
 
 Retain all upstream tests under `Tests/V2STests` and the documentation localization

@@ -1,81 +1,72 @@
 import Foundation
-import XCTest
+import Testing
 @testable import v2s
 
-final class GlossaryServiceTests: XCTestCase {
+@Suite struct GlossaryServiceTests {
     private let service = GlossaryService()
 
-    func testEmptyGlossaryReturnsTextUnchanged() {
-        XCTAssertEqual(service.apply(to: "He said AI wins", glossary: [:]), "He said AI wins")
+    @Test func emptyGlossaryReturnsTextUnchanged() {
+        #expect(service.apply(to: "He said AI wins", glossary: [:]) == "He said AI wins")
     }
 
-    func testReplacesStandaloneLatinTerm() {
+    @Test func replacesStandaloneLatinTerm() {
         let result = service.apply(to: "He said AI wins", glossary: ["AI": "人工智能"])
-        XCTAssertEqual(result, "He said 人工智能 wins")
+        #expect(result == "He said 人工智能 wins")
     }
 
-    func testDoesNotReplaceLatinTermInsideAnotherWord() {
+    @Test func doesNotReplaceLatinTermInsideAnotherWord() {
         let result = service.apply(to: "They repaired the airfield", glossary: ["AI": "人工智能"])
-        XCTAssertEqual(result, "They repaired the airfield")
+        #expect(result == "They repaired the airfield")
     }
 
-    func testDoesNotReplaceLatinTermSuffixInsideAnotherWord() {
+    @Test func doesNotReplaceLatinTermSuffixInsideAnotherWord() {
         let result = service.apply(to: "OpenAI released a model", glossary: ["AI": "人工智能"])
-        XCTAssertEqual(result, "OpenAI released a model")
+        #expect(result == "OpenAI released a model")
     }
 
-    func testReplacesLatinTermAdjacentToCJKCharacters() {
+    @Test func replacesLatinTermAdjacentToCJKCharacters() {
         let result = service.apply(to: "使用AI模型", glossary: ["AI": "人工智能"])
-        XCTAssertEqual(result, "使用人工智能模型")
+        #expect(result == "使用人工智能模型")
     }
 
-    func testReplacesLatinTermAtStringBoundariesAndBeforePunctuation() {
+    @Test func replacesLatinTermAtStringBoundariesAndBeforePunctuation() {
         let result = service.apply(to: "AI is the future. I love AI.", glossary: ["AI": "人工智能"])
-        XCTAssertEqual(result, "人工智能 is the future. I love 人工智能.")
+        #expect(result == "人工智能 is the future. I love 人工智能.")
     }
 
-    func testMatchesCaseInsensitively() {
+    @Test func matchesCaseInsensitively() {
         let result = service.apply(to: "ai everywhere", glossary: ["AI": "人工智能"])
-        XCTAssertEqual(result, "人工智能 everywhere")
+        #expect(result == "人工智能 everywhere")
     }
 
-    func testLongestEntryWinsOverShorterOverlap() {
+    @Test func longestEntryWinsOverShorterOverlap() {
         let result = service.apply(
             to: "I love New York",
             glossary: ["New York": "纽约", "York": "约克"]
         )
-        XCTAssertEqual(result, "I love 纽约")
+        #expect(result == "I love 纽约")
     }
 
-    func testReplacesCJKTermWithoutWordBoundaries() {
+    @Test func replacesCJKTermWithoutWordBoundaries() {
         let result = service.apply(to: "这个模型很好", glossary: ["模型": "model"])
-        XCTAssertEqual(result, "这个model很好")
+        #expect(result == "这个model很好")
     }
 
-    func testDigitEdgedTermRespectsBoundaries() {
+    @Test func digitEdgedTermRespectsBoundaries() {
         let glossary = ["5G": "五代网络"]
-        XCTAssertEqual(service.apply(to: "The 25G link", glossary: glossary), "The 25G link")
-        XCTAssertEqual(service.apply(to: "用5G上网", glossary: glossary), "用五代网络上网")
+        #expect(service.apply(to: "The 25G link", glossary: glossary) == "The 25G link")
+        #expect(service.apply(to: "用5G上网", glossary: glossary) == "用五代网络上网")
     }
 
-    func testAccentedLatinTermRespectsBoundaries() {
+    @Test func accentedLatinTermRespectsBoundaries() {
         let glossary = ["café": "咖啡馆"]
-        XCTAssertEqual(service.apply(to: "meet at the café now", glossary: glossary), "meet at the 咖啡馆 now")
-        XCTAssertEqual(service.apply(to: "cafés stay open", glossary: glossary), "cafés stay open")
+        #expect(service.apply(to: "meet at the café now", glossary: glossary) == "meet at the 咖啡馆 now")
+        #expect(service.apply(to: "cafés stay open", glossary: glossary) == "cafés stay open")
     }
 
-    func testNonLatinTermsRespectBoundaries() {
-        XCTAssertEqual(
-            service.apply(to: "протестирование продолжается", glossary: ["тест": "test"]),
-            "протестирование продолжается"
-        )
-        XCTAssertEqual(
-            service.apply(to: "καφές είναι έτοιμος", glossary: ["καφ": "coffee"]),
-            "καφές είναι έτοιμος"
-        )
-        XCTAssertEqual(
-            service.apply(to: "وسلامة الجميع", glossary: ["سلام": "peace"]),
-            "وسلامة الجميع"
-        )
+    @Test func nonLatinTermsRespectBoundaries() {
+        #expect(service.apply(to: "протестирование продолжается", glossary: ["тест": "test"]) == "протестирование продолжается")
+        #expect(service.apply(to: "καφές είναι έτοιμος", glossary: ["καφ": "coffee"]) == "καφές είναι έτοιμος")
+        #expect(service.apply(to: "وسلامة الجميع", glossary: ["سلام": "peace"]) == "وسلامة الجميع")
     }
 }

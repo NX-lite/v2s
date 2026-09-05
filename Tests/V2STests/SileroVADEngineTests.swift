@@ -1,9 +1,9 @@
 import AVFoundation
 import Foundation
-import XCTest
+import Testing
 @testable import v2s
 
-final class SileroVADEngineTests: XCTestCase {
+@Suite struct SileroVADEngineTests {
     private static let chunkSize = 512
     private static let sampleRate = 16_000.0
     // Captured from the pinned Silero v5 reference with each 512-sample chunk
@@ -26,23 +26,21 @@ final class SileroVADEngineTests: XCTestCase {
         0.0031940639,
     ]
 
-    func testPackagedModelMatchesGoldenSequenceAfterReset() throws {
+    @Test func packagedModelMatchesGoldenSequenceAfterReset() throws {
         let engine = try SileroVADEngine()
         // This first run starts immediately after init, so it also verifies that
         // prewarming did not carry context or recurrent state into production.
         let firstRun = try processGoldenSequence(with: engine)
-        assertGoldenSequence(firstRun)
+        assertGoldenSequence(firstRun, sourceLocation: #_sourceLocation)
 
         engine.reset()
 
         let secondRun = try processGoldenSequence(with: engine)
-        assertGoldenSequence(secondRun)
+        assertGoldenSequence(secondRun, sourceLocation: #_sourceLocation)
 
         for index in Self.goldenProbabilities.indices {
-            XCTAssertEqual(
-                secondRun[index].speechProbability,
-                firstRun[index].speechProbability,
-                accuracy: 1e-6,
+            #expect(
+                abs(secondRun[index].speechProbability - firstRun[index].speechProbability) <= 1e-6,
                 "Reset run differs at chunk \(index)"
             )
         }
@@ -56,55 +54,36 @@ final class SileroVADEngineTests: XCTestCase {
 
     private func assertGoldenSequence(
         _ results: [VADResult],
-        file: StaticString = #filePath,
-        line: UInt = #line
+        sourceLocation: SourceLocation = #_sourceLocation
     ) {
-        XCTAssertEqual(results.count, Self.goldenProbabilities.count, file: file, line: line)
+        #expect(results.count == Self.goldenProbabilities.count, sourceLocation: sourceLocation)
 
         for (index, result) in results.enumerated() {
-            XCTAssertEqual(
-                result.speechProbability,
-                Self.goldenProbabilities[index],
-                accuracy: 1e-4,
+            #expect(
+                abs(result.speechProbability - Self.goldenProbabilities[index]) <= 1e-4,
                 "Unexpected probability at chunk \(index)",
-                file: file,
-                line: line
+                sourceLocation: sourceLocation
             )
-            XCTAssertFalse(
-                result.containsSpeechOnset,
-                "Unexpected speech onset at chunk \(index)",
-                file: file,
-                line: line
-            )
-            XCTAssertFalse(
-                result.containsSpeechOffset,
-                "Unexpected speech offset at chunk \(index)",
-                file: file,
-                line: line
-            )
-            XCTAssertFalse(
-                result.isSpeech,
-                "Hysteresis entered speech at chunk \(index)",
-                file: file,
-                line: line
-            )
+            #expect(!result.containsSpeechOnset, "Unexpected speech onset at chunk \(index)", sourceLocation: sourceLocation)
+            #expect(!result.containsSpeechOffset, "Unexpected speech offset at chunk \(index)", sourceLocation: sourceLocation)
+            #expect(!result.isSpeech, "Hysteresis entered speech at chunk \(index)", sourceLocation: sourceLocation)
         }
     }
 
     private func makeBuffer(chunkIndex: Int) throws -> AVAudioPCMBuffer {
-        let format = try XCTUnwrap(AVAudioFormat(
+        let format = try #require(AVAudioFormat(
             commonFormat: .pcmFormatFloat32,
             sampleRate: Self.sampleRate,
             channels: 1,
             interleaved: true
         ))
-        let buffer = try XCTUnwrap(AVAudioPCMBuffer(
+        let buffer = try #require(AVAudioPCMBuffer(
             pcmFormat: format,
             frameCapacity: AVAudioFrameCount(Self.chunkSize)
         ))
         buffer.frameLength = AVAudioFrameCount(Self.chunkSize)
 
-        let channelData = try XCTUnwrap(buffer.floatChannelData)
+        let channelData = try #require(buffer.floatChannelData)
         let channel = channelData[0]
         let firstSample = chunkIndex * Self.chunkSize
 
