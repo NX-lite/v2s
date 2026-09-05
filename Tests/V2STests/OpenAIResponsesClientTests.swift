@@ -169,6 +169,81 @@ import Testing
         #expect(queryItems.first { $0.name == "alt" }?.value == "json")
     }
 
+    @Test func geminiConcreteBaseRoutesRespondAndModelDiscoveryIndependently() async throws {
+        let generatePayload = Data("""
+        {"candidates":[{"content":{"parts":[{"text":"gemini text"}]}}]}
+        """.utf8)
+        let modelsPayload = Data("""
+        {"models":[{"name":"models/gemini-a","supportedGenerationMethods":["generateContent"]}]}
+        """.utf8)
+        let transport = StubHTTPTransport(stubs: [
+            .init(status: 200, data: generatePayload),
+            .init(status: 200, data: modelsPayload),
+        ])
+        let client = OpenAIResponsesClient(
+            apiKey: "test-placeholder-key",
+            baseURLString: "https://generativelanguage.googleapis.com/v1beta/models/gemini-test:generateContent?alt=json",
+            model: "ignored-model",
+            transport: transport
+        )
+
+        _ = try await client.respond(instructions: "System", prompt: "Question", screenshotPNGData: nil)
+        _ = try await client.fetchAvailableModels()
+        let requests = await transport.requestsSnapshot()
+
+        #expect(requests.count == 2)
+        #expect(requests[0].url?.path == "/v1beta/models/gemini-test:generateContent")
+        #expect(requests[1].url?.path == "/v1beta/models")
+        #expect(requests[1].url?.query?.contains("alt=json") == true)
+    }
+
+    @Test func geminiModelsBaseRoutesModelDiscoveryAndRespondIndependently() async throws {
+        let modelsPayload = Data("""
+        {"models":[{"name":"models/gemini-a","supportedGenerationMethods":["generateContent"]}]}
+        """.utf8)
+        let generatePayload = Data("""
+        {"candidates":[{"content":{"parts":[{"text":"gemini text"}]}}]}
+        """.utf8)
+        let transport = StubHTTPTransport(stubs: [
+            .init(status: 200, data: modelsPayload),
+            .init(status: 200, data: generatePayload),
+        ])
+        let client = OpenAIResponsesClient(
+            apiKey: "test-placeholder-key",
+            baseURLString: "https://generativelanguage.googleapis.com/v1beta/models",
+            model: "gemini-a",
+            transport: transport
+        )
+
+        _ = try await client.fetchAvailableModels()
+        _ = try await client.respond(instructions: "System", prompt: "Question", screenshotPNGData: nil)
+        let requests = await transport.requestsSnapshot()
+
+        #expect(requests.count == 2)
+        #expect(requests[0].url?.path == "/v1beta/models")
+        #expect(requests[1].url?.path == "/v1beta/models/gemini-a:generateContent")
+    }
+
+    @Test func geminiKeyReplacementPreservesRawEncodingOfOtherQueryPairs() async throws {
+        let payload = Data("""
+        {"candidates":[{"content":{"parts":[{"text":"gemini text"}]}}]}
+        """.utf8)
+        let transport = StubHTTPTransport(stubs: [.init(status: 200, data: payload)])
+        let client = OpenAIResponsesClient(
+            apiKey: "test-placeholder-key",
+            baseURLString: "https://generativelanguage.googleapis.com/v1beta?trace=a%2Bb&route=a%2Fb&key=old",
+            model: "gemini-a",
+            transport: transport
+        )
+
+        _ = try await client.respond(instructions: "System", prompt: "Question", screenshotPNGData: nil)
+        let request = try #require(await transport.firstRequest())
+        let url = try #require(request.url)
+        let components = try #require(URLComponents(url: url, resolvingAgainstBaseURL: false))
+
+        #expect(components.percentEncodedQuery == "trace=a%2Bb&route=a%2Fb&key=test-placeholder-key")
+    }
+
     @Test func openAIEndpointNormalizationPreservesQueryValuesEndingInSlash() async throws {
         let payload = Data("""
         {"output":[{"content":[{"type":"output_text","text":"response text"}]}]}
@@ -217,6 +292,52 @@ import Testing
             }
             #expect(!message.contains("test-placeholder-key"))
             #expect(!(error.errorDescription ?? "").contains("test-placeholder-key"))
+        } catch {
+            Issue.record("Expected ClientError, got \(error)")
+        }
+    }
+
+    @Test func imageKeywordsOnAuthenticationAndRateLimitRemainHTTPError() async {
+        for status in [401, 429] {
+            let payload = Data("{\"error\":{\"message\":\"Vision image request rejected\"}}".utf8)
+            let transport = StubHTTPTransport(stubs: [.init(status: status, data: payload)])
+            let client = OpenAIResponsesClient(
+                apiKey: "test-placeholder-key", baseURLString: "https://example.invalid/v1", model: "gpt-test", transport: transport
+            )
+
+            do {
+                _ = try await client.respond(instructions: "System", prompt: "Question", screenshotPNGData: Data([1]))
+                Issue.record("Expected HTTP \(status) error")
+            } catch let error as OpenAIResponsesClient.ClientError {
+                guard case .http(let actualStatus, let message) = error else {
+                    Issue.record("Expected HTTP error, got \(error)")
+                    continue
+                }
+                #expect(actualStatus == status)
+                #expect(message.localizedCaseInsensitiveContains("vision"))
+            } catch {
+                Issue.record("Expected ClientError, got \(error)")
+            }
+        }
+    }
+
+    @Test func imageKeywordsWithoutScreenshotRemainHTTPError() async {
+        let payload = Data("{\"error\":{\"message\":\"Vision image request rejected\"}}".utf8)
+        let transport = StubHTTPTransport(stubs: [.init(status: 400, data: payload)])
+        let client = OpenAIResponsesClient(
+            apiKey: "test-placeholder-key", baseURLString: "https://example.invalid/v1", model: "gpt-test", transport: transport
+        )
+
+        do {
+            _ = try await client.respond(instructions: "System", prompt: "Question", screenshotPNGData: nil)
+            Issue.record("Expected HTTP error")
+        } catch let error as OpenAIResponsesClient.ClientError {
+            guard case .http(let status, let message) = error else {
+                Issue.record("Expected HTTP error, got \(error)")
+                return
+            }
+            #expect(status == 400)
+            #expect(message.localizedCaseInsensitiveContains("vision"))
         } catch {
             Issue.record("Expected ClientError, got \(error)")
         }
@@ -354,6 +475,7 @@ private actor StubHTTPTransport: HTTPTransport {
 
     func firstRequest() -> URLRequest? { requests.first }
     func requestCount() -> Int { requests.count }
+    func requestsSnapshot() -> [URLRequest] { requests }
 }
 
 private actor ThrowingHTTPTransport: HTTPTransport {

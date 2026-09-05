@@ -122,7 +122,7 @@ struct OpenAIResponsesClient: Sendable {
             )
         }
 
-        let data = try await successfulData(for: request, apiKey: apiKey)
+        let data = try await successfulData(for: request, apiKey: apiKey, imageWasSent: screenshotPNGData != nil)
         let text: String
         switch endpoint {
         case .chat:
@@ -149,7 +149,7 @@ struct OpenAIResponsesClient: Sendable {
             generationConfig: .init(maxOutputTokens: 900)
         )
         let request = try jsonRequest(url: url, method: "POST", body: body)
-        let data = try await successfulData(for: request, apiKey: apiKey)
+        let data = try await successfulData(for: request, apiKey: apiKey, imageWasSent: screenshotPNGData != nil)
         let text = try Self.decode(GeminiGenerateContentPayload.self, from: data).outputText
         guard !text.isEmpty else { throw ClientError.invalidResponse }
         return Response(text: text, imageWasSent: screenshotPNGData != nil)
@@ -230,7 +230,7 @@ struct OpenAIResponsesClient: Sendable {
         return request
     }
 
-    private func successfulData(for request: URLRequest, apiKey: String) async throws -> Data {
+    private func successfulData(for request: URLRequest, apiKey: String, imageWasSent: Bool = false) async throws -> Data {
         let data: Data
         let response: HTTPURLResponse
         do {
@@ -240,7 +240,7 @@ struct OpenAIResponsesClient: Sendable {
         }
         guard (200..<300).contains(response.statusCode) else {
             let message = Self.sanitizedErrorMessage(from: data, apiKey: apiKey) ?? "HTTP \(response.statusCode)"
-            if Self.isImageUnsupportedError(message) {
+            if imageWasSent && Self.isImageCapabilityRejection(status: response.statusCode, message: message) {
                 throw ClientError.imageUnsupported(message: message)
             }
             throw ClientError.http(status: response.statusCode, message: message)
@@ -251,6 +251,12 @@ struct OpenAIResponsesClient: Sendable {
     private enum OpenAIEndpoint {
         case chat(URL)
         case responses(URL)
+    }
+
+    private enum GeminiBasePath {
+        case root([String])
+        case models([String])
+        case generateContent([String])
     }
 
     private func openAIEndpoint() throws -> OpenAIEndpoint {
@@ -283,8 +289,15 @@ struct OpenAIResponsesClient: Sendable {
 
     private func geminiModelsURL(apiKey: String) throws -> URL {
         var components = try Self.requiredBaseComponents(from: baseURLString)
-        if components.percentEncodedPath.split(separator: "/").last != "models" {
-            components.percentEncodedPath = Self.appending(percentEncodedPath: components.percentEncodedPath, components: ["models"])
+        switch Self.geminiBasePath(for: components.percentEncodedPath) {
+        case .root(let segments):
+            components.percentEncodedPath = Self.path(from: segments + ["models"])
+        case .models(let segments):
+            components.percentEncodedPath = Self.path(from: segments)
+        case .generateContent(var segments):
+            segments.removeLast()
+            if segments.last != "models" { segments.append("models") }
+            components.percentEncodedPath = Self.path(from: segments)
         }
         Self.replaceAPIKey(in: &components, with: apiKey)
         return try Self.requiredURL(components)
@@ -292,7 +305,8 @@ struct OpenAIResponsesClient: Sendable {
 
     private func geminiGenerateContentURL(model: String, apiKey: String) throws -> URL {
         var components = try Self.requiredBaseComponents(from: baseURLString)
-        if components.percentEncodedPath.split(separator: "/").last?.hasSuffix(":generateContent") == true {
+        if case .generateContent(let segments) = Self.geminiBasePath(for: components.percentEncodedPath) {
+            components.percentEncodedPath = Self.path(from: segments)
             Self.replaceAPIKey(in: &components, with: apiKey)
             return try Self.requiredURL(components)
         }
@@ -300,15 +314,28 @@ struct OpenAIResponsesClient: Sendable {
         guard let encodedModel = model.addingPercentEncoding(withAllowedCharacters: allowed) else {
             throw ClientError.invalidRequest
         }
-        let prefix = components.percentEncodedPath.trimmingCharacters(in: CharacterSet(charactersIn: "/"))
-        components.percentEncodedPath = "/" + ([prefix, "models", "\(encodedModel):generateContent"].filter { !$0.isEmpty }.joined(separator: "/"))
+        let segments: [String]
+        switch Self.geminiBasePath(for: components.percentEncodedPath) {
+        case .root(let prefix):
+            segments = prefix + ["models", "\(encodedModel):generateContent"]
+        case .models(let prefix):
+            segments = prefix + ["\(encodedModel):generateContent"]
+        case .generateContent:
+            throw ClientError.invalidRequest
+        }
+        components.percentEncodedPath = Self.path(from: segments)
         Self.replaceAPIKey(in: &components, with: apiKey)
         return try Self.requiredURL(components)
     }
 
     private static func replaceAPIKey(in components: inout URLComponents, with apiKey: String) {
-        let retainedItems = (components.queryItems ?? []).filter { $0.name.caseInsensitiveCompare("key") != .orderedSame }
-        components.queryItems = retainedItems + [URLQueryItem(name: "key", value: apiKey)]
+        let retainedPairs = (components.percentEncodedQuery ?? "").split(separator: "&", omittingEmptySubsequences: false).filter { pair in
+            let name = pair.split(separator: "=", maxSplits: 1, omittingEmptySubsequences: false).first ?? pair
+            return name.caseInsensitiveCompare("key") != .orderedSame
+        }
+        let allowed = CharacterSet.urlQueryAllowed.subtracting(CharacterSet(charactersIn: "&=+#?"))
+        guard let encodedKey = apiKey.addingPercentEncoding(withAllowedCharacters: allowed) else { return }
+        components.percentEncodedQuery = (retainedPairs.map(String.init) + ["key=\(encodedKey)"]).joined(separator: "&")
     }
 
     private static func baseComponents(from baseURLString: String) -> URLComponents? {
@@ -340,6 +367,17 @@ struct OpenAIResponsesClient: Sendable {
         return "/" + ([existing] + components).filter { !$0.isEmpty }.joined(separator: "/")
     }
 
+    private static func geminiBasePath(for percentEncodedPath: String) -> GeminiBasePath {
+        let segments = percentEncodedPath.split(separator: "/").map(String.init)
+        if segments.last?.hasSuffix(":generateContent") == true { return .generateContent(segments) }
+        if segments.last == "models" { return .models(segments) }
+        return .root(segments)
+    }
+
+    private static func path(from segments: [String]) -> String {
+        "/" + segments.joined(separator: "/")
+    }
+
     private static func decode<Payload: Decodable>(_ type: Payload.Type, from data: Data) throws -> Payload {
         do {
             return try JSONDecoder().decode(type, from: data)
@@ -367,6 +405,10 @@ struct OpenAIResponsesClient: Sendable {
         return ["image", "vision", "visual", "multimodal", "multi-modal", "inline_data", "no endpoints"].contains {
             lowercased.contains($0)
         }
+    }
+
+    private static func isImageCapabilityRejection(status: Int, message: String) -> Bool {
+        status != 401 && status != 403 && status != 429 && !(500..<600).contains(status) && isImageUnsupportedError(message)
     }
 }
 
