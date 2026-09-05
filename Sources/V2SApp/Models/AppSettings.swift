@@ -12,6 +12,7 @@ struct AppSettings: Codable {
     var subtitleMode: SubtitleMode
     var subtitleDisplayMode: SubtitleDisplayMode
     var glossary: [String: String]
+    var assistant: AssistantSettings
 
     static let `default` = AppSettings(
         selectedSourceID: nil,
@@ -24,8 +25,21 @@ struct AppSettings: Codable {
         overlayStyle: .default,
         subtitleMode: .balanced,
         subtitleDisplayMode: .both,
-        glossary: [:]
+        glossary: [:],
+        assistant: .default
     )
+
+    private enum LegacyCodingKeys: String, CodingKey {
+        case privacyModeEnabled
+        case gptAPIKey
+        case gptAPIBaseURL
+        case gptModel
+        case gptSkills
+        case autoDetectConversationLanguages
+        case hotKeyFollowUp
+        case hotKeyAsk
+        case hotKeySwitchMode
+    }
 
     // Custom decoder so existing settings files load cleanly as new fields are added.
     init(from decoder: Decoder) throws {
@@ -51,6 +65,34 @@ struct AppSettings: Codable {
             ?? AppSettings.default.subtitleDisplayMode
         glossary = (try? c.decodeIfPresent([String: String].self, forKey: .glossary))
             ?? AppSettings.default.glossary
+
+        let legacy = try decoder.container(keyedBy: LegacyCodingKeys.self)
+        if let nestedAssistant = try? c.decodeIfPresent(AssistantSettings.self, forKey: .assistant) {
+            assistant = nestedAssistant
+        } else {
+            assistant = AssistantSettings(
+                apiKey: (try? legacy.decodeIfPresent(String.self, forKey: .gptAPIKey))
+                    ?? AssistantSettings.default.apiKey,
+                baseURL: (try? legacy.decodeIfPresent(String.self, forKey: .gptAPIBaseURL))
+                    ?? AssistantSettings.default.baseURL,
+                model: (try? legacy.decodeIfPresent(String.self, forKey: .gptModel))
+                    ?? AssistantSettings.default.model,
+                skills: (try? legacy.decodeIfPresent(String.self, forKey: .gptSkills))
+                    ?? AssistantSettings.default.skills,
+                autoDetectConversationLanguages: (try? legacy.decodeIfPresent(Bool.self, forKey: .autoDetectConversationLanguages))
+                    ?? AssistantSettings.default.autoDetectConversationLanguages,
+                followUpHotKey: (try? legacy.decodeIfPresent(HotKeyBinding.self, forKey: .hotKeyFollowUp))
+                    ?? AssistantSettings.default.followUpHotKey,
+                askHotKey: (try? legacy.decodeIfPresent(HotKeyBinding.self, forKey: .hotKeyAsk))
+                    ?? AssistantSettings.default.askHotKey,
+                switchModeHotKey: (try? legacy.decodeIfPresent(HotKeyBinding.self, forKey: .hotKeySwitchMode))
+                    ?? AssistantSettings.default.switchModeHotKey
+            )
+        }
+
+        if let privacyModeEnabled = try? legacy.decodeIfPresent(Bool.self, forKey: .privacyModeEnabled) {
+            overlayStyle.invisibleInRecording = privacyModeEnabled
+        }
     }
 
     init(
@@ -64,7 +106,8 @@ struct AppSettings: Codable {
         overlayStyle: OverlayStyle,
         subtitleMode: SubtitleMode,
         subtitleDisplayMode: SubtitleDisplayMode,
-        glossary: [String: String]
+        glossary: [String: String],
+        assistant: AssistantSettings = .default
     ) {
         self.selectedSourceID = selectedSourceID
         self.selectedSourceIDs = selectedSourceIDs
@@ -77,5 +120,6 @@ struct AppSettings: Codable {
         self.subtitleMode     = subtitleMode
         self.subtitleDisplayMode = subtitleDisplayMode
         self.glossary         = glossary
+        self.assistant = assistant
     }
 }

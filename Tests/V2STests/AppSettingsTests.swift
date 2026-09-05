@@ -100,4 +100,52 @@ import Testing
 
         #expect(decoded.invisibleInRecording)
     }
+
+    @Test func forkFlatAssistantSettingsMigrateWithoutLosingPrivacy() throws {
+        let json = """
+        {
+          "inputLanguageID":"en","outputLanguageID":"zh-Hans",
+          "overlayStyle":{},"subtitleMode":"balanced",
+          "subtitleDisplayMode":"both","glossary":{},
+          "privacyModeEnabled":true,
+          "gptAPIKey":"secret-placeholder","gptAPIBaseURL":"https://example.invalid/v1",
+          "gptModel":"model-a","gptSkills":"Answer briefly",
+          "autoDetectConversationLanguages":false,
+          "hotKeyFollowUp":{"key":"f","useCommand":true,"useOption":true,"useControl":false,"useShift":false},
+          "hotKeyAsk":{"key":"g","useCommand":true,"useOption":true,"useControl":false,"useShift":false},
+          "hotKeySwitchMode":{"key":"t","useCommand":true,"useOption":true,"useControl":false,"useShift":false}
+        }
+        """
+
+        let settings = try JSONDecoder().decode(AppSettings.self, from: Data(json.utf8))
+
+        #expect(settings.assistant.apiKey == "secret-placeholder")
+        #expect(settings.assistant.baseURL == "https://example.invalid/v1")
+        #expect(settings.assistant.model == "model-a")
+        #expect(settings.assistant.skills == "Answer briefly")
+        #expect(!settings.assistant.autoDetectConversationLanguages)
+        #expect(settings.assistant.followUpHotKey == .defaultFollowUp)
+        #expect(settings.overlayStyle.invisibleInRecording)
+    }
+
+    @Test func malformedLegacyFieldDoesNotDiscardOtherAssistantFields() throws {
+        let json = """
+        {"gptAPIKey":"kept","gptModel":42,"gptSkills":"kept-skill"}
+        """
+
+        let settings = try JSONDecoder().decode(AppSettings.self, from: Data(json.utf8))
+
+        #expect(settings.assistant.apiKey == "kept")
+        #expect(settings.assistant.model == AssistantSettings.default.model)
+        #expect(settings.assistant.skills == "kept-skill")
+    }
+
+    @Test func newEncodingContainsNestedAssistantAndNoLegacySecretsKey() throws {
+        let data = try JSONEncoder().encode(AppSettings.default)
+        let object = try #require(JSONSerialization.jsonObject(with: data) as? [String: Any])
+
+        #expect(object["assistant"] != nil)
+        #expect(object["gptAPIKey"] == nil)
+        #expect(object["privacyModeEnabled"] == nil)
+    }
 }
