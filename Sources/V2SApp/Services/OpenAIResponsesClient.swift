@@ -231,15 +231,21 @@ struct OpenAIResponsesClient: Sendable {
     }
 
     private func successfulData(for request: URLRequest, apiKey: String) async throws -> Data {
-        let (data, response) = try await transport.data(for: request)
-        guard (200..<300).contains(response.statusCode) else {
-            let message = Self.sanitizedErrorMessage(from: data, apiKey: apiKey) ?? "HTTP \(response.statusCode)"
-            if Self.isImageUnsupportedError(message) {
-                throw ClientError.imageUnsupported(message: message)
+        do {
+            let (data, response) = try await transport.data(for: request)
+            guard (200..<300).contains(response.statusCode) else {
+                let message = Self.sanitizedErrorMessage(from: data, apiKey: apiKey) ?? "HTTP \(response.statusCode)"
+                if Self.isImageUnsupportedError(message) {
+                    throw ClientError.imageUnsupported(message: message)
+                }
+                throw ClientError.http(status: response.statusCode, message: message)
             }
-            throw ClientError.http(status: response.statusCode, message: message)
+            return data
+        } catch let error as ClientError {
+            throw error
+        } catch {
+            throw ClientError.invalidResponse
         }
-        return data
     }
 
     private enum OpenAIEndpoint {
@@ -277,31 +283,44 @@ struct OpenAIResponsesClient: Sendable {
 
     private func geminiModelsURL(apiKey: String) throws -> URL {
         var components = try Self.requiredBaseComponents(from: baseURLString)
-        components.path = Self.appending(path: components.path, components: ["models"])
-        components.queryItems = [URLQueryItem(name: "key", value: apiKey)]
+        if components.path.split(separator: "/").last != "models" {
+            components.path = Self.appending(path: components.path, components: ["models"])
+        }
+        Self.replaceAPIKey(in: &components, with: apiKey)
         return try Self.requiredURL(components)
     }
 
     private func geminiGenerateContentURL(model: String, apiKey: String) throws -> URL {
         var components = try Self.requiredBaseComponents(from: baseURLString)
+        if components.path.split(separator: "/").last?.hasSuffix(":generateContent") == true {
+            Self.replaceAPIKey(in: &components, with: apiKey)
+            return try Self.requiredURL(components)
+        }
         let allowed = CharacterSet.urlPathAllowed.subtracting(CharacterSet(charactersIn: "/?#"))
         guard let encodedModel = model.addingPercentEncoding(withAllowedCharacters: allowed) else {
             throw ClientError.invalidRequest
         }
         let prefix = components.percentEncodedPath.trimmingCharacters(in: CharacterSet(charactersIn: "/"))
         components.percentEncodedPath = "/" + ([prefix, "models", "\(encodedModel):generateContent"].filter { !$0.isEmpty }.joined(separator: "/"))
-        components.queryItems = [URLQueryItem(name: "key", value: apiKey)]
+        Self.replaceAPIKey(in: &components, with: apiKey)
         return try Self.requiredURL(components)
     }
 
+    private static func replaceAPIKey(in components: inout URLComponents, with apiKey: String) {
+        let retainedItems = (components.queryItems ?? []).filter { $0.name.caseInsensitiveCompare("key") != .orderedSame }
+        components.queryItems = retainedItems + [URLQueryItem(name: "key", value: apiKey)]
+    }
+
     private static func baseComponents(from baseURLString: String) -> URLComponents? {
-        var source = baseURLString.trimmingCharacters(in: .whitespacesAndNewlines)
-        while source.last == "/" || source.last == "\\" { source.removeLast() }
+        let source = baseURLString.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !source.isEmpty, var components = URLComponents(string: source),
               let scheme = components.scheme?.lowercased(), ["http", "https"].contains(scheme),
               components.host?.isEmpty == false else {
             return nil
         }
+        var normalizedPath = components.path
+        while normalizedPath.last == "/" || normalizedPath.last == "\\" { normalizedPath.removeLast() }
+        components.path = normalizedPath
         components.fragment = nil
         return components
     }
@@ -466,12 +485,12 @@ private struct ChatCompletionPayload: Decodable {
 }
 
 private struct ResponsesPayload: Decodable {
-    struct Output: Decodable { let content: [Content] }
+    struct Output: Decodable { let content: [Content]? }
     struct Content: Decodable { let type: String; let text: String? }
     let output: [Output]
 
     var outputText: String {
-        output.flatMap(\.content)
+        output.flatMap { $0.content ?? [] }
             .filter { $0.type == "output_text" }
             .compactMap(\.text)
             .joined(separator: "\n")

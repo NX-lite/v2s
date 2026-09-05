@@ -85,6 +85,23 @@ import Testing
         #expect(response == .init(text: "gemini text", imageWasSent: true))
     }
 
+    @Test func responsesPayloadIgnoresNonTextOutputItems() async throws {
+        let payload = Data("""
+        {"output":[
+          {"type":"reasoning","summary":[]},
+          {"type":"message","content":[{"type":"output_text","text":"usable text"}]}
+        ]}
+        """.utf8)
+        let transport = StubHTTPTransport(stubs: [.init(status: 200, data: payload)])
+        let client = OpenAIResponsesClient(
+            apiKey: "test-placeholder-key", baseURLString: "https://example.invalid/v1/responses", model: "gpt-test", transport: transport
+        )
+
+        let response = try await client.respond(instructions: "System", prompt: "Question", screenshotPNGData: nil)
+
+        #expect(response == .init(text: "usable text", imageWasSent: false))
+    }
+
     @Test func modelDiscoveryFiltersUnsupportedGeminiModels() async throws {
         let payload = Data("""
         {"models":[
@@ -104,6 +121,73 @@ import Testing
 
         #expect(request.url?.path == "/v1beta/models")
         #expect(models == ["gemini-a", "gemini-z"])
+    }
+
+    @Test func geminiConcreteGenerateContentEndpointIsNotDuplicatedAndReplacesKey() async throws {
+        let payload = Data("""
+        {"candidates":[{"content":{"parts":[{"text":"gemini text"}]}}]}
+        """.utf8)
+        let transport = StubHTTPTransport(stubs: [.init(status: 200, data: payload)])
+        let client = OpenAIResponsesClient(
+            apiKey: "test-placeholder-key",
+            baseURLString: "https://generativelanguage.googleapis.com/v1beta/models/gemini-test:generateContent?key=old-key&alt=json",
+            model: "ignored-model",
+            transport: transport
+        )
+
+        _ = try await client.respond(instructions: "System", prompt: "Question", screenshotPNGData: nil)
+        let request = try #require(await transport.firstRequest())
+        let url = try #require(request.url)
+        let components = try #require(URLComponents(url: url, resolvingAgainstBaseURL: false))
+        let queryItems = components.queryItems ?? []
+
+        #expect(request.url?.path == "/v1beta/models/gemini-test:generateContent")
+        #expect(queryItems.filter { $0.name == "key" }.map(\.value) == ["test-placeholder-key"])
+        #expect(queryItems.first { $0.name == "alt" }?.value == "json")
+    }
+
+    @Test func geminiModelDiscoveryEndpointIsNotDuplicatedAndReplacesKey() async throws {
+        let payload = Data("""
+        {"models":[{"name":"models/gemini-a","supportedGenerationMethods":["generateContent"]}]}
+        """.utf8)
+        let transport = StubHTTPTransport(stubs: [.init(status: 200, data: payload)])
+        let client = OpenAIResponsesClient(
+            apiKey: "test-placeholder-key",
+            baseURLString: "https://generativelanguage.googleapis.com/v1beta/models?key=old-key&alt=json",
+            model: "gemini-a",
+            transport: transport
+        )
+
+        _ = try await client.fetchAvailableModels()
+        let request = try #require(await transport.firstRequest())
+        let url = try #require(request.url)
+        let components = try #require(URLComponents(url: url, resolvingAgainstBaseURL: false))
+        let queryItems = components.queryItems ?? []
+
+        #expect(request.url?.path == "/v1beta/models")
+        #expect(queryItems.filter { $0.name == "key" }.map(\.value) == ["test-placeholder-key"])
+        #expect(queryItems.first { $0.name == "alt" }?.value == "json")
+    }
+
+    @Test func openAIEndpointNormalizationPreservesQueryValuesEndingInSlash() async throws {
+        let payload = Data("""
+        {"output":[{"content":[{"type":"output_text","text":"response text"}]}]}
+        """.utf8)
+        let transport = StubHTTPTransport(stubs: [.init(status: 200, data: payload)])
+        let client = OpenAIResponsesClient(
+            apiKey: "test-placeholder-key",
+            baseURLString: "https://example.invalid/v1/responses?path=/",
+            model: "gpt-test",
+            transport: transport
+        )
+
+        _ = try await client.respond(instructions: "System", prompt: "Question", screenshotPNGData: nil)
+        let request = try #require(await transport.firstRequest())
+        let url = try #require(request.url)
+        let components = try #require(URLComponents(url: url, resolvingAgainstBaseURL: false))
+
+        #expect(request.url?.path == "/v1/responses")
+        #expect(components.queryItems?.first { $0.name == "path" }?.value == "/")
     }
 
     @Test func missingKeyFailsBeforeTransport() async {
@@ -173,6 +257,28 @@ import Testing
         }
     }
 
+    @Test func transportFailureDoesNotExposeGeminiRequestSecrets() async {
+        let client = OpenAIResponsesClient(
+            apiKey: "transport-secret",
+            baseURLString: "https://generativelanguage.googleapis.com/v1beta",
+            model: "gemini-test",
+            transport: ThrowingHTTPTransport()
+        )
+
+        do {
+            _ = try await client.respond(instructions: "instructions-secret", prompt: "body-secret", screenshotPNGData: nil)
+            Issue.record("Expected a sanitized client error")
+        } catch let error as OpenAIResponsesClient.ClientError {
+            #expect(error == .invalidResponse)
+            let description = error.errorDescription ?? ""
+            #expect(!description.contains("transport-secret"))
+            #expect(!description.localizedCaseInsensitiveContains("authorization"))
+            #expect(!description.contains("body-secret"))
+        } catch {
+            Issue.record("Expected ClientError, got \(error.localizedDescription)")
+        }
+    }
+
     private func chatResponse(_ text: String) -> Data {
         Data("{\"choices\":[{\"message\":{\"content\":\"\(text)\"}}]}".utf8)
     }
@@ -212,4 +318,21 @@ private actor StubHTTPTransport: HTTPTransport {
 
     func firstRequest() -> URLRequest? { requests.first }
     func requestCount() -> Int { requests.count }
+}
+
+private actor ThrowingHTTPTransport: HTTPTransport {
+    func data(for request: URLRequest) async throws -> (Data, HTTPURLResponse) {
+        let body = request.httpBody.flatMap { String(data: $0, encoding: .utf8) } ?? ""
+        throw URLLeakingTransportError("\(request.url?.absoluteString ?? "") Authorization: \(request.value(forHTTPHeaderField: "Authorization") ?? "") \(body)")
+    }
+}
+
+private struct URLLeakingTransportError: Error, LocalizedError {
+    let details: String
+
+    init(_ details: String) {
+        self.details = details
+    }
+
+    var errorDescription: String? { details }
 }
