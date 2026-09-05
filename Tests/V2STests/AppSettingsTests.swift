@@ -111,9 +111,9 @@ import Testing
           "gptAPIKey":"secret-placeholder","gptAPIBaseURL":"https://example.invalid/v1",
           "gptModel":"model-a","gptSkills":"Answer briefly",
           "autoDetectConversationLanguages":false,
-          "hotKeyFollowUp":{"key":"f","useCommand":true,"useOption":true,"useControl":false,"useShift":false},
-          "hotKeyAsk":{"key":"g","useCommand":true,"useOption":true,"useControl":false,"useShift":false},
-          "hotKeySwitchMode":{"key":"t","useCommand":true,"useOption":true,"useControl":false,"useShift":false}
+          "hotKeyFollowUp":{"key":"x","useCommand":false,"useOption":false,"useControl":true,"useShift":false},
+          "hotKeyAsk":{"key":"y","useCommand":true,"useOption":false,"useControl":false,"useShift":true},
+          "hotKeySwitchMode":{"key":"9","useCommand":false,"useOption":true,"useControl":true,"useShift":true}
         }
         """
 
@@ -124,7 +124,27 @@ import Testing
         #expect(settings.assistant.model == "model-a")
         #expect(settings.assistant.skills == "Answer briefly")
         #expect(!settings.assistant.autoDetectConversationLanguages)
-        #expect(settings.assistant.followUpHotKey == .defaultFollowUp)
+        #expect(settings.assistant.followUpHotKey == HotKeyBinding(
+            key: "x",
+            useCommand: false,
+            useOption: false,
+            useControl: true,
+            useShift: false
+        ))
+        #expect(settings.assistant.askHotKey == HotKeyBinding(
+            key: "y",
+            useCommand: true,
+            useOption: false,
+            useControl: false,
+            useShift: true
+        ))
+        #expect(settings.assistant.switchModeHotKey == HotKeyBinding(
+            key: "9",
+            useCommand: false,
+            useOption: true,
+            useControl: true,
+            useShift: true
+        ))
         #expect(settings.overlayStyle.invisibleInRecording)
     }
 
