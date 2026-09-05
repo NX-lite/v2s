@@ -231,21 +231,21 @@ struct OpenAIResponsesClient: Sendable {
     }
 
     private func successfulData(for request: URLRequest, apiKey: String) async throws -> Data {
+        let data: Data
+        let response: HTTPURLResponse
         do {
-            let (data, response) = try await transport.data(for: request)
-            guard (200..<300).contains(response.statusCode) else {
-                let message = Self.sanitizedErrorMessage(from: data, apiKey: apiKey) ?? "HTTP \(response.statusCode)"
-                if Self.isImageUnsupportedError(message) {
-                    throw ClientError.imageUnsupported(message: message)
-                }
-                throw ClientError.http(status: response.statusCode, message: message)
-            }
-            return data
-        } catch let error as ClientError {
-            throw error
+            (data, response) = try await transport.data(for: request)
         } catch {
             throw ClientError.invalidResponse
         }
+        guard (200..<300).contains(response.statusCode) else {
+            let message = Self.sanitizedErrorMessage(from: data, apiKey: apiKey) ?? "HTTP \(response.statusCode)"
+            if Self.isImageUnsupportedError(message) {
+                throw ClientError.imageUnsupported(message: message)
+            }
+            throw ClientError.http(status: response.statusCode, message: message)
+        }
+        return data
     }
 
     private enum OpenAIEndpoint {
@@ -255,20 +255,20 @@ struct OpenAIResponsesClient: Sendable {
 
     private func openAIEndpoint() throws -> OpenAIEndpoint {
         var components = try Self.requiredBaseComponents(from: baseURLString)
-        let parts = components.path.split(separator: "/").map(String.init)
+        let parts = components.percentEncodedPath.split(separator: "/").map(String.init)
         if parts.last == "responses" {
             return .responses(try Self.requiredURL(components))
         }
         if parts.suffix(2) == ["chat", "completions"] {
             return .chat(try Self.requiredURL(components))
         }
-        components.path = Self.appending(path: components.path, components: ["chat", "completions"])
+        components.percentEncodedPath = Self.appending(percentEncodedPath: components.percentEncodedPath, components: ["chat", "completions"])
         return .chat(try Self.requiredURL(components))
     }
 
     private func openAIModelsURL() throws -> URL {
         var components = try Self.requiredBaseComponents(from: baseURLString)
-        var parts = components.path.split(separator: "/").map(String.init)
+        var parts = components.percentEncodedPath.split(separator: "/").map(String.init)
         if parts.suffix(2) == ["chat", "completions"] {
             parts.removeLast(2)
         } else if parts.last == "responses" {
@@ -277,14 +277,14 @@ struct OpenAIResponsesClient: Sendable {
         if parts.last != "models" {
             parts.append("models")
         }
-        components.path = "/" + parts.joined(separator: "/")
+        components.percentEncodedPath = "/" + parts.joined(separator: "/")
         return try Self.requiredURL(components)
     }
 
     private func geminiModelsURL(apiKey: String) throws -> URL {
         var components = try Self.requiredBaseComponents(from: baseURLString)
-        if components.path.split(separator: "/").last != "models" {
-            components.path = Self.appending(path: components.path, components: ["models"])
+        if components.percentEncodedPath.split(separator: "/").last != "models" {
+            components.percentEncodedPath = Self.appending(percentEncodedPath: components.percentEncodedPath, components: ["models"])
         }
         Self.replaceAPIKey(in: &components, with: apiKey)
         return try Self.requiredURL(components)
@@ -292,7 +292,7 @@ struct OpenAIResponsesClient: Sendable {
 
     private func geminiGenerateContentURL(model: String, apiKey: String) throws -> URL {
         var components = try Self.requiredBaseComponents(from: baseURLString)
-        if components.path.split(separator: "/").last?.hasSuffix(":generateContent") == true {
+        if components.percentEncodedPath.split(separator: "/").last?.hasSuffix(":generateContent") == true {
             Self.replaceAPIKey(in: &components, with: apiKey)
             return try Self.requiredURL(components)
         }
@@ -318,9 +318,9 @@ struct OpenAIResponsesClient: Sendable {
               components.host?.isEmpty == false else {
             return nil
         }
-        var normalizedPath = components.path
-        while normalizedPath.last == "/" || normalizedPath.last == "\\" { normalizedPath.removeLast() }
-        components.path = normalizedPath
+        var normalizedPath = components.percentEncodedPath
+        while normalizedPath.last == "/" { normalizedPath.removeLast() }
+        components.percentEncodedPath = normalizedPath
         components.fragment = nil
         return components
     }
@@ -335,8 +335,8 @@ struct OpenAIResponsesClient: Sendable {
         return url
     }
 
-    private static func appending(path: String, components: [String]) -> String {
-        let existing = path.trimmingCharacters(in: CharacterSet(charactersIn: "/"))
+    private static func appending(percentEncodedPath: String, components: [String]) -> String {
+        let existing = percentEncodedPath.trimmingCharacters(in: CharacterSet(charactersIn: "/"))
         return "/" + ([existing] + components).filter { !$0.isEmpty }.joined(separator: "/")
     }
 

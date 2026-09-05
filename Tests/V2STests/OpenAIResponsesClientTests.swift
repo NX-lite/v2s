@@ -279,6 +279,42 @@ import Testing
         }
     }
 
+    @Test func transportClientErrorDoesNotExposeSecrets() async {
+        let client = OpenAIResponsesClient(
+            apiKey: "transport-secret",
+            baseURLString: "https://example.invalid/v1",
+            model: "gpt-test",
+            transport: ClientErrorThrowingHTTPTransport()
+        )
+
+        do {
+            _ = try await client.respond(instructions: "System", prompt: "Question", screenshotPNGData: nil)
+            Issue.record("Expected a sanitized client error")
+        } catch let error as OpenAIResponsesClient.ClientError {
+            #expect(error == .invalidResponse)
+            let description = error.errorDescription ?? ""
+            #expect(!description.contains("transport-secret"))
+            #expect(!description.localizedCaseInsensitiveContains("authorization"))
+        } catch {
+            Issue.record("Expected ClientError, got \(error.localizedDescription)")
+        }
+    }
+
+    @Test func openAIEndpointNormalizationPreservesEncodedPathSegments() async throws {
+        let transport = StubHTTPTransport(stubs: [.init(status: 200, data: chatResponse("hello"))])
+        let client = OpenAIResponsesClient(
+            apiKey: "test-placeholder-key",
+            baseURLString: "https://example.invalid/proxy%2Ftenant/v1/chat/completions",
+            model: "gpt-test",
+            transport: transport
+        )
+
+        _ = try await client.respond(instructions: "System", prompt: "Question", screenshotPNGData: nil)
+        let request = try #require(await transport.firstRequest())
+
+        #expect(request.url?.absoluteString.localizedCaseInsensitiveContains("/proxy%2Ftenant/v1/chat/completions") == true)
+    }
+
     private func chatResponse(_ text: String) -> Data {
         Data("{\"choices\":[{\"message\":{\"content\":\"\(text)\"}}]}".utf8)
     }
@@ -324,6 +360,12 @@ private actor ThrowingHTTPTransport: HTTPTransport {
     func data(for request: URLRequest) async throws -> (Data, HTTPURLResponse) {
         let body = request.httpBody.flatMap { String(data: $0, encoding: .utf8) } ?? ""
         throw URLLeakingTransportError("\(request.url?.absoluteString ?? "") Authorization: \(request.value(forHTTPHeaderField: "Authorization") ?? "") \(body)")
+    }
+}
+
+private actor ClientErrorThrowingHTTPTransport: HTTPTransport {
+    func data(for request: URLRequest) async throws -> (Data, HTTPURLResponse) {
+        throw OpenAIResponsesClient.ClientError.http(status: 400, message: "Authorization: Bearer transport-secret")
     }
 }
 
