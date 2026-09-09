@@ -12,6 +12,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     private var statusBarController: StatusBarController?
     private var settingsWindowController: SettingsWindowController?
     private var overlayWindowController: OverlayWindowController?
+    private var globalHotKeyController: GlobalHotKeyController?
     private var singleInstanceWakeObserver: NSObjectProtocol?
     private var singleInstanceLockDescriptor: Int32 = -1
     private var sourceRefreshTimer: Timer?
@@ -83,6 +84,33 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         self.statusBarController = statusBarController
         installSingleInstanceWakeObserver()
 
+        let globalHotKeyController = GlobalHotKeyController { [weak self] action in
+            guard let self else {
+                return
+            }
+            switch action {
+            case .followUp:
+                self.appModel.assistant.request(
+                    .followUp,
+                    snapshot: self.appModel.assistantTranscriptSnapshot()
+                )
+            case .ask:
+                self.appModel.assistant.request(
+                    .ask,
+                    snapshot: self.appModel.assistantTranscriptSnapshot()
+                )
+            case .switchMode:
+                self.appModel.assistant.toggleOverlayMode()
+            }
+        }
+        let currentHotKeys = AssistantHotKeyConfiguration(appModel.assistant.settings)
+        globalHotKeyController.update(
+            followUp: currentHotKeys.followUp,
+            ask: currentHotKeys.ask,
+            switchMode: currentHotKeys.switchMode
+        )
+        self.globalHotKeyController = globalHotKeyController
+
         overlayWindowController.trayIconRectProvider = { [weak self] in
             self?.statusBarController?.statusItemScreenRect
         }
@@ -93,6 +121,19 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             .removeDuplicates()
             .sink { [weak self] state in
                 self?.updateSourceRefreshTimer(for: state)
+            }
+            .store(in: &cancellables)
+
+        appModel.assistant.$settings
+            .map(AssistantHotKeyConfiguration.init)
+            .removeDuplicates()
+            .dropFirst()
+            .sink { [weak self] hotKeys in
+                self?.globalHotKeyController?.update(
+                    followUp: hotKeys.followUp,
+                    ask: hotKeys.ask,
+                    switchMode: hotKeys.switchMode
+                )
             }
             .store(in: &cancellables)
     }
@@ -386,6 +427,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 
     func applicationWillTerminate(_ notification: Notification) {
         appModel.assistant.cancelRequest()
+        globalHotKeyController?.invalidate()
+        globalHotKeyController = nil
         if let singleInstanceWakeObserver {
             DistributedNotificationCenter.default().removeObserver(singleInstanceWakeObserver)
             self.singleInstanceWakeObserver = nil
@@ -402,6 +445,18 @@ private struct SingleInstanceLockMetadata {
     let pid: Int32?
     let identifier: String?
     let path: String?
+}
+
+private struct AssistantHotKeyConfiguration: Equatable {
+    let followUp: HotKeyBinding
+    let ask: HotKeyBinding
+    let switchMode: HotKeyBinding
+
+    init(_ settings: AssistantSettings) {
+        followUp = settings.followUpHotKey
+        ask = settings.askHotKey
+        switchMode = settings.switchModeHotKey
+    }
 }
 
 private extension AppDelegate {
