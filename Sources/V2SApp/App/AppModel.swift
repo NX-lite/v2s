@@ -2172,8 +2172,9 @@ final class AppModel: ObservableObject {
         transcriptGeneration &+= 1
     }
 
-    // Internal test seams keep transcript production APIs read-only while allowing
-    // integration tests to assert the assistant snapshot bridge deterministically.
+    #if DEBUG
+    // Test seams keep transcript production APIs read-only while allowing integration
+    // tests to assert the assistant snapshot bridge deterministically.
     func replaceTranscriptEntriesForTesting(_ entries: [TranscriptEntry]) {
         transcriptEntries = entries
         transcriptGeneration &+= 1
@@ -2186,6 +2187,7 @@ final class AppModel: ObservableObject {
     ) {
         upsertTranscriptEntry(id: id, sourceText: sourceText, translatedText: translatedText)
     }
+    #endif
 
     var shouldReserveCommittedCaptionSlot: Bool {
         guard sessionState == .running else {
