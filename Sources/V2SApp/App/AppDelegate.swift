@@ -376,6 +376,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     }
 
     func applicationWillTerminate(_ notification: Notification) {
+        Self.cancelAssistantRequestForTermination(in: appModel)
         if let singleInstanceWakeObserver {
             DistributedNotificationCenter.default().removeObserver(singleInstanceWakeObserver)
             self.singleInstanceWakeObserver = nil
@@ -385,6 +386,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         sourceRefreshTimer = nil
         cancellables.removeAll()
         appModel.persistSettings()
+    }
+
+    static func cancelAssistantRequestForTermination(in model: AppModel) {
+        model.assistant.cancelRequest()
     }
 }
 

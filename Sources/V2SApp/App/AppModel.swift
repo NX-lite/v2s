@@ -32,6 +32,8 @@ private enum AppBuildInfo {
 final class AppModel: ObservableObject {
     private let settingsStore: SettingsStore
     private let sourceCatalogService: SourceCatalogService
+    let assistant: AssistantCoordinator
+    private var assistantSettingsCancellable: AnyCancellable?
     private let translationCoordinator = TranslationCoordinator()
     private let glossaryService = GlossaryService()
     private let speedMonitor = SpeedMonitor()
@@ -189,12 +191,14 @@ final class AppModel: ObservableObject {
 
     init(
         settingsStore: SettingsStore,
-        sourceCatalogService: SourceCatalogService
+        sourceCatalogService: SourceCatalogService,
+        assistant: AssistantCoordinator? = nil
     ) {
+        let settings = settingsStore.load()
         self.settingsStore = settingsStore
         self.sourceCatalogService = sourceCatalogService
+        self.assistant = assistant ?? AssistantCoordinator(settings: settings.assistant)
 
-        let settings = settingsStore.load()
         self.selectedSourceID = settings.selectedSourceID
         var initialSelectedSourceIDs = Set(settings.selectedSourceIDs)
         if initialSelectedSourceIDs.isEmpty, let selectedSourceID = settings.selectedSourceID {
@@ -232,6 +236,13 @@ final class AppModel: ObservableObject {
         }
         refreshSources()
         refreshSupportedLanguageOptions()
+
+        assistantSettingsCancellable = self.assistant.$settings
+            .dropFirst()
+            .removeDuplicates()
+            .sink { [weak self] assistantSettings in
+                self?.persistSettings(assistantSettings: assistantSettings)
+            }
     }
 
     convenience init() {
@@ -774,6 +785,7 @@ final class AppModel: ObservableObject {
     }
 
     func stopSession() {
+        assistant.cancelRequest()
         resetLiveTextPipeline()
         stopLiveTranscriptionSessions()
         sessionState = .idle
@@ -859,6 +871,10 @@ final class AppModel: ObservableObject {
     }
 
     func persistSettings() {
+        persistSettings(assistantSettings: assistant.settings)
+    }
+
+    private func persistSettings(assistantSettings: AssistantSettings) {
         guard isBootstrapping == false else {
             return
         }
@@ -874,7 +890,8 @@ final class AppModel: ObservableObject {
             overlayStyle: overlayStyle,
             subtitleMode: subtitleMode,
             subtitleDisplayMode: subtitleDisplayMode,
-            glossary: glossary
+            glossary: glossary,
+            assistant: assistantSettings
         )
 
         settingsStore.save(settings)
@@ -2126,6 +2143,23 @@ final class AppModel: ObservableObject {
         transcriptEntries.isEmpty == false
     }
 
+    func assistantTranscriptSnapshot() -> AssistantTranscriptSnapshot {
+        AssistantTranscriptSnapshot(
+            sourceName: selectedSourceDisplayName,
+            inputLanguageID: inputLanguageID,
+            inputLanguageName: languageName(for: inputLanguageID),
+            outputLanguageID: outputLanguageID,
+            outputLanguageName: languageName(for: outputLanguageID),
+            entries: transcriptEntries.map {
+                AssistantTranscriptEntry(
+                    timestamp: $0.timestamp,
+                    sourceText: $0.sourceText,
+                    translatedText: $0.translatedText
+                )
+            }
+        )
+    }
+
     func transcriptText(isTranslation: Bool) -> String {
         transcriptEntries
             .map { isTranslation ? $0.translatedText : $0.sourceText }
@@ -2136,6 +2170,21 @@ final class AppModel: ObservableObject {
     func clearTranscript() {
         transcriptEntries.removeAll()
         transcriptGeneration &+= 1
+    }
+
+    // Internal test seams keep transcript production APIs read-only while allowing
+    // integration tests to assert the assistant snapshot bridge deterministically.
+    func replaceTranscriptEntriesForTesting(_ entries: [TranscriptEntry]) {
+        transcriptEntries = entries
+        transcriptGeneration &+= 1
+    }
+
+    func upsertTranscriptEntryForTesting(
+        id: UUID,
+        sourceText: String,
+        translatedText: String
+    ) {
+        upsertTranscriptEntry(id: id, sourceText: sourceText, translatedText: translatedText)
     }
 
     var shouldReserveCommittedCaptionSlot: Bool {
@@ -2915,16 +2964,19 @@ final class AppModel: ObservableObject {
         sourceText: String,
         translatedText: String
     ) {
-        let entry = TranscriptEntry(
-            id: id,
-            sourceText: sourceText,
-            translatedText: translatedText
-        )
-
         if let existingIndex = transcriptEntries.firstIndex(where: { $0.id == id }) {
-            transcriptEntries[existingIndex] = entry
+            transcriptEntries[existingIndex] = TranscriptEntry(
+                id: id,
+                sourceText: sourceText,
+                translatedText: translatedText,
+                timestamp: transcriptEntries[existingIndex].timestamp
+            )
         } else {
-            transcriptEntries.append(entry)
+            transcriptEntries.append(TranscriptEntry(
+                id: id,
+                sourceText: sourceText,
+                translatedText: translatedText
+            ))
         }
     }
 
@@ -3241,6 +3293,7 @@ struct TranscriptEntry: Identifiable, Equatable {
     let id: UUID
     var sourceText: String
     var translatedText: String
+    var timestamp: Date = Date()
 }
 
 private struct SpeechLanguageCatalog {
