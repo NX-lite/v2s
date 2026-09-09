@@ -138,9 +138,14 @@ final class AssistantCoordinator: ObservableObject {
         removePendingReply()
         screenStatus = .unknown
 
-        guard hasRequiredConfiguration(settings) else {
+        guard hasValidConfiguration(settings) else {
             requestState = .failed("Assistant configuration is incomplete.")
             appendReply(action: action, text: "Assistant configuration is incomplete.")
+            return
+        }
+        guard hasConversationContent(snapshot) else {
+            requestState = .failed("No conversation context is available.")
+            appendReply(action: action, text: "No conversation context is available.")
             return
         }
 
@@ -239,12 +244,13 @@ final class AssistantCoordinator: ObservableObject {
         screenStatus = screenContext.status
 
         let prompt: AssistantPrompt
+        let currentTime = Date()
         do {
             prompt = try await promptBuilder.build(
                 action: action,
                 snapshot: snapshot,
                 settings: settings,
-                currentTime: Date(),
+                currentTime: currentTime,
                 hasScreenshot: screenContext.pngData != nil,
                 ocrText: screenContext.ocrText
             )
@@ -273,11 +279,26 @@ final class AssistantCoordinator: ObservableObject {
             }
 
             screenStatus = .providerRejectedImage
+            let fallbackPrompt: AssistantPrompt
+            do {
+                fallbackPrompt = try await promptBuilder.build(
+                    action: action,
+                    snapshot: snapshot,
+                    settings: settings,
+                    currentTime: currentTime,
+                    hasScreenshot: false,
+                    ocrText: screenContext.ocrText
+                )
+            } catch {
+                finishRequestFailure(error, action: action, generation: generation)
+                return
+            }
+            guard isCurrentRequest(generation) else { return }
             do {
                 let response = try await responder.respond(
                     settings: settings,
-                    instructions: prompt.instructions,
-                    prompt: prompt.userContent,
+                    instructions: fallbackPrompt.instructions,
+                    prompt: fallbackPrompt.userContent,
                     screenshotPNGData: nil
                 )
                 finishRequestSuccess(response, action: action, replyID: replyID, generation: generation)
@@ -296,7 +317,7 @@ final class AssistantCoordinator: ObservableObject {
         generation: Int
     ) {
         guard isCurrentRequest(generation) else { return }
-        if response.imageWasSent {
+        if response.imageWasSent, screenStatus.isWarning == false {
             screenStatus = .screenshotSent
         }
         replacePendingReply(id: replyID, action: action, text: response.text)
@@ -354,10 +375,23 @@ final class AssistantCoordinator: ObservableObject {
         clampReplyScrollOffset()
     }
 
-    private func hasRequiredConfiguration(_ settings: AssistantSettings) -> Bool {
-        settings.apiKey.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty == false
-            && settings.baseURL.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty == false
-            && settings.model.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty == false
+    private func hasValidConfiguration(_ settings: AssistantSettings) -> Bool {
+        guard settings.apiKey.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty == false,
+              settings.model.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty == false,
+              let endpoint = URLComponents(string: settings.baseURL.trimmingCharacters(in: .whitespacesAndNewlines)),
+              let scheme = endpoint.scheme?.lowercased(),
+              ["http", "https"].contains(scheme),
+              endpoint.host?.isEmpty == false else {
+            return false
+        }
+        return true
+    }
+
+    private func hasConversationContent(_ snapshot: AssistantTranscriptSnapshot) -> Bool {
+        snapshot.entries.contains { entry in
+            entry.sourceText.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty == false
+                || entry.translatedText.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty == false
+        }
     }
 
     private func userFacingMessage(for error: Error) -> String {

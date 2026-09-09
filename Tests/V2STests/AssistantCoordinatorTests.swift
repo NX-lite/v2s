@@ -58,9 +58,11 @@ import Testing
     @Test func imageUnsupportedRetriesExactlyOnceWithoutImage() async {
         let image = Data([0x89, 0x50, 0x4E, 0x47])
         let responder = ResponderFake(steps: [.imageUnsupported, .response("Text-only answer")])
+        let promptBuilder = PromptBuilderFake()
         let coordinator = makeCoordinator(
             responder: responder,
-            screen: ScreenContextFake(contexts: [.init(pngData: image, ocrText: "OCR", status: .ready)])
+            screen: ScreenContextFake(contexts: [.init(pngData: image, ocrText: "OCR", status: .ready)]),
+            promptBuilder: promptBuilder
         )
 
         coordinator.request(.followUp, snapshot: sampleSnapshot())
@@ -70,6 +72,31 @@ import Testing
         }
 
         #expect(await responder.screenshotArguments() == [image, nil])
+        #expect(await responder.prompts() == ["Image prompt with OCR", "Text-only prompt with OCR"])
+        #expect(await promptBuilder.calls() == [
+            .init(hasScreenshot: true, ocrText: "OCR"),
+            .init(hasScreenshot: false, ocrText: "OCR"),
+        ])
+        #expect(coordinator.screenStatus == .providerRejectedImage)
+    }
+
+    @Test func imageFallbackPromptFailurePublishesOneFailureWithoutRetry() async {
+        let responder = ResponderFake(steps: [.imageUnsupported, .response("unused")])
+        let promptBuilder = PromptBuilderFake(steps: [.prompt, .failure])
+        let coordinator = makeCoordinator(
+            responder: responder,
+            screen: ScreenContextFake(contexts: [.init(pngData: Data([0x01]), ocrText: "OCR", status: .ready)]),
+            promptBuilder: promptBuilder
+        )
+
+        coordinator.request(.ask, snapshot: sampleSnapshot())
+        await waitUntil {
+            if case .failed = coordinator.requestState { return true }
+            return false
+        }
+
+        #expect(await responder.callCount() == 1)
+        #expect(coordinator.replies.map(\.text) == ["Assistant request failed."])
         #expect(coordinator.screenStatus == .providerRejectedImage)
     }
 
@@ -132,6 +159,23 @@ import Testing
         #expect(coordinator.screenStatus.isWarning)
     }
 
+    @Test func OCRFailureRemainsWarningAfterSuccessfulImageResponse() async {
+        let responder = ResponderFake(steps: [.response("Image answer")])
+        let coordinator = makeCoordinator(
+            responder: responder,
+            screen: ScreenContextFake(contexts: [.init(pngData: Data([0x01]), ocrText: nil, status: .ocrFailed)])
+        )
+
+        coordinator.request(.ask, snapshot: sampleSnapshot())
+        await waitUntil {
+            coordinator.requestState == .idle
+                && coordinator.replies.map(\.text) == ["Image answer"]
+        }
+
+        #expect(coordinator.screenStatus == .ocrFailed)
+        #expect(coordinator.screenStatus.isWarning)
+    }
+
     @Test func replyScrollOffsetClampsAfterHistoryChanges() async {
         let responder = ResponderFake(steps: [.response("First"), .response("Second")])
         let coordinator = makeCoordinator(
@@ -179,6 +223,47 @@ import Testing
         #expect(await responder.callCount() == 0)
     }
 
+    @Test func invalidEndpointFailsBeforeScreenCapture() async {
+        var settings = configuredSettings()
+        settings.baseURL = "ftp://example.invalid/v1"
+        let responder = ResponderFake(steps: [.response("unused")])
+        let screen = ScreenContextFake(contexts: [readyScreenContext()])
+        let coordinator = AssistantCoordinator(
+            settings: settings,
+            responder: responder,
+            screenContextProvider: screen,
+            promptBuilder: PromptBuilderFake()
+        )
+
+        coordinator.request(.ask, snapshot: sampleSnapshot())
+        await drainTasks()
+
+        if case .failed = coordinator.requestState {
+            // Expected: invalid endpoints are rejected before screen capture starts.
+        } else {
+            Issue.record("Expected an invalid-endpoint failure")
+        }
+        #expect(await screen.callCount() == 0)
+        #expect(await responder.callCount() == 0)
+    }
+
+    @Test func emptyTranscriptFailsBeforeScreenCapture() async {
+        let responder = ResponderFake(steps: [.response("unused")])
+        let screen = ScreenContextFake(contexts: [readyScreenContext()])
+        let coordinator = makeCoordinator(responder: responder, screen: screen)
+
+        coordinator.request(.ask, snapshot: emptySnapshot())
+        await drainTasks()
+
+        if case .failed = coordinator.requestState {
+            // Expected: empty transcript context is rejected before screen capture starts.
+        } else {
+            Issue.record("Expected an empty-transcript failure")
+        }
+        #expect(await screen.callCount() == 0)
+        #expect(await responder.callCount() == 0)
+    }
+
     private func makeCoordinator(
         responder: ResponderFake,
         screen: ScreenContextFake,
@@ -215,6 +300,17 @@ import Testing
 
     private func readyScreenContext() -> ScreenContext {
         .init(pngData: Data([0x01]), ocrText: "Screen text", status: .ready)
+    }
+
+    private func emptySnapshot() -> AssistantTranscriptSnapshot {
+        AssistantTranscriptSnapshot(
+            sourceName: "Planning meeting",
+            inputLanguageID: "en",
+            inputLanguageName: "English",
+            outputLanguageID: "zh-Hans",
+            outputLanguageName: "Simplified Chinese",
+            entries: [.init(timestamp: .distantPast, sourceText: " \n ", translatedText: "\t")]
+        )
     }
 
     private func waitForCalls(_ responder: ResponderFake, expected: Int) async {
@@ -262,6 +358,13 @@ private actor ScreenContextFake: AssistantScreenContextProviding {
 }
 
 private actor PromptBuilderFake: AssistantPromptBuilding {
+    private var steps: [Step]
+    private var recordedCalls: [Call] = []
+
+    init(steps: [Step] = []) {
+        self.steps = steps
+    }
+
     func build(
         action: AssistantAction,
         snapshot: AssistantTranscriptSnapshot,
@@ -270,13 +373,40 @@ private actor PromptBuilderFake: AssistantPromptBuilding {
         hasScreenshot: Bool,
         ocrText: String?
     ) async throws -> AssistantPrompt {
-        .init(instructions: "Test instructions", userContent: "Test prompt")
+        recordedCalls.append(.init(hasScreenshot: hasScreenshot, ocrText: ocrText))
+        let step = steps.isEmpty ? .prompt : steps.removeFirst()
+        switch step {
+        case .prompt:
+            return .init(
+                instructions: "Test instructions",
+                userContent: hasScreenshot ? "Image prompt with \(ocrText ?? "no OCR")" : "Text-only prompt with \(ocrText ?? "no OCR")"
+            )
+        case .failure:
+            throw BuildFailure.failed
+        }
+    }
+
+    func calls() -> [Call] { recordedCalls }
+
+    struct Call: Equatable, Sendable {
+        let hasScreenshot: Bool
+        let ocrText: String?
+    }
+
+    enum Step: Sendable {
+        case prompt
+        case failure
+    }
+
+    enum BuildFailure: Error, Sendable {
+        case failed
     }
 }
 
 private actor ResponderFake: AssistantResponding {
     private var steps: [Step]
     private var images: [Data?] = []
+    private var receivedPrompts: [String] = []
     private var heldContinuations: [CheckedContinuation<OpenAIResponsesClient.Response, Error>] = []
 
     init(steps: [Step]) {
@@ -298,6 +428,7 @@ private actor ResponderFake: AssistantResponding {
         screenshotPNGData: Data?
     ) async throws -> OpenAIResponsesClient.Response {
         images.append(screenshotPNGData)
+        receivedPrompts.append(prompt)
         let step = steps.isEmpty ? .failure : steps.removeFirst()
         switch step {
         case .response(let text):
@@ -321,6 +452,7 @@ private actor ResponderFake: AssistantResponding {
 
     func callCount() -> Int { images.count }
     func screenshotArguments() -> [Data?] { images }
+    func prompts() -> [String] { receivedPrompts }
 
     enum Step: Sendable {
         case response(String)
