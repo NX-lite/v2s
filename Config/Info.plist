@@ -30,6 +30,8 @@
 	<string>v2s captures audio from other apps to generate live subtitles.</string>
 	<key>NSMicrophoneUsageDescription</key>
 	<string>v2s uses the microphone to generate subtitles from live speech.</string>
+	<key>NSScreenCaptureUsageDescription</key>
+	<string>v2s captures screen context only after an explicit Follow Up or Ask assistant request.</string>
 	<key>NSSpeechRecognitionUsageDescription</key>
 	<string>v2s uses speech recognition to transcribe audio into subtitles.</string>
 </dict>
