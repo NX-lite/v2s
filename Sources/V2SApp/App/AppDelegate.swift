@@ -4,7 +4,7 @@ import Darwin
 
 @MainActor
 final class AppDelegate: NSObject, NSApplicationDelegate {
-    private let appModel = AppModel()
+    private let appModel: AppModel
     private let updaterService = UpdaterService()
     private let launchAtLoginService = LaunchAtLoginService()
     private let dockVisibilityController = DockVisibilityController()
@@ -16,6 +16,15 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     private var singleInstanceLockDescriptor: Int32 = -1
     private var sourceRefreshTimer: Timer?
     private var cancellables = Set<AnyCancellable>()
+
+    override convenience init() {
+        self.init(appModel: AppModel())
+    }
+
+    init(appModel: AppModel) {
+        self.appModel = appModel
+        super.init()
+    }
 
     func applicationDidFinishLaunching(_ notification: Notification) {
         if acquireSingleInstanceLock() == false {
@@ -376,7 +385,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     }
 
     func applicationWillTerminate(_ notification: Notification) {
-        Self.cancelAssistantRequestForTermination(in: appModel)
+        appModel.assistant.cancelRequest()
         if let singleInstanceWakeObserver {
             DistributedNotificationCenter.default().removeObserver(singleInstanceWakeObserver)
             self.singleInstanceWakeObserver = nil
@@ -386,10 +395,6 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         sourceRefreshTimer = nil
         cancellables.removeAll()
         appModel.persistSettings()
-    }
-
-    static func cancelAssistantRequestForTermination(in model: AppModel) {
-        model.assistant.cancelRequest()
     }
 }
 

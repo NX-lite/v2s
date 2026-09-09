@@ -167,7 +167,7 @@ import Testing
         #expect(model.assistant.replies.isEmpty)
     }
 
-    @Test func terminationHelperCancelsAnInFlightAssistantRequest() async {
+    @Test func applicationTerminationCancelsAnInFlightAssistantRequest() async {
         let settingsURL = makeSettingsURL()
         defer { try? FileManager.default.removeItem(at: settingsURL) }
 
@@ -187,7 +187,8 @@ import Testing
         model.assistant.request(.followUp, snapshot: model.assistantTranscriptSnapshot())
         await waitForCall(on: responder)
 
-        AppDelegate.cancelAssistantRequestForTermination(in: model)
+        let delegate = AppDelegate(appModel: model)
+        delegate.applicationWillTerminate(Notification(name: .init("test.termination")))
         #expect(model.assistant.requestState == .idle)
         #expect(model.assistant.replies.isEmpty)
 
