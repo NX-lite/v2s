@@ -82,7 +82,7 @@ struct AssistantPromptBuilderAdapter: AssistantPromptBuilding {
         hasScreenshot: Bool,
         ocrText: String?
     ) async throws -> AssistantPrompt {
-        try builder.build(
+        builder.build(
             action: action,
             snapshot: snapshot,
             settings: settings,
@@ -143,12 +143,6 @@ final class AssistantCoordinator: ObservableObject {
             appendReply(action: action, text: "Assistant configuration is incomplete.")
             return
         }
-        guard hasConversationContent(snapshot) else {
-            requestState = .failed("No conversation context is available.")
-            appendReply(action: action, text: "No conversation context is available.")
-            return
-        }
-
         requestState = .running(action)
         let generation = requestGeneration
         let requestSettings = settings
@@ -387,19 +381,9 @@ final class AssistantCoordinator: ObservableObject {
         return true
     }
 
-    private func hasConversationContent(_ snapshot: AssistantTranscriptSnapshot) -> Bool {
-        snapshot.entries.contains { entry in
-            entry.sourceText.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty == false
-                || entry.translatedText.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty == false
-        }
-    }
-
     private func userFacingMessage(for error: Error) -> String {
         if let clientError = error as? OpenAIResponsesClient.ClientError {
             return clientError.errorDescription ?? "Assistant request failed."
-        }
-        if error is AssistantPromptBuilder.BuildError {
-            return "No conversation context is available."
         }
         return "Assistant request failed."
     }

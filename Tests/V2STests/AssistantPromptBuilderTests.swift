@@ -19,7 +19,7 @@ import Testing
         )
         let currentTime = Date(timeIntervalSince1970: 120)
 
-        let first = try builder.build(
+        let first = builder.build(
             action: .ask,
             snapshot: snapshot,
             settings: settings,
@@ -27,7 +27,7 @@ import Testing
             hasScreenshot: true,
             ocrText: "  Screen title  "
         )
-        let second = try builder.build(
+        let second = builder.build(
             action: .ask,
             snapshot: snapshot,
             settings: settings,
@@ -66,13 +66,13 @@ import Testing
         #expect(first.instructions.contains("For Ask"))
     }
 
-    @Test func followUpUsesDistinctActionInstruction() throws {
+    @Test func followUpUsesDistinctActionInstruction() {
         let builder = AssistantPromptBuilder()
         let snapshot = sampleSnapshot()
         let settings = settings(skills: "", autoDetect: false)
 
-        let ask = try builder.build(action: .ask, snapshot: snapshot, settings: settings, currentTime: Date(timeIntervalSince1970: 120), hasScreenshot: false, ocrText: nil)
-        let followUp = try builder.build(action: .followUp, snapshot: snapshot, settings: settings, currentTime: Date(timeIntervalSince1970: 120), hasScreenshot: false, ocrText: nil)
+        let ask = builder.build(action: .ask, snapshot: snapshot, settings: settings, currentTime: Date(timeIntervalSince1970: 120), hasScreenshot: false, ocrText: nil)
+        let followUp = builder.build(action: .followUp, snapshot: snapshot, settings: settings, currentTime: Date(timeIntervalSince1970: 120), hasScreenshot: false, ocrText: nil)
 
         #expect(ask.instructions != followUp.instructions)
         #expect(ask.userContent != followUp.userContent)
@@ -82,9 +82,9 @@ import Testing
         #expect(ask.instructions.contains("For Ask"))
     }
 
-    @Test func noOCRDoesNotEmitOCRSection() throws {
+    @Test func noOCRDoesNotEmitOCRSection() {
         let builder = AssistantPromptBuilder()
-        let prompt = try builder.build(
+        let prompt = builder.build(
             action: .ask,
             snapshot: sampleSnapshot(),
             settings: settings(skills: "", autoDetect: false),
@@ -97,8 +97,8 @@ import Testing
         #expect(prompt.userContent.contains("An image is attached to this request."))
     }
 
-    @Test func emptyTranscriptThrowsBeforeAnyProviderWork() {
-        let emptySnapshot = AssistantTranscriptSnapshot(
+    @Test func emptyTranscriptUsesExplicitPlaceholder() {
+        let whitespaceOnlySnapshot = AssistantTranscriptSnapshot(
             sourceName: "Silent Source",
             inputLanguageID: "en",
             inputLanguageName: "English",
@@ -109,20 +109,43 @@ import Testing
                 AssistantTranscriptEntry(timestamp: .distantFuture, sourceText: "\t", translatedText: " "),
             ]
         )
+        let emptyEntriesSnapshot = AssistantTranscriptSnapshot(
+            sourceName: "Silent Source",
+            inputLanguageID: "en",
+            inputLanguageName: "English",
+            outputLanguageID: "zh-Hans",
+            outputLanguageName: "Simplified Chinese",
+            entries: []
+        )
+        let builder = AssistantPromptBuilder()
 
-        #expect(throws: AssistantPromptBuilder.BuildError.emptyTranscript) {
-            try AssistantPromptBuilder().build(
-                action: .ask,
-                snapshot: emptySnapshot,
-                settings: settings(skills: "", autoDetect: false),
-                currentTime: Date(timeIntervalSince1970: 120),
-                hasScreenshot: false,
-                ocrText: nil
-            )
-        }
+        let imagePrompt = builder.build(
+            action: .followUp,
+            snapshot: emptyEntriesSnapshot,
+            settings: settings(skills: "", autoDetect: false),
+            currentTime: Date(timeIntervalSince1970: 120),
+            hasScreenshot: true,
+            ocrText: "  Visible window title  "
+        )
+        let textOnlyPrompt = builder.build(
+            action: .ask,
+            snapshot: whitespaceOnlySnapshot,
+            settings: settings(skills: "", autoDetect: false),
+            currentTime: Date(timeIntervalSince1970: 120),
+            hasScreenshot: false,
+            ocrText: nil
+        )
+
+        #expect(imagePrompt.userContent.contains("Previous conversation content:\n(No transcript yet.)"))
+        #expect(imagePrompt.userContent.contains("An image is attached to this request."))
+        #expect(imagePrompt.userContent.contains("Screen text (OCR):\nVisible window title"))
+        #expect(imagePrompt.userContent.contains("Follow Up: provide a natural next response"))
+        #expect(textOnlyPrompt.userContent.contains("Previous conversation content:\n(No transcript yet.)"))
+        #expect(textOnlyPrompt.userContent.contains("No image is attached to this request."))
+        #expect(textOnlyPrompt.userContent.contains("Ask: answer the explicit or likely question"))
     }
 
-    @Test func singleSidedEntryUsesDashAndAutoDetectSettingChangesInstructions() throws {
+    @Test func singleSidedEntryUsesDashAndAutoDetectSettingChangesInstructions() {
         let snapshot = AssistantTranscriptSnapshot(
             sourceName: "Team Standup",
             inputLanguageID: "en",
@@ -132,8 +155,8 @@ import Testing
             entries: [AssistantTranscriptEntry(timestamp: Date(timeIntervalSince1970: 0), sourceText: "Only source", translatedText: " ")]
         )
         let builder = AssistantPromptBuilder()
-        let detected = try builder.build(action: .ask, snapshot: snapshot, settings: settings(skills: "", autoDetect: true), currentTime: Date(timeIntervalSince1970: 120), hasScreenshot: false, ocrText: nil)
-        let configured = try builder.build(action: .ask, snapshot: snapshot, settings: settings(skills: "", autoDetect: false), currentTime: Date(timeIntervalSince1970: 120), hasScreenshot: false, ocrText: nil)
+        let detected = builder.build(action: .ask, snapshot: snapshot, settings: settings(skills: "", autoDetect: true), currentTime: Date(timeIntervalSince1970: 120), hasScreenshot: false, ocrText: nil)
+        let configured = builder.build(action: .ask, snapshot: snapshot, settings: settings(skills: "", autoDetect: false), currentTime: Date(timeIntervalSince1970: 120), hasScreenshot: false, ocrText: nil)
 
         #expect(detected.userContent.contains("translation: -"))
         #expect(detected.instructions.contains("Automatically detect the conversation languages"))

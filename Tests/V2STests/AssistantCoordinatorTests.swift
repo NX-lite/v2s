@@ -247,21 +247,48 @@ import Testing
         #expect(await responder.callCount() == 0)
     }
 
-    @Test func emptyTranscriptFailsBeforeScreenCapture() async {
-        let responder = ResponderFake(steps: [.response("unused")])
+    @Test func emptyTranscriptStillCapturesAndRequests() async {
+        let responder = ResponderFake(steps: [.response("Empty-context answer")])
         let screen = ScreenContextFake(contexts: [readyScreenContext()])
-        let coordinator = makeCoordinator(responder: responder, screen: screen)
+        let coordinator = AssistantCoordinator(
+            settings: configuredSettings(),
+            responder: responder,
+            screenContextProvider: screen,
+            promptBuilder: AssistantPromptBuilderAdapter()
+        )
 
         coordinator.request(.ask, snapshot: emptySnapshot())
-        await drainTasks()
-
-        if case .failed = coordinator.requestState {
-            // Expected: empty transcript context is rejected before screen capture starts.
-        } else {
-            Issue.record("Expected an empty-transcript failure")
+        await waitUntil {
+            coordinator.requestState == .idle
+                && coordinator.replies.map(\.text) == ["Empty-context answer"]
         }
-        #expect(await screen.callCount() == 0)
-        #expect(await responder.callCount() == 0)
+
+        #expect(await screen.callCount() == 1)
+        #expect(await responder.callCount() == 1)
+        #expect(await responder.prompts().first?.contains("(No transcript yet.)") == true)
+        #expect(await responder.screenshotArguments() == [Data([0x01])])
+    }
+
+    @Test func emptyTranscriptPermissionDenialStillSendsTextOnlyRequest() async {
+        let responder = ResponderFake(steps: [.response("Text-only empty-context answer")])
+        let screen = ScreenContextFake(contexts: [.init(pngData: nil, ocrText: nil, status: .permissionNeeded)])
+        let coordinator = AssistantCoordinator(
+            settings: configuredSettings(),
+            responder: responder,
+            screenContextProvider: screen,
+            promptBuilder: AssistantPromptBuilderAdapter()
+        )
+
+        coordinator.request(.followUp, snapshot: emptySnapshot())
+        await waitUntil {
+            coordinator.requestState == .idle
+                && coordinator.replies.map(\.text) == ["Text-only empty-context answer"]
+        }
+
+        #expect(await screen.callCount() == 1)
+        #expect(await responder.screenshotArguments() == [nil])
+        #expect(await responder.prompts().first?.contains("(No transcript yet.)") == true)
+        #expect(coordinator.screenStatus == .permissionNeeded)
     }
 
     private func makeCoordinator(

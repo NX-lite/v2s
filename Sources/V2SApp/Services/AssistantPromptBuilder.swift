@@ -1,10 +1,6 @@
 import Foundation
 
 struct AssistantPromptBuilder {
-    enum BuildError: Error, Equatable {
-        case emptyTranscript
-    }
-
     func build(
         action: AssistantAction,
         snapshot: AssistantTranscriptSnapshot,
@@ -12,11 +8,11 @@ struct AssistantPromptBuilder {
         currentTime: Date,
         hasScreenshot: Bool,
         ocrText: String?
-    ) throws -> AssistantPrompt {
+    ) -> AssistantPrompt {
         let transcriptLines = snapshot.entries.map(transcriptLine)
-        guard snapshot.entries.contains(where: hasConversationContent) else {
-            throw BuildError.emptyTranscript
-        }
+        let transcript = snapshot.entries.contains(where: hasConversationContent)
+            ? transcriptLines.joined(separator: "\n")
+            : "(No transcript yet.)"
 
         var instructions = """
         You are an on-screen conversation assistant for v2s. Use the transcript, timing, source name, and screenshot context together. Be concise, practical, and preserve names and technical terms.
@@ -42,7 +38,7 @@ struct AssistantPromptBuilder {
         Output language: \(snapshot.outputLanguageName) (\(snapshot.outputLanguageID))
 
         Previous conversation content:
-        \(transcriptLines.joined(separator: "\n"))
+        \(transcript)
 
         \(hasScreenshot ? "An image is attached to this request." : "No image is attached to this request.")
         """
