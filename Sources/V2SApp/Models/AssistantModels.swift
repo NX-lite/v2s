@@ -10,6 +10,26 @@ enum OverlayViewMode: Equatable, Sendable {
     case assistantReplies
 }
 
+enum AssistantRequestState: Equatable, Sendable {
+    case idle
+    case running(AssistantAction)
+    case failed(String)
+}
+
+enum AssistantModelFetchState: Equatable, Sendable {
+    case idle
+    case fetching
+    case fetched([String])
+    case failed(String)
+}
+
+enum AssistantAPITestState: Equatable, Sendable {
+    case idle
+    case testing
+    case passed(String)
+    case failed(String)
+}
+
 struct AssistantTranscriptEntry: Equatable, Sendable {
     let timestamp: Date
     let sourceText: String
