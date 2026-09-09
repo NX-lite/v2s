@@ -13,8 +13,8 @@ import Testing
             outputLanguageID: "zh-Hans",
             outputLanguageName: "Simplified Chinese",
             entries: [
-                AssistantTranscriptEntry(timestamp: Date(timeIntervalSince1970: 0), sourceText: " Hello ", translatedText: " 你好 "),
-                AssistantTranscriptEntry(timestamp: Date(timeIntervalSince1970: 60), sourceText: "Next step?", translatedText: "下一步？"),
+                AssistantTranscriptEntry(timestamp: Date(timeIntervalSince1970: 60), sourceText: " Hello ", translatedText: " 你好 "),
+                AssistantTranscriptEntry(timestamp: Date(timeIntervalSince1970: 0), sourceText: "Next step?", translatedText: "下一步？"),
             ]
         )
         let currentTime = Date(timeIntervalSince1970: 120)
@@ -38,15 +38,28 @@ import Testing
 
         #expect(first == second)
         #expect(first.userContent.contains("Current time: 1970-01-01T00:02:00Z"))
-        #expect(first.userContent.contains("1970-01-01T00:00:00Z"))
         #expect(first.userContent.contains("1970-01-01T00:01:00Z"))
         #expect(first.userContent.contains("Source name: Team Standup"))
         #expect(first.userContent.contains("Input language: English (en)"))
         #expect(first.userContent.contains("Output language: Simplified Chinese (zh-Hans)"))
-        #expect(first.userContent.contains("original: Hello"))
-        #expect(first.userContent.contains("translation: 你好"))
-        #expect(first.userContent.contains("original: Next step?"))
-        #expect(first.userContent.contains("translation: 下一步？"))
+        let transcriptAndSuffix = try #require(
+            first.userContent
+                .components(separatedBy: "Previous conversation content:\n")
+                .last
+        )
+        let transcript = try #require(
+            transcriptAndSuffix
+                .components(separatedBy: "\n\nAn image is attached to this request.")
+                .first
+        )
+        #expect(transcript == """
+        - time: 1970-01-01T00:01:00Z
+          original: Hello
+          translation: 你好
+        - time: 1970-01-01T00:00:00Z
+          original: Next step?
+          translation: 下一步？
+        """)
         #expect(first.userContent.contains("An image is attached to this request."))
         #expect(first.userContent.contains("Screen text (OCR):\nScreen title"))
         #expect(first.instructions.contains("User skills/instructions:\nPrefer concise answers."))
