@@ -62,25 +62,31 @@ struct OpenAIResponsesClient: Sendable {
         ).text
     }
 
+    func validateRequestConfiguration() throws {
+        _ = try validatedRequestConfiguration()
+    }
+
     func respond(instructions: String, prompt: String, screenshotPNGData: Data?) async throws -> Response {
-        let key = try validatedAPIKey()
-        let resolvedModel = try validatedModel()
-        if isGeminiProvider {
+        let configuration = try validatedRequestConfiguration()
+        switch configuration.endpoint {
+        case .gemini(let url):
             return try await respondGemini(
-                apiKey: key,
-                model: resolvedModel,
+                url: url,
+                apiKey: configuration.apiKey,
+                instructions: instructions,
+                prompt: prompt,
+                screenshotPNGData: screenshotPNGData
+            )
+        case .openAI(let endpoint):
+            return try await respondOpenAI(
+                endpoint: endpoint,
+                apiKey: configuration.apiKey,
+                model: configuration.model,
                 instructions: instructions,
                 prompt: prompt,
                 screenshotPNGData: screenshotPNGData
             )
         }
-        return try await respondOpenAI(
-            apiKey: key,
-            model: resolvedModel,
-            instructions: instructions,
-            prompt: prompt,
-            screenshotPNGData: screenshotPNGData
-        )
     }
 
     private var isGeminiProvider: Bool {
@@ -91,6 +97,7 @@ struct OpenAIResponsesClient: Sendable {
     private func validatedAPIKey() throws -> String {
         let key = apiKey.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !key.isEmpty else { throw ClientError.missingAPIKey }
+        guard !key.contains(where: \.isNewline) else { throw ClientError.invalidRequest }
         return key
     }
 
@@ -103,13 +110,13 @@ struct OpenAIResponsesClient: Sendable {
     }
 
     private func respondOpenAI(
+        endpoint: OpenAIEndpoint,
         apiKey: String,
         model: String,
         instructions: String,
         prompt: String,
         screenshotPNGData: Data?
     ) async throws -> Response {
-        let endpoint = try openAIEndpoint()
         let request: URLRequest
         switch endpoint {
         case .chat(let url):
@@ -135,13 +142,12 @@ struct OpenAIResponsesClient: Sendable {
     }
 
     private func respondGemini(
+        url: URL,
         apiKey: String,
-        model: String,
         instructions: String,
         prompt: String,
         screenshotPNGData: Data?
     ) async throws -> Response {
-        let url = try geminiGenerateContentURL(model: model, apiKey: apiKey)
         let parts = [GeminiPart(text: prompt)] + (screenshotPNGData.map { [GeminiPart(inlineData: .init(mimeType: "image/png", data: $0.base64EncodedString()))] } ?? [])
         let body = GeminiGenerateContentRequest(
             systemInstruction: .init(parts: [.init(text: instructions)]),
@@ -248,6 +254,11 @@ struct OpenAIResponsesClient: Sendable {
         return data
     }
 
+    private enum RequestEndpoint {
+        case openAI(OpenAIEndpoint)
+        case gemini(URL)
+    }
+
     private enum OpenAIEndpoint {
         case chat(URL)
         case responses(URL)
@@ -257,6 +268,19 @@ struct OpenAIResponsesClient: Sendable {
         case root([String])
         case models([String])
         case generateContent([String])
+    }
+
+    private func validatedRequestConfiguration() throws -> (apiKey: String, model: String, endpoint: RequestEndpoint) {
+        let key = try validatedAPIKey()
+        let resolvedModel = try validatedModel()
+        if isGeminiProvider {
+            return (
+                apiKey: key,
+                model: resolvedModel,
+                endpoint: .gemini(try geminiGenerateContentURL(model: resolvedModel, apiKey: key))
+            )
+        }
+        return (apiKey: key, model: resolvedModel, endpoint: .openAI(try openAIEndpoint()))
     }
 
     private func openAIEndpoint() throws -> OpenAIEndpoint {

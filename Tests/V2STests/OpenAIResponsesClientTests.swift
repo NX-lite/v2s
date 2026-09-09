@@ -3,6 +3,57 @@ import Testing
 @testable import v2s
 
 @Suite struct OpenAIResponsesClientTests {
+    @Test func requestConfigurationRejectsNewlineModelAndAPIKeyWithoutTransport() async {
+        let invalidModelTransport = StubHTTPTransport(stubs: [])
+        let invalidModelClient = OpenAIResponsesClient(
+            apiKey: "test-placeholder-key",
+            baseURLString: "https://example.invalid/v1",
+            model: "gpt-test\nmalicious",
+            transport: invalidModelTransport
+        )
+
+        #expect(throws: OpenAIResponsesClient.ClientError.invalidRequest) {
+            try invalidModelClient.validateRequestConfiguration()
+        }
+        #expect(await invalidModelTransport.requestCount() == 0)
+
+        let injectedKey = "header-secret\r\nX-Injected: true"
+        let invalidKeyTransport = StubHTTPTransport(stubs: [])
+        let invalidKeyClient = OpenAIResponsesClient(
+            apiKey: injectedKey,
+            baseURLString: "https://example.invalid/v1",
+            model: "gpt-test",
+            transport: invalidKeyTransport
+        )
+
+        do {
+            try invalidKeyClient.validateRequestConfiguration()
+            Issue.record("Expected a malformed API-key error")
+        } catch let error as OpenAIResponsesClient.ClientError {
+            #expect(error == .invalidRequest)
+            #expect(!(error.errorDescription ?? "").contains(injectedKey))
+        } catch {
+            Issue.record("Expected ClientError, got \(error)")
+        }
+        #expect(await invalidKeyTransport.requestCount() == 0)
+    }
+
+    @Test func requestConfigurationAcceptsOpenAIAndGeminiEndpoints() throws {
+        let openAIClient = OpenAIResponsesClient(
+            apiKey: "test-placeholder-key",
+            baseURLString: "https://example.invalid/v1/responses",
+            model: "gpt-test"
+        )
+        let geminiClient = OpenAIResponsesClient(
+            apiKey: "test-placeholder-key",
+            baseURLString: "https://generativelanguage.googleapis.com/v1beta",
+            model: "gemini-test"
+        )
+
+        try openAIClient.validateRequestConfiguration()
+        try geminiClient.validateRequestConfiguration()
+    }
+
     @Test func openAIRequestUsesNormalizedChatEndpointAndBearerHeader() async throws {
         let transport = StubHTTPTransport(stubs: [.init(status: 200, data: chatResponse("hello"))])
         let client = OpenAIResponsesClient(

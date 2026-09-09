@@ -2,6 +2,7 @@ import Combine
 import Foundation
 
 protocol AssistantResponding: Sendable {
+    func validateRequestConfiguration(settings: AssistantSettings) throws
     func fetchAvailableModels(settings: AssistantSettings) async throws -> [String]
     func testConnection(settings: AssistantSettings) async throws -> String
     func respond(
@@ -32,6 +33,10 @@ struct OpenAIResponsesAssistantResponder: AssistantResponding {
 
     init(transport: any HTTPTransport = URLSessionHTTPTransport()) {
         self.transport = transport
+    }
+
+    func validateRequestConfiguration(settings: AssistantSettings) throws {
+        try client(for: settings).validateRequestConfiguration()
     }
 
     func fetchAvailableModels(settings: AssistantSettings) async throws -> [String] {
@@ -138,9 +143,12 @@ final class AssistantCoordinator: ObservableObject {
         removePendingReply()
         screenStatus = .unknown
 
-        guard hasValidConfiguration(settings) else {
-            requestState = .failed("Assistant configuration is incomplete.")
-            appendReply(action: action, text: "Assistant configuration is incomplete.")
+        do {
+            try responder.validateRequestConfiguration(settings: settings)
+        } catch {
+            let message = userFacingMessage(for: error)
+            requestState = .failed(message)
+            appendReply(action: action, text: message)
             return
         }
         requestState = .running(action)
@@ -367,18 +375,6 @@ final class AssistantCoordinator: ObservableObject {
         replies.removeAll { $0.id == pendingReplyID }
         self.pendingReplyID = nil
         clampReplyScrollOffset()
-    }
-
-    private func hasValidConfiguration(_ settings: AssistantSettings) -> Bool {
-        guard settings.apiKey.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty == false,
-              settings.model.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty == false,
-              let endpoint = URLComponents(string: settings.baseURL.trimmingCharacters(in: .whitespacesAndNewlines)),
-              let scheme = endpoint.scheme?.lowercased(),
-              ["http", "https"].contains(scheme),
-              endpoint.host?.isEmpty == false else {
-            return false
-        }
-        return true
     }
 
     private func userFacingMessage(for error: Error) -> String {

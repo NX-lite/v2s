@@ -247,6 +247,52 @@ import Testing
         #expect(await responder.callCount() == 0)
     }
 
+    @Test func newlineModelFailsBeforeScreenCapture() async {
+        var settings = configuredSettings()
+        settings.model = "gpt-test\nmalicious"
+        let responder = ResponderFake(steps: [.response("unused")])
+        let screen = ScreenContextFake(contexts: [readyScreenContext()])
+        let coordinator = AssistantCoordinator(
+            settings: settings,
+            responder: responder,
+            screenContextProvider: screen,
+            promptBuilder: PromptBuilderFake()
+        )
+
+        coordinator.request(.ask, snapshot: sampleSnapshot())
+
+        if case .failed = coordinator.requestState {
+            // Expected: malformed models are rejected before screen capture starts.
+        } else {
+            Issue.record("Expected a malformed-model failure")
+        }
+        #expect(await screen.callCount() == 0)
+        #expect(await responder.callCount() == 0)
+    }
+
+    @Test func newlineAPIKeyFailsBeforeScreenCapture() async {
+        var settings = configuredSettings()
+        settings.apiKey = "header-secret\r\nX-Injected: true"
+        let responder = ResponderFake(steps: [.response("unused")])
+        let screen = ScreenContextFake(contexts: [readyScreenContext()])
+        let coordinator = AssistantCoordinator(
+            settings: settings,
+            responder: responder,
+            screenContextProvider: screen,
+            promptBuilder: PromptBuilderFake()
+        )
+
+        coordinator.request(.ask, snapshot: sampleSnapshot())
+
+        if case .failed(let message) = coordinator.requestState {
+            #expect(!message.contains("header-secret"))
+        } else {
+            Issue.record("Expected a malformed-key failure")
+        }
+        #expect(await screen.callCount() == 0)
+        #expect(await responder.callCount() == 0)
+    }
+
     @Test func emptyTranscriptStillCapturesAndRequests() async {
         let responder = ResponderFake(steps: [.response("Empty-context answer")])
         let screen = ScreenContextFake(contexts: [readyScreenContext()])
@@ -438,6 +484,14 @@ private actor ResponderFake: AssistantResponding {
 
     init(steps: [Step]) {
         self.steps = steps
+    }
+
+    nonisolated func validateRequestConfiguration(settings: AssistantSettings) throws {
+        try OpenAIResponsesClient(
+            apiKey: settings.apiKey,
+            baseURLString: settings.baseURL,
+            model: settings.model
+        ).validateRequestConfiguration()
     }
 
     func fetchAvailableModels(settings: AssistantSettings) async throws -> [String] {
