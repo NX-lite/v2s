@@ -214,33 +214,30 @@ private struct ScreenSelection: Sendable {
 
 struct VisionTextRecognizer: TextRecognizing {
     func recognizeText(from pngData: Data) async -> String? {
-        guard let image = CIImage(data: pngData) else { return nil }
+        await Task.detached(priority: .userInitiated) {
+            guard let image = CIImage(data: pngData) else { return nil }
 
-        return await withCheckedContinuation { continuation in
-            let request = VNRecognizeTextRequest { request, error in
-                guard error == nil,
-                      let observations = request.results as? [VNRecognizedTextObservation]
-                else {
-                    continuation.resume(returning: nil)
-                    return
-                }
-
-                let candidates = observations.enumerated().compactMap { index, observation -> OCRTextCandidate? in
-                    guard let text = observation.topCandidates(1).first?.string else { return nil }
-                    return OCRTextCandidate(text: text, boundingBox: observation.boundingBox, originalIndex: index)
-                }
-                let lines = OCRCandidateOrdering.ordered(candidates).map(\.text)
-                let text = lines.joined(separator: "\n").trimmingCharacters(in: .whitespacesAndNewlines)
-                continuation.resume(returning: text.isEmpty ? nil : text)
-            }
+            let request = VNRecognizeTextRequest()
             request.recognitionLevel = .accurate
             request.usesLanguageCorrection = true
 
             do {
                 try VNImageRequestHandler(ciImage: image, options: [:]).perform([request])
+                guard let observations = request.results else {
+                    return nil
+                }
+                let candidates = observations.enumerated().compactMap { index, observation -> OCRTextCandidate? in
+                    guard let text = observation.topCandidates(1).first?.string else { return nil }
+                    return OCRTextCandidate(text: text, boundingBox: observation.boundingBox, originalIndex: index)
+                }
+                let text = OCRCandidateOrdering.ordered(candidates)
+                    .map(\.text)
+                    .joined(separator: "\n")
+                    .trimmingCharacters(in: .whitespacesAndNewlines)
+                return text.isEmpty ? nil : text
             } catch {
-                continuation.resume(returning: nil)
+                return nil
             }
-        }
+        }.value
     }
 }

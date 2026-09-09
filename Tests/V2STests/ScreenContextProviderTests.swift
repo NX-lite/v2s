@@ -1,3 +1,4 @@
+import AppKit
 import Foundation
 import Testing
 @testable import v2s
@@ -70,6 +71,14 @@ import Testing
         #expect(OCRCandidateOrdering.ordered(candidates).map(\.text) == expected)
     }
 
+    @Test func visionRecognizerReturnsNilForBlankPNGWithoutCrashing() async throws {
+        let pngData = try #require(blankPNG())
+
+        let text = await VisionTextRecognizer().recognizeText(from: pngData)
+
+        #expect(text == nil)
+    }
+
     @Test func captureFailureSkipsRecognition() async {
         let capture = CaptureFake(outcome: .failed)
         let recognizer = RecognizerFake(result: "unused")
@@ -107,5 +116,22 @@ import Testing
             receivedData = pngData
             return result
         }
+    }
+
+    private func blankPNG() -> Data? {
+        guard let bitmap = NSBitmapImageRep(
+            bitmapDataPlanes: nil,
+            pixelsWide: 1,
+            pixelsHigh: 1,
+            bitsPerSample: 8,
+            samplesPerPixel: 4,
+            hasAlpha: true,
+            isPlanar: false,
+            colorSpaceName: .deviceRGB,
+            bytesPerRow: 0,
+            bitsPerPixel: 0
+        ) else { return nil }
+        bitmap.setColor(.white, atX: 0, y: 0)
+        return bitmap.representation(using: .png, properties: [:])
     }
 }
