@@ -25,17 +25,19 @@ if xcodebuild -version >/dev/null 2>&1; then
 fi
 
 clt_root="/Library/Developer/CommandLineTools"
-manifest_sdk="$clt_root/SDKs/MacOSX15.4.sdk"
-target_sdk="$clt_root/SDKs/MacOSX26.4.sdk"
+target_sdk="$(xcrun --sdk macosx --show-sdk-path)"
+manifest_sdk="$target_sdk"
+sdk_cache_key="$(xcrun --sdk macosx --show-sdk-version)"
+sdk_cache_key="${sdk_cache_key//./_}"
 frameworks_dir="$clt_root/Library/Developer/Frameworks"
 developer_lib_dir="$clt_root/Library/Developer/usr/lib"
 
-export CLANG_MODULE_CACHE_PATH="$repo_root/.build/clt-module-cache-v2"
+export CLANG_MODULE_CACHE_PATH="$repo_root/.build/clt-module-cache-$sdk_cache_key"
 export SWIFTPM_MODULECACHE_OVERRIDE="$CLANG_MODULE_CACHE_PATH"
-clt_cache_dir="$repo_root/.build/clt-cache-v2"
-clt_config_dir="$repo_root/.build/clt-config-v2"
-clt_security_dir="$repo_root/.build/clt-security-v2"
-clt_scratch_dir="$repo_root/.build/clt-scratch-v2"
+clt_cache_dir="$repo_root/.build/clt-cache-$sdk_cache_key"
+clt_config_dir="$repo_root/.build/clt-config-$sdk_cache_key"
+clt_security_dir="$repo_root/.build/clt-security-$sdk_cache_key"
+clt_scratch_dir="$repo_root/.build/clt-scratch-$sdk_cache_key"
 mkdir -p "$CLANG_MODULE_CACHE_PATH" "$clt_cache_dir" "$clt_config_dir" "$clt_security_dir" "$clt_scratch_dir"
 
 clt_swiftpm_local_cache_args=(

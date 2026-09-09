@@ -101,6 +101,10 @@ unchanged.
 - whether the latest answer used an image; and
 - the current screen-context warning.
 
+Reply history stores semantic thinking, response, and failure values rather than
+pre-localized strings. The UI localizes assistant-owned labels and errors at render
+time; provider response text is displayed unchanged.
+
 It receives immutable transcript snapshots from `AppModel`. It cannot mutate speech,
 translation, caption queues, or transcript storage. A monotonically increasing request
 generation prevents a cancelled or stale response from replacing newer state. Only
@@ -159,7 +163,7 @@ controller and to the settings window.
 ## Request Flow
 
 1. A button or global hotkey requests `Follow Up` or `Ask`.
-2. The coordinator validates the endpoint, API key, model, and transcript snapshot.
+2. The coordinator validates the endpoint, API key, and model.
 3. The screen-context provider attempts capture and OCR.
 4. The prompt builder produces deterministic instructions and content.
 5. The provider client sends one request with an image when available.
@@ -171,7 +175,8 @@ controller and to the settings window.
 ## Error and Lifecycle Rules
 
 - Missing API configuration fails before capture or network access.
-- Empty transcript context fails before network access.
+- Empty transcript context uses the fork-compatible `(No transcript yet.)` placeholder,
+  allowing screen-only Ask requests and text-only fallback when capture is unavailable.
 - Screen-capture denial degrades to text-only operation and surfaces a warning.
 - Cancelling, stopping a session, or terminating the app cancels assistant work and
   prevents stale completion handlers from updating UI state.
@@ -191,8 +196,8 @@ and complete suites.
 Swift package tests use Swift Testing (`@Suite`, `@Test`, `#expect`, and
 `#require`) rather than XCTest. Locally, run `scripts/test-swift.sh`, which uses
 normal `swift test` under full Xcode and otherwise the verified Command Line Tools
-compatibility path: manifest SDK `MacOSX15.4.sdk`, target SDK `MacOSX26.4.sdk`,
-Swift Testing import/framework paths and rpaths, `--disable-sandbox`, and
+compatibility path: the active SDK for manifest and target compilation, Swift Testing
+import/framework paths and rpaths, `--disable-sandbox`, and SDK-versioned
 repository-local `.build` caches. XCTest-style examples in the implementation plan
 are behavioral pseudocode and must be converted when implemented.
 

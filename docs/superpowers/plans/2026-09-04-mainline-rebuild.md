@@ -24,8 +24,9 @@ test. The verified local Command Line Tools compatibility path is:
 
 1. use `scripts/test-swift.sh`, which keeps SwiftPM caches below `.build`, runs
    normal `swift test` when full Xcode is selected, and otherwise uses the verified
-   manifest SDK `MacOSX15.4.sdk`, target SDK `MacOSX26.4.sdk`, Swift Testing import
-   and framework paths, link rpaths, and `--disable-sandbox`; or
+   active Command Line Tools SDK for both manifest and target compilation, Swift
+   Testing import and framework paths, link rpaths, SDK-versioned local caches, and
+   `--disable-sandbox`; or
 2. install/select a compatible Xcode 26 toolchain locally; or
 3. push the integration branch with user approval and use the `macos-26` CI runner
    for every required red/green verification.
@@ -421,13 +422,13 @@ Expected: focused and full Swift suites pass.
 
 Use a fixed date and two transcript entries. Assert ISO-8601 ordering, source name,
 language IDs and names, OCR inclusion, skills inclusion, distinct action instruction,
-and rejection of an empty transcript.
+and the fork-compatible explicit placeholder for an empty transcript.
 
 ```swift
 func testAskPromptIsDeterministicAndIncludesAllContext() throws
 func testFollowUpUsesDistinctActionInstruction() throws
 func testNoOCRDoesNotEmitOCRSection() throws
-func testEmptyTranscriptThrowsBeforeAnyProviderWork() throws
+func testEmptyTranscriptUsesExplicitPlaceholder() throws
 ```
 
 - [ ] **Step 2: Run and verify RED**
@@ -455,8 +456,17 @@ struct AssistantTranscriptSnapshot: Equatable, Sendable {
 struct AssistantPrompt: Equatable, Sendable {
     let instructions: String; let userContent: String
 }
+enum AssistantFailure: Equatable, Sendable {
+    case invalidConfiguration
+    case requestFailed(detail: String?)
+}
+enum AssistantReplyContent: Equatable, Sendable {
+    case thinking
+    case response(String)
+    case failure(AssistantFailure)
+}
 struct AssistantReply: Identifiable, Equatable, Sendable {
-    let id: UUID; let action: AssistantAction; let title: String; let text: String
+    let id: UUID; let action: AssistantAction; let content: AssistantReplyContent
 }
 ```
 
@@ -464,8 +474,6 @@ struct AssistantReply: Identifiable, Equatable, Sendable {
 
 ```swift
 struct AssistantPromptBuilder {
-    enum BuildError: Error, Equatable { case emptyTranscript }
-
     func build(action: AssistantAction, snapshot: AssistantTranscriptSnapshot,
                settings: AssistantSettings, currentTime: Date,
                hasScreenshot: Bool, ocrText: String?) throws -> AssistantPrompt
@@ -473,9 +481,10 @@ struct AssistantPromptBuilder {
 ```
 
 Build the instruction prefix and action suffix from the fork behavior. Format every
-entry with one ISO-8601 timestamp, `original`, and `translation`; use `-` for one empty
-side. Trim skills and OCR before inclusion. Throw `.emptyTranscript` when every entry
-has empty source and translation text.
+transcript record deterministically. When no record contains conversation text, emit
+the fork's `(No transcript yet.)` placeholder so screen-only Ask remains available.
+Give every non-empty entry one ISO-8601 timestamp, `original`, and `translation`; use
+`-` for one empty side. Trim skills and OCR before inclusion.
 
 - [ ] **Step 5: Verify GREEN and commit**
 
@@ -595,13 +604,13 @@ main-actor contract:
 
 ```swift
 enum AssistantRequestState: Equatable {
-    case idle, running(AssistantAction), failed(String)
+    case idle, running(AssistantAction), failed(AssistantFailure)
 }
 enum AssistantModelFetchState: Equatable {
-    case idle, fetching, fetched([String]), failed(String)
+    case idle, fetching, fetched([String]), failed(AssistantFailure)
 }
 enum AssistantAPITestState: Equatable {
-    case idle, testing, passed(String), failed(String)
+    case idle, testing, passed(String), failed(AssistantFailure)
 }
 
 @MainActor
@@ -630,7 +639,8 @@ Increment a `requestGeneration` before each request and cancellation. Capture th
 generation in the task; guard equality before every published completion. On
 `.imageUnsupported`, call the responder once more with `nil` image and set
 `.providerRejectedImage`. All other failures publish one failed state and retain prior
-replies.
+replies. Store thinking, response, and failure as semantic reply content so Task 8 and
+Task 9 can localize UI-owned text without altering provider responses.
 
 - [ ] **Step 4: Verify RED-GREEN behavior explicitly**
 
@@ -856,7 +866,8 @@ metrics to assistant history only in reply mode.
 
 Add an assistant section to `StatusBarPopoverView` with Follow Up and Ask buttons. Both
 buttons call the same coordinator methods as the global hotkeys, close the popover after
-dispatch, and are disabled while the transcript snapshot has no content.
+dispatch, and remain available when the transcript is empty so Ask can use current-screen
+context, matching `origin/main`.
 
 - [ ] **Step 4: Apply one privacy source to all windows**
 
