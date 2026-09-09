@@ -146,9 +146,9 @@ final class AssistantCoordinator: ObservableObject {
         do {
             try responder.validateRequestConfiguration(settings: settings)
         } catch {
-            let message = userFacingMessage(for: error)
-            requestState = .failed(message)
-            appendReply(action: action, text: message)
+            let failure = AssistantFailure.invalidConfiguration
+            requestState = .failed(failure)
+            appendReply(action: action, content: .failure(failure))
             return
         }
         requestState = .running(action)
@@ -189,7 +189,7 @@ final class AssistantCoordinator: ObservableObject {
                 self.modelFetchTask = nil
             } catch {
                 guard self.modelFetchGeneration == generation else { return }
-                self.modelFetchState = .failed(self.userFacingMessage(for: error))
+                self.modelFetchState = .failed(self.failure(for: error))
                 self.modelFetchTask = nil
             }
         }
@@ -211,7 +211,7 @@ final class AssistantCoordinator: ObservableObject {
                 self.apiTestTask = nil
             } catch {
                 guard self.apiTestGeneration == generation else { return }
-                self.apiTestState = .failed(self.userFacingMessage(for: error))
+                self.apiTestState = .failed(self.failure(for: error))
                 self.apiTestTask = nil
             }
         }
@@ -262,7 +262,7 @@ final class AssistantCoordinator: ObservableObject {
         }
         guard isCurrentRequest(generation) else { return }
 
-        let replyID = appendThinkingReply(action: action)
+        let replyID = appendPendingReply(action: action)
         guard isCurrentRequest(generation) else { return }
 
         do {
@@ -322,7 +322,7 @@ final class AssistantCoordinator: ObservableObject {
         if response.imageWasSent, screenStatus.isWarning == false {
             screenStatus = .screenshotSent
         }
-        replacePendingReply(id: replyID, action: action, text: response.text)
+        replacePendingReply(id: replyID, action: action, content: .response(response.text))
         pendingReplyID = nil
         requestState = .idle
         requestTask = nil
@@ -331,37 +331,37 @@ final class AssistantCoordinator: ObservableObject {
 
     private func finishRequestFailure(_ error: Error, action: AssistantAction, generation: Int) {
         guard isCurrentRequest(generation) else { return }
-        let message = userFacingMessage(for: error)
+        let failure = failure(for: error)
         if let pendingReplyID {
-            replacePendingReply(id: pendingReplyID, action: action, text: message)
+            replacePendingReply(id: pendingReplyID, action: action, content: .failure(failure))
             self.pendingReplyID = nil
         } else {
-            appendReply(action: action, text: message)
+            appendReply(action: action, content: .failure(failure))
         }
-        requestState = .failed(message)
+        requestState = .failed(failure)
         requestTask = nil
         clampReplyScrollOffset()
     }
 
-    private func appendThinkingReply(action: AssistantAction) -> UUID {
+    private func appendPendingReply(action: AssistantAction) -> UUID {
         let id = UUID()
         pendingReplyID = id
-        appendReply(id: id, action: action, text: "Thinking…")
+        appendReply(id: id, action: action, content: .thinking)
         return id
     }
 
-    private func appendReply(action: AssistantAction, text: String) {
-        appendReply(id: UUID(), action: action, text: text)
+    private func appendReply(action: AssistantAction, content: AssistantReplyContent) {
+        appendReply(id: UUID(), action: action, content: content)
     }
 
-    private func appendReply(id: UUID, action: AssistantAction, text: String) {
-        replies.append(AssistantReply(id: id, action: action, title: title(for: action), text: text))
+    private func appendReply(id: UUID, action: AssistantAction, content: AssistantReplyContent) {
+        replies.append(AssistantReply(id: id, action: action, content: content))
         overlayMode = .assistantReplies
         clampReplyScrollOffset()
     }
 
-    private func replacePendingReply(id: UUID, action: AssistantAction, text: String) {
-        let reply = AssistantReply(id: id, action: action, title: title(for: action), text: text)
+    private func replacePendingReply(id: UUID, action: AssistantAction, content: AssistantReplyContent) {
+        let reply = AssistantReply(id: id, action: action, content: content)
         if let index = replies.firstIndex(where: { $0.id == id }) {
             replies[index] = reply
         } else {
@@ -377,18 +377,11 @@ final class AssistantCoordinator: ObservableObject {
         clampReplyScrollOffset()
     }
 
-    private func userFacingMessage(for error: Error) -> String {
-        if let clientError = error as? OpenAIResponsesClient.ClientError {
-            return clientError.errorDescription ?? "Assistant request failed."
+    private func failure(for error: Error) -> AssistantFailure {
+        guard let clientError = error as? OpenAIResponsesClient.ClientError else {
+            return .requestFailed(detail: nil)
         }
-        return "Assistant request failed."
-    }
-
-    private func title(for action: AssistantAction) -> String {
-        switch action {
-        case .followUp: "Follow Up"
-        case .ask: "Ask"
-        }
+        return .requestFailed(detail: clientError.errorDescription)
     }
 
     private var maximumReplyScrollOffset: Int {

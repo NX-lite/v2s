@@ -10,24 +10,35 @@ enum OverlayViewMode: Equatable, Sendable {
     case assistantReplies
 }
 
+enum AssistantFailure: Equatable, Sendable {
+    case invalidConfiguration
+    case requestFailed(detail: String?)
+}
+
+enum AssistantReplyContent: Equatable, Sendable {
+    case thinking
+    case response(String)
+    case failure(AssistantFailure)
+}
+
 enum AssistantRequestState: Equatable, Sendable {
     case idle
     case running(AssistantAction)
-    case failed(String)
+    case failed(AssistantFailure)
 }
 
 enum AssistantModelFetchState: Equatable, Sendable {
     case idle
     case fetching
     case fetched([String])
-    case failed(String)
+    case failed(AssistantFailure)
 }
 
 enum AssistantAPITestState: Equatable, Sendable {
     case idle
     case testing
     case passed(String)
-    case failed(String)
+    case failed(AssistantFailure)
 }
 
 struct AssistantTranscriptEntry: Equatable, Sendable {
@@ -53,6 +64,5 @@ struct AssistantPrompt: Equatable, Sendable {
 struct AssistantReply: Identifiable, Equatable, Sendable {
     let id: UUID
     let action: AssistantAction
-    let title: String
-    let text: String
+    let content: AssistantReplyContent
 }

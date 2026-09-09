@@ -18,13 +18,13 @@ import Testing
         #expect(coordinator.overlayMode == .assistantReplies)
         #expect(coordinator.replies.count == 1)
         #expect(coordinator.replies[0].action == .ask)
-        #expect(coordinator.replies[0].text == "Thinking…")
+        #expect(coordinator.replies[0].content == .thinking)
         #expect(coordinator.screenStatus == .ready)
 
         await responder.releaseHeldResponse(text: "Use the deployment checklist.")
         await waitUntil {
             coordinator.requestState == .idle
-                && coordinator.replies.map(\.text) == ["Use the deployment checklist."]
+                && coordinator.replies.map(\.content) == [.response("Use the deployment checklist.")]
         }
 
         #expect(coordinator.overlayMode == .assistantReplies)
@@ -44,13 +44,13 @@ import Testing
         coordinator.request(.followUp, snapshot: sampleSnapshot())
         await waitUntil {
             coordinator.requestState == .idle
-                && coordinator.replies.map(\.text) == ["Second answer"]
+                && coordinator.replies.map(\.content) == [.response("Second answer")]
         }
 
         await responder.releaseHeldResponse(text: "Stale first answer")
         await drainTasks()
 
-        #expect(coordinator.replies.map(\.text) == ["Second answer"])
+        #expect(coordinator.replies.map(\.content) == [.response("Second answer")])
         #expect(coordinator.replies.map(\.action) == [.followUp])
         #expect(coordinator.requestState == .idle)
     }
@@ -68,7 +68,7 @@ import Testing
         coordinator.request(.followUp, snapshot: sampleSnapshot())
         await waitUntil {
             coordinator.requestState == .idle
-                && coordinator.replies.map(\.text) == ["Text-only answer"]
+                && coordinator.replies.map(\.content) == [.response("Text-only answer")]
         }
 
         #expect(await responder.screenshotArguments() == [image, nil])
@@ -96,7 +96,7 @@ import Testing
         }
 
         #expect(await responder.callCount() == 1)
-        #expect(coordinator.replies.map(\.text) == ["Assistant request failed."])
+        #expect(coordinator.replies.map(\.content) == [.failure(.requestFailed(detail: nil))])
         #expect(coordinator.screenStatus == .providerRejectedImage)
     }
 
@@ -113,13 +113,13 @@ import Testing
         coordinator.request(.followUp, snapshot: sampleSnapshot())
         await waitUntil {
             coordinator.requestState == .idle
-                && coordinator.replies.map(\.text) == ["Current answer"]
+                && coordinator.replies.map(\.content) == [.response("Current answer")]
         }
 
         await responder.releaseHeldResponse(text: "Stale fallback answer")
         await drainTasks()
 
-        #expect(coordinator.replies.map(\.text) == ["Current answer"])
+        #expect(coordinator.replies.map(\.content) == [.response("Current answer")])
         #expect(coordinator.screenStatus == .screenshotSent)
     }
 
@@ -137,8 +137,60 @@ import Testing
         }
 
         #expect(await responder.callCount() == 1)
-        #expect(coordinator.replies.map(\.text) == ["Assistant request failed."])
+        #expect(coordinator.requestState == .failed(.requestFailed(detail: nil)))
+        #expect(coordinator.replies.map(\.content) == [.failure(.requestFailed(detail: nil))])
         #expect(coordinator.screenStatus == .ready)
+    }
+
+    @Test func typedClientFailureKeepsSanitizedDetailInSemanticFailure() async {
+        let responder = ResponderFake(steps: [.clientFailure(.http(status: 503, message: "Provider temporarily unavailable"))])
+        let coordinator = makeCoordinator(
+            responder: responder,
+            screen: ScreenContextFake(contexts: [readyScreenContext()])
+        )
+
+        coordinator.request(.ask, snapshot: sampleSnapshot())
+        await waitUntil {
+            coordinator.requestState == .failed(.requestFailed(detail: "HTTP 503: Provider temporarily unavailable"))
+        }
+
+        guard case .failed(.requestFailed(let detail)) = coordinator.requestState else {
+            Issue.record("Expected a request failure with provider detail")
+            return
+        }
+        #expect(detail == "HTTP 503: Provider temporarily unavailable")
+        #expect(detail?.contains(configuredSettings().apiKey) == false)
+        #expect(coordinator.replies.map(\.content) == [.failure(.requestFailed(detail: detail))])
+    }
+
+    @Test func modelFetchFailureUsesSemanticFailure() async {
+        let responder = ResponderFake(steps: [], shouldFailModelFetch: true)
+        let coordinator = makeCoordinator(
+            responder: responder,
+            screen: ScreenContextFake(contexts: [])
+        )
+
+        coordinator.fetchModels()
+        await waitUntil {
+            coordinator.modelFetchState == .failed(.requestFailed(detail: nil))
+        }
+
+        #expect(coordinator.modelFetchState == .failed(.requestFailed(detail: nil)))
+    }
+
+    @Test func apiTestFailureUsesSemanticFailure() async {
+        let responder = ResponderFake(steps: [], shouldFailAPITest: true)
+        let coordinator = makeCoordinator(
+            responder: responder,
+            screen: ScreenContextFake(contexts: [])
+        )
+
+        coordinator.testAPI()
+        await waitUntil {
+            coordinator.apiTestState == .failed(.requestFailed(detail: nil))
+        }
+
+        #expect(coordinator.apiTestState == .failed(.requestFailed(detail: nil)))
     }
 
     @Test func permissionDenialContinuesTextOnlyAndPublishesWarning() async {
@@ -151,7 +203,7 @@ import Testing
         coordinator.request(.ask, snapshot: sampleSnapshot())
         await waitUntil {
             coordinator.requestState == .idle
-                && coordinator.replies.map(\.text) == ["Text-only answer"]
+                && coordinator.replies.map(\.content) == [.response("Text-only answer")]
         }
 
         #expect(await responder.screenshotArguments() == [nil])
@@ -169,7 +221,7 @@ import Testing
         coordinator.request(.ask, snapshot: sampleSnapshot())
         await waitUntil {
             coordinator.requestState == .idle
-                && coordinator.replies.map(\.text) == ["Image answer"]
+                && coordinator.replies.map(\.content) == [.response("Image answer")]
         }
 
         #expect(coordinator.screenStatus == .ocrFailed)
@@ -185,10 +237,10 @@ import Testing
         coordinator.updateReplyVisibleCount(1)
 
         coordinator.request(.ask, snapshot: sampleSnapshot())
-        await waitUntil { coordinator.replies.map(\.text) == ["First"] && coordinator.requestState == .idle }
+        await waitUntil { coordinator.replies.map(\.content) == [.response("First")] && coordinator.requestState == .idle }
 
         coordinator.request(.followUp, snapshot: sampleSnapshot())
-        await waitUntil { coordinator.replies.map(\.text) == ["First", "Second"] && coordinator.requestState == .idle }
+        await waitUntil { coordinator.replies.map(\.content) == [.response("First"), .response("Second")] && coordinator.requestState == .idle }
 
         coordinator.setReplyScrollOffset(999)
         #expect(coordinator.replyScrollOffset == 1)
@@ -214,11 +266,8 @@ import Testing
 
         coordinator.request(.ask, snapshot: sampleSnapshot())
 
-        if case .failed = coordinator.requestState {
-            // Expected: configuration fails synchronously before capture starts.
-        } else {
-            Issue.record("Expected a missing-configuration failure")
-        }
+        #expect(coordinator.requestState == .failed(.invalidConfiguration))
+        #expect(coordinator.replies.map(\.content) == [.failure(.invalidConfiguration)])
         #expect(await screen.callCount() == 0)
         #expect(await responder.callCount() == 0)
     }
@@ -238,11 +287,8 @@ import Testing
         coordinator.request(.ask, snapshot: sampleSnapshot())
         await drainTasks()
 
-        if case .failed = coordinator.requestState {
-            // Expected: invalid endpoints are rejected before screen capture starts.
-        } else {
-            Issue.record("Expected an invalid-endpoint failure")
-        }
+        #expect(coordinator.requestState == .failed(.invalidConfiguration))
+        #expect(coordinator.replies.map(\.content) == [.failure(.invalidConfiguration)])
         #expect(await screen.callCount() == 0)
         #expect(await responder.callCount() == 0)
     }
@@ -261,11 +307,8 @@ import Testing
 
         coordinator.request(.ask, snapshot: sampleSnapshot())
 
-        if case .failed = coordinator.requestState {
-            // Expected: malformed models are rejected before screen capture starts.
-        } else {
-            Issue.record("Expected a malformed-model failure")
-        }
+        #expect(coordinator.requestState == .failed(.invalidConfiguration))
+        #expect(coordinator.replies.map(\.content) == [.failure(.invalidConfiguration)])
         #expect(await screen.callCount() == 0)
         #expect(await responder.callCount() == 0)
     }
@@ -284,11 +327,8 @@ import Testing
 
         coordinator.request(.ask, snapshot: sampleSnapshot())
 
-        if case .failed(let message) = coordinator.requestState {
-            #expect(!message.contains("header-secret"))
-        } else {
-            Issue.record("Expected a malformed-key failure")
-        }
+        #expect(coordinator.requestState == .failed(.invalidConfiguration))
+        #expect(coordinator.replies.map(\.content) == [.failure(.invalidConfiguration)])
         #expect(await screen.callCount() == 0)
         #expect(await responder.callCount() == 0)
     }
@@ -306,7 +346,7 @@ import Testing
         coordinator.request(.ask, snapshot: emptySnapshot())
         await waitUntil {
             coordinator.requestState == .idle
-                && coordinator.replies.map(\.text) == ["Empty-context answer"]
+                && coordinator.replies.map(\.content) == [.response("Empty-context answer")]
         }
 
         #expect(await screen.callCount() == 1)
@@ -328,7 +368,7 @@ import Testing
         coordinator.request(.followUp, snapshot: emptySnapshot())
         await waitUntil {
             coordinator.requestState == .idle
-                && coordinator.replies.map(\.text) == ["Text-only empty-context answer"]
+                && coordinator.replies.map(\.content) == [.response("Text-only empty-context answer")]
         }
 
         #expect(await screen.callCount() == 1)
@@ -478,12 +518,16 @@ private actor PromptBuilderFake: AssistantPromptBuilding {
 
 private actor ResponderFake: AssistantResponding {
     private var steps: [Step]
+    private let shouldFailModelFetch: Bool
+    private let shouldFailAPITest: Bool
     private var images: [Data?] = []
     private var receivedPrompts: [String] = []
     private var heldContinuations: [CheckedContinuation<OpenAIResponsesClient.Response, Error>] = []
 
-    init(steps: [Step]) {
+    init(steps: [Step], shouldFailModelFetch: Bool = false, shouldFailAPITest: Bool = false) {
         self.steps = steps
+        self.shouldFailModelFetch = shouldFailModelFetch
+        self.shouldFailAPITest = shouldFailAPITest
     }
 
     nonisolated func validateRequestConfiguration(settings: AssistantSettings) throws {
@@ -495,11 +539,13 @@ private actor ResponderFake: AssistantResponding {
     }
 
     func fetchAvailableModels(settings: AssistantSettings) async throws -> [String] {
-        ["gpt-test"]
+        if shouldFailModelFetch { throw ResponderFailure.failed }
+        return ["gpt-test"]
     }
 
     func testConnection(settings: AssistantSettings) async throws -> String {
-        "OK"
+        if shouldFailAPITest { throw ResponderFailure.failed }
+        return "OK"
     }
 
     func respond(
@@ -516,6 +562,8 @@ private actor ResponderFake: AssistantResponding {
             return .init(text: text, imageWasSent: screenshotPNGData != nil)
         case .imageUnsupported:
             throw OpenAIResponsesClient.ClientError.imageUnsupported(message: "Vision is unavailable")
+        case .clientFailure(let error):
+            throw error
         case .failure:
             throw ResponderFailure.failed
         case .held:
@@ -538,6 +586,7 @@ private actor ResponderFake: AssistantResponding {
     enum Step: Sendable {
         case response(String)
         case imageUnsupported
+        case clientFailure(OpenAIResponsesClient.ClientError)
         case failure
         case held
     }
