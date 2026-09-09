@@ -36,6 +36,18 @@ struct GlobalHotKeyRegistration {
     }
 }
 
+struct GlobalHotKeyEventHandlerInstallation {
+    fileprivate let reference: EventHandlerRef?
+
+    init() {
+        reference = nil
+    }
+
+    fileprivate init(reference: EventHandlerRef) {
+        self.reference = reference
+    }
+}
+
 struct HotKeySystemRegistrationFailure: Error, Equatable {
     let status: OSStatus
 }
@@ -47,6 +59,13 @@ protocol GlobalHotKeyRegistering: AnyObject {
         action: GlobalHotKeyAction
     ) -> Result<GlobalHotKeyRegistration, HotKeySystemRegistrationFailure>
     func unregister(_ registration: GlobalHotKeyRegistration)
+}
+
+protocol GlobalHotKeyEventInstalling: AnyObject {
+    func install(
+        userData: UnsafeMutableRawPointer
+    ) -> Result<GlobalHotKeyEventHandlerInstallation, HotKeySystemRegistrationFailure>
+    func remove(_ installation: GlobalHotKeyEventHandlerInstallation)
 }
 
 @MainActor
@@ -68,16 +87,20 @@ final class GlobalHotKeyController: ObservableObject {
 
     private let onAction: (GlobalHotKeyAction) -> Void
     private let registrar: any GlobalHotKeyRegistering
+    private let eventInstaller: any GlobalHotKeyEventInstalling
     private var registrations: [GlobalHotKeyRegistration] = []
-    private var eventHandlerRef: EventHandlerRef?
+    private var eventHandlerInstallation: GlobalHotKeyEventHandlerInstallation?
+    private var eventHandlerFailure: OSStatus?
 
     init(
         onAction: @escaping (GlobalHotKeyAction) -> Void,
         registrar: (any GlobalHotKeyRegistering)? = nil,
+        eventInstaller: (any GlobalHotKeyEventInstalling)? = nil,
         installsEventHandler: Bool = true
     ) {
         self.onAction = onAction
         self.registrar = registrar ?? CarbonGlobalHotKeyRegistrar()
+        self.eventInstaller = eventInstaller ?? CarbonGlobalHotKeyEventInstaller()
         if installsEventHandler {
             installEventHandler()
         }
@@ -87,8 +110,8 @@ final class GlobalHotKeyController: ObservableObject {
         for registration in registrations {
             registrar.unregister(registration)
         }
-        if let eventHandlerRef {
-            RemoveEventHandler(eventHandlerRef)
+        if let eventHandlerInstallation {
+            eventInstaller.remove(eventHandlerInstallation)
         }
     }
 
@@ -101,6 +124,13 @@ final class GlobalHotKeyController: ObservableObject {
             switchMode: switchMode
         )
         errors = plan.errors
+
+        if let eventHandlerFailure {
+            for action in plan.bindings.keys {
+                errors[action] = .registrationFailed(eventHandlerFailure)
+            }
+            return
+        }
 
         for action in GlobalHotKeyAction.allCases {
             guard let binding = plan.bindings[action],
@@ -168,60 +198,21 @@ final class GlobalHotKeyController: ObservableObject {
     }
 
     private func installEventHandler() {
-        var eventType = EventTypeSpec(
-            eventClass: OSType(kEventClassKeyboard),
-            eventKind: UInt32(kEventHotKeyPressed)
-        )
-        var installedHandler: EventHandlerRef?
         let userData = UnsafeMutableRawPointer(Unmanaged.passUnretained(self).toOpaque())
-        let status = InstallEventHandler(
-            GetApplicationEventTarget(),
-            { _, eventRef, userData in
-                guard let eventRef, let userData else {
-                    return noErr
-                }
-
-                var hotKeyID = EventHotKeyID()
-                let parameterStatus = GetEventParameter(
-                    eventRef,
-                    EventParamName(kEventParamDirectObject),
-                    EventParamType(typeEventHotKeyID),
-                    nil,
-                    MemoryLayout<EventHotKeyID>.size,
-                    nil,
-                    &hotKeyID
-                )
-                guard parameterStatus == noErr,
-                      hotKeyID.signature == globalHotKeyEventSignature else {
-                    return parameterStatus == noErr ? noErr : parameterStatus
-                }
-
-                let controller = Unmanaged<GlobalHotKeyController>
-                    .fromOpaque(userData)
-                    .takeUnretainedValue()
-                Task { @MainActor [weak controller] in
-                    controller?.handle(hotKeyID: hotKeyID)
-                }
-                return noErr
-            },
-            1,
-            &eventType,
-            userData,
-            &installedHandler
-        )
-
-        guard status == noErr, let installedHandler else {
-            return
+        switch eventInstaller.install(userData: userData) {
+        case .success(let installation):
+            eventHandlerInstallation = installation
+        case .failure(let failure):
+            eventHandlerFailure = failure.status
         }
-        eventHandlerRef = installedHandler
     }
 
     private func removeEventHandler() {
-        guard let eventHandlerRef else {
+        guard let eventHandlerInstallation else {
             return
         }
-        RemoveEventHandler(eventHandlerRef)
-        self.eventHandlerRef = nil
+        eventInstaller.remove(eventHandlerInstallation)
+        self.eventHandlerInstallation = nil
     }
 
     private func unregisterAll() {
@@ -231,7 +222,7 @@ final class GlobalHotKeyController: ObservableObject {
         registrations.removeAll()
     }
 
-    private func handle(hotKeyID: EventHotKeyID) {
+    fileprivate func handle(hotKeyID: EventHotKeyID) {
         guard let action = Self.action(for: hotKeyID) else {
             return
         }
@@ -295,4 +286,64 @@ private final class CarbonGlobalHotKeyRegistrar: GlobalHotKeyRegistering {
         }
         UnregisterEventHotKey(reference)
     }
+}
+
+private final class CarbonGlobalHotKeyEventInstaller: GlobalHotKeyEventInstalling {
+    func install(
+        userData: UnsafeMutableRawPointer
+    ) -> Result<GlobalHotKeyEventHandlerInstallation, HotKeySystemRegistrationFailure> {
+        var eventType = EventTypeSpec(
+            eventClass: OSType(kEventClassKeyboard),
+            eventKind: UInt32(kEventHotKeyPressed)
+        )
+        var reference: EventHandlerRef?
+        let status = InstallEventHandler(
+            GetApplicationEventTarget(),
+            carbonGlobalHotKeyEventHandler,
+            1,
+            &eventType,
+            userData,
+            &reference
+        )
+        guard status == noErr, let reference else {
+            return .failure(.init(status: status == noErr ? OSStatus(-1) : status))
+        }
+        return .success(GlobalHotKeyEventHandlerInstallation(reference: reference))
+    }
+
+    func remove(_ installation: GlobalHotKeyEventHandlerInstallation) {
+        guard let reference = installation.reference else {
+            return
+        }
+        RemoveEventHandler(reference)
+    }
+}
+
+private let carbonGlobalHotKeyEventHandler: EventHandlerUPP = { _, eventRef, userData in
+    guard let eventRef, let userData else {
+        return noErr
+    }
+
+    var hotKeyID = EventHotKeyID()
+    let status = GetEventParameter(
+        eventRef,
+        EventParamName(kEventParamDirectObject),
+        EventParamType(typeEventHotKeyID),
+        nil,
+        MemoryLayout<EventHotKeyID>.size,
+        nil,
+        &hotKeyID
+    )
+    guard status == noErr,
+          hotKeyID.signature == globalHotKeyEventSignature else {
+        return status == noErr ? noErr : status
+    }
+
+    let controller = Unmanaged<GlobalHotKeyController>
+        .fromOpaque(userData)
+        .takeUnretainedValue()
+    Task { @MainActor [weak controller] in
+        controller?.handle(hotKeyID: hotKeyID)
+    }
+    return noErr
 }

@@ -133,6 +133,56 @@ import Testing
         #expect(registrar.activeActions == [.followUp, .switchMode])
     }
 
+    @Test func failedEventHandlerInstallationPreventsAllRegistrations() {
+        let registrar = RecordingHotKeyRegistrar()
+        let installer = RecordingHotKeyEventInstaller(failureStatus: -4321)
+        do {
+            let controller = GlobalHotKeyController(
+                onAction: { _ in },
+                registrar: registrar,
+                eventInstaller: installer
+            )
+
+            controller.update(
+                followUp: .defaultFollowUp,
+                ask: .defaultAsk,
+                switchMode: .defaultSwitchMode
+            )
+
+            #expect(installer.installationCount == 1)
+            #expect(registrar.registeredActions.isEmpty)
+            #expect(controller.errors == [
+                .followUp: .registrationFailed(-4321),
+                .ask: .registrationFailed(-4321),
+                .switchMode: .registrationFailed(-4321),
+            ])
+
+            controller.invalidate()
+            #expect(installer.removalCount == 0)
+        }
+        #expect(installer.removalCount == 0)
+    }
+
+    @Test func successfulInjectedEventHandlerAllowsRegistrations() {
+        let registrar = RecordingHotKeyRegistrar()
+        let installer = RecordingHotKeyEventInstaller()
+        let controller = GlobalHotKeyController(
+            onAction: { _ in },
+            registrar: registrar,
+            eventInstaller: installer
+        )
+
+        controller.update(
+            followUp: .defaultFollowUp,
+            ask: .defaultAsk,
+            switchMode: .defaultSwitchMode
+        )
+
+        #expect(installer.installationCount == 1)
+        #expect(registrar.registeredActions == [.followUp, .ask, .switchMode])
+        #expect(controller.errors.isEmpty)
+    }
+
     @Test func eventRoutingIgnoresForeignSignaturesAndUnknownActions() {
         #expect(GlobalHotKeyController.action(for: .init(
             signature: GlobalHotKeyController.eventSignature,
@@ -191,5 +241,29 @@ private final class RecordingHotKeyRegistrar: GlobalHotKeyRegistering {
     func unregister(_ registration: GlobalHotKeyRegistration) {
         unregisteredActions.append(registration.action)
         activeActions.removeAll { $0 == registration.action }
+    }
+}
+
+private final class RecordingHotKeyEventInstaller: GlobalHotKeyEventInstalling {
+    private let failureStatus: OSStatus?
+    private(set) var installationCount = 0
+    private(set) var removalCount = 0
+
+    init(failureStatus: OSStatus? = nil) {
+        self.failureStatus = failureStatus
+    }
+
+    func install(
+        userData: UnsafeMutableRawPointer
+    ) -> Result<GlobalHotKeyEventHandlerInstallation, HotKeySystemRegistrationFailure> {
+        installationCount += 1
+        if let failureStatus {
+            return .failure(.init(status: failureStatus))
+        }
+        return .success(GlobalHotKeyEventHandlerInstallation())
+    }
+
+    func remove(_ installation: GlobalHotKeyEventHandlerInstallation) {
+        removalCount += 1
     }
 }
