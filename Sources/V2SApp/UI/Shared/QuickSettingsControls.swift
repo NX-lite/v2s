@@ -1,5 +1,60 @@
 import SwiftUI
 
+@MainActor
+enum AssistantPopoverActions {
+    static func dispatch(
+        _ action: AssistantAction,
+        model: AppModel,
+        closePopover: () -> Void
+    ) {
+        model.requestAssistant(action)
+        closePopover()
+    }
+}
+
+struct AssistantActionControls: View {
+    @ObservedObject var model: AppModel
+    @ObservedObject var assistant: AssistantCoordinator
+    let onAction: (AssistantAction) -> Void
+
+    init(
+        model: AppModel,
+        onAction: @escaping (AssistantAction) -> Void
+    ) {
+        self.model = model
+        self._assistant = ObservedObject(wrappedValue: model.assistant)
+        self.onAction = onAction
+    }
+
+    var body: some View {
+        HStack(spacing: 8) {
+            actionButton(.followUp, symbolName: "arrowshape.turn.up.right")
+            actionButton(.ask, symbolName: "questionmark.bubble")
+        }
+    }
+
+    private func actionButton(_ action: AssistantAction, symbolName: String) -> some View {
+        Button {
+            onAction(action)
+        } label: {
+            Label(title(for: action), systemImage: symbolName)
+        }
+        .buttonStyle(.bordered)
+        .disabled(isRequestRunning)
+    }
+
+    private var isRequestRunning: Bool {
+        if case .running = assistant.requestState {
+            return true
+        }
+        return false
+    }
+
+    private func title(for action: AssistantAction) -> String {
+        AppLocalization.assistantActionTitle(action, languageID: model.resolvedInterfaceLanguageID)
+    }
+}
+
 struct SettingsControlRow<Content: View>: View {
     let label: String
     @ViewBuilder let content: () -> Content

@@ -7,6 +7,7 @@ enum OverlayPanelMetrics {
 
 struct OverlayView: View {
     @ObservedObject var model: AppModel
+    @ObservedObject var assistant: AssistantCoordinator
     @ObservedObject var interactionState: OverlayInteractionState
     @Namespace private var captionFlowNamespace
     @State private var renderedPassThroughBubble: OverlayPassThroughBubble?
@@ -16,12 +17,24 @@ struct OverlayView: View {
     @State private var lastCommittedSlotHeight: CGFloat = 0.0
     @State private var measuredHistoryEntryHeights: [UUID: CGFloat] = [:]
 
+    init(model: AppModel, interactionState: OverlayInteractionState) {
+        self.model = model
+        self._assistant = ObservedObject(wrappedValue: model.assistant)
+        self.interactionState = interactionState
+    }
+
     var body: some View {
         ZStack {
-            subtitleContent
-                .mask(passThroughMask)
+            if displaysAssistantReplies {
+                assistantReplyContent
+            } else {
+                subtitleContent
+                    .mask(passThroughMask)
+            }
 
-            passThroughBubble
+            if displaysAssistantReplies == false {
+                passThroughBubble
+            }
         }
         .frame(maxWidth: .infinity, maxHeight: .infinity)
         .onAppear {
@@ -31,6 +44,25 @@ struct OverlayView: View {
             syncPassThroughBubble(bubble)
         }
         .modifier(OverlayTranslationHostModifier(model: model))
+    }
+
+    private var displaysAssistantReplies: Bool {
+        assistant.overlayMode == .assistantReplies && assistant.replies.isEmpty == false
+    }
+
+    private var assistantReplyContent: some View {
+        AssistantReplyView(
+            assistant: assistant,
+            languageID: model.resolvedInterfaceLanguageID
+        )
+        .frame(maxWidth: .infinity, maxHeight: .infinity)
+        .background(backgroundView)
+        .overlay(
+            RoundedRectangle(cornerRadius: OverlayPanelMetrics.cornerRadius, style: .continuous)
+                .strokeBorder(Color.white.opacity(0.08), lineWidth: 1)
+        )
+        .padding(.horizontal, OverlayControlsLayout.outerPadding)
+        .padding(.vertical, OverlayControlsLayout.outerPadding)
     }
 
     @ViewBuilder
@@ -929,10 +961,131 @@ struct OverlayResetSizeButtonView: View {
     }
 }
 
+struct OverlayAssistantActionButtonView: View {
+    @ObservedObject var model: AppModel
+    @ObservedObject var assistant: AssistantCoordinator
+    let action: AssistantAction
+
+    init(model: AppModel, action: AssistantAction) {
+        self.model = model
+        self._assistant = ObservedObject(wrappedValue: model.assistant)
+        self.action = action
+    }
+
+    var body: some View {
+        Button {
+            model.requestAssistant(action)
+        } label: {
+            ZStack {
+                Circle().fill(Color.white.opacity(0.12))
+                Image(systemName: symbolName)
+                    .font(.system(size: 9, weight: .semibold))
+                    .foregroundColor(.white.opacity(0.65))
+            }
+        }
+        .buttonStyle(.plain)
+        .frame(width: OverlayControlsLayout.controlSize, height: OverlayControlsLayout.controlSize)
+        .disabled(isRequestRunning)
+        .accessibilityLabel(title)
+        .help(title)
+    }
+
+    private var isRequestRunning: Bool {
+        if case .running = assistant.requestState {
+            return true
+        }
+        return false
+    }
+
+    private var symbolName: String {
+        switch action {
+        case .followUp:
+            "arrowshape.turn.up.right"
+        case .ask:
+            "questionmark.bubble"
+        }
+    }
+
+    private var title: String {
+        AppLocalization.assistantActionTitle(action, languageID: model.resolvedInterfaceLanguageID)
+    }
+}
+
+enum OverlayHistoryScrollTarget: Equatable {
+    case subtitles
+    case assistantReplies
+}
+
+@MainActor
+enum OverlayHistoryScrollRouting {
+    static func target(for assistant: AssistantCoordinator) -> OverlayHistoryScrollTarget {
+        assistant.overlayMode == .assistantReplies && assistant.replies.isEmpty == false
+            ? .assistantReplies
+            : .subtitles
+    }
+
+    static func totalCount(model: AppModel) -> Int {
+        switch target(for: model.assistant) {
+        case .subtitles:
+            max(model.overlayState?.history.count ?? 0, 0)
+        case .assistantReplies:
+            model.assistant.replies.count
+        }
+    }
+
+    static func visibleCount(model: AppModel) -> Int {
+        switch target(for: model.assistant) {
+        case .subtitles:
+            model.overlayHistoryVisibleCount
+        case .assistantReplies:
+            model.assistant.replyVisibleCount
+        }
+    }
+
+    static func currentOffset(model: AppModel) -> Int {
+        switch target(for: model.assistant) {
+        case .subtitles:
+            model.overlayHistoryScrollOffset
+        case .assistantReplies:
+            model.assistant.replyScrollOffset
+        }
+    }
+
+    static func setOffset(_ offset: Int, model: AppModel) {
+        switch target(for: model.assistant) {
+        case .subtitles:
+            model.setOverlayHistoryScrollOffset(offset)
+        case .assistantReplies:
+            model.assistant.setReplyScrollOffset(offset)
+        }
+    }
+
+    static func scroll(by delta: Int, model: AppModel) {
+        switch target(for: model.assistant) {
+        case .subtitles:
+            model.scrollOverlayHistory(by: delta)
+        case .assistantReplies:
+            model.assistant.scrollReplies(by: delta)
+        }
+    }
+}
+
 struct OverlayHistoryScrollbarView: View {
     @ObservedObject var model: AppModel
+    @ObservedObject var assistant: AssistantCoordinator
     @ObservedObject var interactionState: OverlayInteractionState
     var showTranscript: () -> Void = {}
+
+    init(
+        model: AppModel,
+        interactionState: OverlayInteractionState,
+        showTranscript: @escaping () -> Void = {}
+    ) {
+        self.model = model
+        self._assistant = ObservedObject(wrappedValue: model.assistant)
+        self.interactionState = interactionState
+        self.showTranscript = showTranscript
+    }
 
     var body: some View {
         let revealProgress = interactionState.scrollbarRevealProgress
@@ -974,11 +1127,11 @@ struct OverlayHistoryScrollbarView: View {
                             .offset(y: metrics.thumbTop)
 
                         OverlayHistoryScrollbarInputLayer(
-                            currentOffset: model.overlayHistoryScrollOffset,
+                            currentOffset: currentScrollOffset,
                             maxScrollOffset: metrics.maxScrollOffset,
                             thumbHeight: metrics.thumbHeight,
-                            onOffsetChange: { model.setOverlayHistoryScrollOffset($0) },
-                            onStepScroll: { model.scrollOverlayHistory(by: $0) }
+                            onOffsetChange: setScrollOffset,
+                            onStepScroll: stepScroll
                         )
                     }
                     .frame(height: trackHeight)
@@ -995,8 +1148,8 @@ struct OverlayHistoryScrollbarView: View {
     }
 
     private func scrollbarMetrics(trackHeight: CGFloat) -> OverlayHistoryScrollbarMetrics {
-        let totalCount = max(model.overlayState?.history.count ?? 0, 0)
-        let visibleCount = max(0, model.overlayHistoryVisibleCount)
+        let totalCount = OverlayHistoryScrollRouting.totalCount(model: model)
+        let visibleCount = OverlayHistoryScrollRouting.visibleCount(model: model)
         let maxScrollOffset = max(0, totalCount - visibleCount)
         let clampedTrackHeight = max(trackHeight, OverlayHistoryScrollbarLayout.minimumThumbHeight)
         let visibilityRatio = totalCount > 0
@@ -1010,7 +1163,7 @@ struct OverlayHistoryScrollbarView: View {
         let progressFromTop: CGFloat
 
         if maxScrollOffset > 0 {
-            progressFromTop = 1.0 - (CGFloat(model.overlayHistoryScrollOffset) / CGFloat(maxScrollOffset))
+            progressFromTop = 1.0 - (CGFloat(currentScrollOffset) / CGFloat(maxScrollOffset))
         } else {
             progressFromTop = 1.0
         }
@@ -1039,13 +1192,13 @@ struct OverlayHistoryScrollbarView: View {
     }
 
     private func latestButtonRevealProgress(for revealProgress: CGFloat) -> CGFloat {
-        guard model.overlayHistoryScrollOffset > 0 else { return 0.0 }
+        guard currentScrollOffset > 0 else { return 0.0 }
         return revealProgress
     }
 
     private func latestButton(revealProgress: CGFloat) -> some View {
         Button {
-            model.setOverlayHistoryScrollOffset(0)
+            setScrollOffset(0)
         } label: {
             ZStack {
                 Circle().fill(Color.white.opacity(0.12))
@@ -1060,7 +1213,11 @@ struct OverlayHistoryScrollbarView: View {
         .scaleEffect(0.9 + (0.1 * revealProgress))
         .allowsHitTesting(revealProgress > 0.05)
         .animation(.easeOut(duration: 0.16), value: revealProgress)
-        .accessibilityLabel(model.localized(.scrollToLatestSubtitle))
+        .accessibilityLabel(
+            model.localized(
+                displayedAssistantReplies ? .scrollToLatestAssistantReply : .scrollToLatestSubtitle
+            )
+        )
     }
 
     private func transcriptButton(revealProgress: CGFloat) -> some View {
@@ -1082,6 +1239,22 @@ struct OverlayHistoryScrollbarView: View {
         .animation(.easeOut(duration: 0.16), value: revealProgress)
         .accessibilityLabel(model.localized(.transcript))
     }
+
+    private var displayedAssistantReplies: Bool {
+        OverlayHistoryScrollRouting.target(for: assistant) == .assistantReplies
+    }
+
+    private var currentScrollOffset: Int {
+        OverlayHistoryScrollRouting.currentOffset(model: model)
+    }
+
+    private func setScrollOffset(_ offset: Int) {
+        OverlayHistoryScrollRouting.setOffset(offset, model: model)
+    }
+
+    private func stepScroll(_ delta: Int) {
+        OverlayHistoryScrollRouting.scroll(by: delta, model: model)
+    }
 }
 
 enum OverlayControlsLayout {
@@ -1092,7 +1265,7 @@ enum OverlayControlsLayout {
     static let controlSize: CGFloat = 22
     static let controlSpacing: CGFloat = 6
 
-    static let controlCount = 4
+    static let controlCount = 6
 
     static var stripSize: CGSize {
         let controlStackHeight = (controlSize * CGFloat(controlCount))
@@ -1103,7 +1276,7 @@ enum OverlayControlsLayout {
         )
     }
 
-    /// Control panel chrome height (four buttons + vertical padding inside the strip).
+    /// Control panel chrome height (six buttons + vertical padding inside the strip).
     static var controlPanelHeight: CGFloat {
         stripSize.height
     }

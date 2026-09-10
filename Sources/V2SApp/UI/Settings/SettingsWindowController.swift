@@ -51,6 +51,7 @@ final class SettingsWindowController: NSWindowController, NSWindowDelegate {
         window.delegate = self
         applyLocalizedTitle()
         bindLocalizedTitle()
+        bindRecordingVisibility()
         actions.closeSettings = { [weak self] in
             self?.closeForSessionStart()
         }
@@ -93,6 +94,20 @@ final class SettingsWindowController: NSWindowController, NSWindowDelegate {
             .store(in: &cancellables)
     }
 
+    private func bindRecordingVisibility() {
+        model.$overlayStyle
+            .map(\.invisibleInRecording)
+            .removeDuplicates()
+            // @Published emits during willSet. The emitted Boolean is the new
+            // visibility, while rereading model.overlayStyle here would be stale.
+            .sink { [weak self] invisibleInRecording in
+                let sharingType: NSWindow.SharingType = invisibleInRecording ? .none : .readOnly
+                self?.window?.sharingType = sharingType
+                self?.subtitleModeInfoWindowController.window?.sharingType = sharingType
+            }
+            .store(in: &cancellables)
+    }
+
     private func applyLocalizedTitle() {
         window?.title = model.localized(.advancedSettingsWindowTitle)
     }
@@ -102,6 +117,16 @@ final class SettingsWindowController: NSWindowController, NSWindowDelegate {
         subtitleModeInfoWindowController.window?.makeKeyAndOrderFront(nil)
         NSApp.activate(ignoringOtherApps: true)
     }
+
+#if DEBUG
+    func showSubtitleModeInfoForTesting() {
+        _ = subtitleModeInfoWindowController
+    }
+
+    var windowSharingTypesForTesting: [NSWindow.SharingType] {
+        [window, subtitleModeInfoWindowController.window].compactMap { $0?.sharingType }
+    }
+#endif
 }
 
 @MainActor

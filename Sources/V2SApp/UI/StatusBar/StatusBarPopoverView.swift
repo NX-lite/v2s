@@ -16,6 +16,7 @@ struct StatusBarPopoverView: View {
                     sourceSection
                     languageSection
                     overlaySection
+                    assistantSection
                 }
                 .padding(16)
             }
@@ -204,6 +205,19 @@ struct StatusBarPopoverView: View {
     }
 
     // MARK: - Footer
+
+    private var assistantSection: some View {
+        VStack(alignment: .leading, spacing: 8) {
+            sectionHeader(model.localized(.assistant), icon: "sparkles")
+            AssistantActionControls(model: model) { action in
+                AssistantPopoverActions.dispatch(
+                    action,
+                    model: model,
+                    closePopover: closePopover
+                )
+            }
+        }
+    }
 
     private var footerSection: some View {
         HStack {

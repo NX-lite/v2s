@@ -2160,6 +2160,10 @@ final class AppModel: ObservableObject {
         )
     }
 
+    func requestAssistant(_ action: AssistantAction) {
+        assistant.request(action, snapshot: assistantTranscriptSnapshot())
+    }
+
     func transcriptText(isTranslation: Bool) -> String {
         transcriptEntries
             .map { isTranslation ? $0.translatedText : $0.sourceText }

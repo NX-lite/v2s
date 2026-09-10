@@ -91,15 +91,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             }
             switch action {
             case .followUp:
-                self.appModel.assistant.request(
-                    .followUp,
-                    snapshot: self.appModel.assistantTranscriptSnapshot()
-                )
+                self.appModel.requestAssistant(.followUp)
             case .ask:
-                self.appModel.assistant.request(
-                    .ask,
-                    snapshot: self.appModel.assistantTranscriptSnapshot()
-                )
+                self.appModel.requestAssistant(.ask)
             case .switchMode:
                 self.appModel.assistant.toggleOverlayMode()
             }

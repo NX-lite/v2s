@@ -12,6 +12,8 @@ final class OverlayWindowController {
     private let controlsChromePanel: OverlayPanel
     private let scrollbarPanel: OverlayPanel
     private let moveButtonPanel: OverlayPanel
+    private let assistantFollowUpButtonPanel: OverlayPanel
+    private let assistantAskButtonPanel: OverlayPanel
     private let closeButtonPanel: OverlayPanel
     private let resizeButtonPanel: OverlayPanel
     private let resetSizeButtonPanel: OverlayPanel
@@ -19,6 +21,8 @@ final class OverlayWindowController {
     private let controlsChromeHostingView: NSHostingView<OverlayControlsChromeView>
     private let scrollbarHostingView: NSHostingView<OverlayHistoryScrollbarView>
     private let moveButtonHostingView: NSHostingView<OverlayMoveButtonView>
+    private let assistantFollowUpButtonHostingView: NSHostingView<OverlayAssistantActionButtonView>
+    private let assistantAskButtonHostingView: NSHostingView<OverlayAssistantActionButtonView>
     private let closeButtonHostingView: NSHostingView<OverlayCloseButtonView>
     private let resizeButtonHostingView: NSHostingView<OverlayResizeButtonView>
     private let resetSizeButtonHostingView: NSHostingView<OverlayResetSizeButtonView>
@@ -91,6 +95,18 @@ final class OverlayWindowController {
             backing: .buffered,
             defer: false
         )
+        self.assistantFollowUpButtonPanel = OverlayPanel(
+            contentRect: NSRect(origin: .zero, size: Self.controlButtonSize),
+            styleMask: [.borderless, .nonactivatingPanel],
+            backing: .buffered,
+            defer: false
+        )
+        self.assistantAskButtonPanel = OverlayPanel(
+            contentRect: NSRect(origin: .zero, size: Self.controlButtonSize),
+            styleMask: [.borderless, .nonactivatingPanel],
+            backing: .buffered,
+            defer: false
+        )
         self.closeButtonPanel = OverlayPanel(
             contentRect: NSRect(origin: .zero, size: Self.controlButtonSize),
             styleMask: [.borderless, .nonactivatingPanel],
@@ -122,6 +138,12 @@ final class OverlayWindowController {
                 onMoveDragChanged: { _ in },
                 onMoveDragEnded: {}
             )
+        )
+        self.assistantFollowUpButtonHostingView = NSHostingView(
+            rootView: OverlayAssistantActionButtonView(model: model, action: .followUp)
+        )
+        self.assistantAskButtonHostingView = NSHostingView(
+            rootView: OverlayAssistantActionButtonView(model: model, action: .ask)
         )
         self.closeButtonHostingView = NSHostingView(rootView: OverlayCloseButtonView(model: model))
         self.resizeButtonHostingView = NSHostingView(
@@ -183,6 +205,12 @@ final class OverlayWindowController {
         configurePanel(moveButtonPanel, acceptsInput: true, level: controlLevel)
         moveButtonPanel.contentView = moveButtonHostingView
 
+        configurePanel(assistantFollowUpButtonPanel, acceptsInput: true, level: controlLevel)
+        assistantFollowUpButtonPanel.contentView = assistantFollowUpButtonHostingView
+
+        configurePanel(assistantAskButtonPanel, acceptsInput: true, level: controlLevel)
+        assistantAskButtonPanel.contentView = assistantAskButtonHostingView
+
         configurePanel(closeButtonPanel, acceptsInput: true, level: controlLevel)
         closeButtonPanel.contentView = closeButtonHostingView
 
@@ -193,6 +221,7 @@ final class OverlayWindowController {
         resetSizeButtonPanel.contentView = resetSizeButtonHostingView
 
         applyRecordingVisibility(model.overlayStyle.invisibleInRecording)
+        syncOverlayContentInputMode()
     }
 
     private var allPanels: [OverlayPanel] {
@@ -200,11 +229,26 @@ final class OverlayWindowController {
     }
 
     private var leftControlPanels: [OverlayPanel] {
-        [controlsChromePanel, moveButtonPanel, closeButtonPanel, resizeButtonPanel, resetSizeButtonPanel]
+        [
+            controlsChromePanel,
+            moveButtonPanel,
+            assistantFollowUpButtonPanel,
+            assistantAskButtonPanel,
+            closeButtonPanel,
+            resizeButtonPanel,
+            resetSizeButtonPanel,
+        ]
     }
 
     private var leftControlButtonPanels: [OverlayPanel] {
-        [moveButtonPanel, resetSizeButtonPanel, closeButtonPanel, resizeButtonPanel]
+        [
+            moveButtonPanel,
+            assistantFollowUpButtonPanel,
+            assistantAskButtonPanel,
+            resetSizeButtonPanel,
+            closeButtonPanel,
+            resizeButtonPanel,
+        ]
     }
 
     private func configurePanel(_ panel: OverlayPanel, acceptsInput: Bool, level: NSWindow.Level) {
@@ -241,7 +285,24 @@ final class OverlayWindowController {
     var panelSharingTypesForTesting: [NSWindow.SharingType] {
         allPanels.map(\.sharingType)
     }
+
+    var overlayContentAcceptsInputForTesting: Bool {
+        panel.ignoresMouseEvents == false
+    }
 #endif
+
+    private var isInteractiveAssistantReplyMode: Bool {
+        model.assistant.overlayMode == .assistantReplies && model.assistant.replies.isEmpty == false
+    }
+
+    private func syncOverlayContentInputMode(
+        overlayMode: OverlayViewMode? = nil,
+        hasReplies: Bool? = nil
+    ) {
+        let mode = overlayMode ?? model.assistant.overlayMode
+        let hasAssistantReplies = hasReplies ?? (model.assistant.replies.isEmpty == false)
+        panel.ignoresMouseEvents = (mode == .assistantReplies && hasAssistantReplies) == false
+    }
 
     private func bindModel() {
         model.$isOverlayVisible
@@ -266,6 +327,18 @@ final class OverlayWindowController {
 
         model.$overlayStyle
             .sink { [weak self] _ in self?.scheduleWindowSync() }
+            .store(in: &cancellables)
+
+        model.assistant.$overlayMode
+            .sink { [weak self] mode in
+                self?.syncOverlayContentInputMode(overlayMode: mode)
+            }
+            .store(in: &cancellables)
+
+        model.assistant.$replies
+            .sink { [weak self] replies in
+                self?.syncOverlayContentInputMode(hasReplies: replies.isEmpty == false)
+            }
             .store(in: &cancellables)
 
         NotificationCenter.default.publisher(for: NSApplication.didChangeScreenParametersNotification)
@@ -920,7 +993,8 @@ final class OverlayWindowController {
             scrollbarRevealProgress(for: mouseLocation, scrollbarFrame: scrollbarPanel.frame)
         )
 
-        guard model.overlayStyle.clickThrough else {
+        guard model.overlayStyle.clickThrough,
+              isInteractiveAssistantReplyMode == false else {
             interactionState.updatePassThroughBubble(nil)
             return
         }

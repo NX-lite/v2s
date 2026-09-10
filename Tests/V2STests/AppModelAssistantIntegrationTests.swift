@@ -135,6 +135,34 @@ import Testing
         #expect(store.load().assistant == persistedAssistant)
     }
 
+    @Test func assistantActionRouteUsesTheCurrentEmptyTranscriptSnapshot() async {
+        let settingsURL = makeSettingsURL()
+        defer { try? FileManager.default.removeItem(at: settingsURL) }
+
+        let responder = HeldResponder()
+        let assistant = AssistantCoordinator(
+            settings: configuredAssistantSettings(),
+            responder: responder,
+            screenContextProvider: ReadyScreenContextProvider(),
+            promptBuilder: StaticPromptBuilder()
+        )
+        let model = AppModel(
+            settingsStore: SettingsStore(fileURL: settingsURL),
+            sourceCatalogService: SourceCatalogService(),
+            assistant: assistant
+        )
+
+        model.requestAssistant(.followUp)
+        await waitForCall(on: responder)
+
+        #expect(model.hasTranscript == false)
+        #expect(model.assistant.requestState == .running(.followUp))
+        #expect(model.assistant.replies.map(\.action) == [.followUp])
+
+        await responder.release(text: "Empty-context follow up")
+        await drainTasks()
+    }
+
     @Test func stopSessionCancelsAnInFlightAssistantRequestAndIgnoresItsLateResponse() async {
         let settingsURL = makeSettingsURL()
         defer { try? FileManager.default.removeItem(at: settingsURL) }
