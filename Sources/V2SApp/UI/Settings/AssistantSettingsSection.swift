@@ -11,6 +11,30 @@ enum AssistantSettingsForm {
     }
 }
 
+@MainActor
+enum AssistantSettingsBindings {
+    static func binding<Value>(
+        for coordinator: AssistantCoordinator,
+        keyPath: WritableKeyPath<AssistantSettings, Value>
+    ) -> Binding<Value> {
+        Binding(
+            get: { coordinator.settings[keyPath: keyPath] },
+            set: { newValue in
+                update(coordinator) { settings in
+                    settings[keyPath: keyPath] = newValue
+                }
+            }
+        )
+    }
+
+    static func update(
+        _ coordinator: AssistantCoordinator,
+        _ update: (inout AssistantSettings) -> Void
+    ) {
+        coordinator.settings = AssistantSettingsForm.updating(coordinator.settings, update)
+    }
+}
+
 struct AssistantSettingsSection: View {
     @ObservedObject var assistant: AssistantCoordinator
     let interfaceLanguageID: String
@@ -178,18 +202,11 @@ struct AssistantSettingsSection: View {
     private func settingsBinding<Value>(
         _ keyPath: WritableKeyPath<AssistantSettings, Value>
     ) -> Binding<Value> {
-        Binding(
-            get: { assistant.settings[keyPath: keyPath] },
-            set: { newValue in
-                updateSettings { settings in
-                    settings[keyPath: keyPath] = newValue
-                }
-            }
-        )
+        AssistantSettingsBindings.binding(for: assistant, keyPath: keyPath)
     }
 
     private func updateSettings(_ update: (inout AssistantSettings) -> Void) {
-        assistant.settings = AssistantSettingsForm.updating(assistant.settings, update)
+        AssistantSettingsBindings.update(assistant, update)
     }
 
     private func hotKeyError(for action: GlobalHotKeyAction) -> HotKeyRegistrationError? {

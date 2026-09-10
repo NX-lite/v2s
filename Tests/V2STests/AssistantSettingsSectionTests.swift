@@ -1,7 +1,37 @@
+import Combine
 import Testing
 @testable import v2s
 
 @Suite struct AssistantSettingsSectionTests {
+    @Test @MainActor func bindingWritesCoordinatorSettingsAndPublishesTheNewValue() {
+        var initial = AssistantSettings.default
+        initial.apiKey = "existing-key"
+        initial.followUpHotKey = HotKeyBinding(
+            key: "q",
+            useCommand: true,
+            useOption: false,
+            useControl: false,
+            useShift: false
+        )
+        let coordinator = AssistantCoordinator(settings: initial)
+        var publishedSettings = [AssistantSettings]()
+        let observation = coordinator.$settings
+            .dropFirst()
+            .sink { publishedSettings.append($0) }
+
+        let binding = AssistantSettingsBindings.binding(
+            for: coordinator,
+            keyPath: \.baseURL
+        )
+        binding.wrappedValue = "https://example.invalid/v1"
+
+        #expect(coordinator.settings.baseURL == "https://example.invalid/v1")
+        #expect(coordinator.settings.apiKey == "existing-key")
+        #expect(coordinator.settings.followUpHotKey == initial.followUpHotKey)
+        #expect(publishedSettings == [coordinator.settings])
+        withExtendedLifetime(observation) {}
+    }
+
     @Test func formUpdatesCopySettingsWithoutDiscardingOtherFields() {
         var original = AssistantSettings.default
         original.apiKey = "existing-key"
