@@ -100,7 +100,11 @@ struct AssistantPromptBuilderAdapter: AssistantPromptBuilding {
 
 @MainActor
 final class AssistantCoordinator: ObservableObject {
-    @Published var settings: AssistantSettings
+    @Published var settings: AssistantSettings {
+        didSet {
+            invalidateProviderOperationsIfNeeded(previousSettings: oldValue)
+        }
+    }
     @Published private(set) var requestState: AssistantRequestState = .idle
     @Published private(set) var modelFetchState: AssistantModelFetchState = .idle
     @Published private(set) var apiTestState: AssistantAPITestState = .idle
@@ -401,5 +405,33 @@ final class AssistantCoordinator: ObservableObject {
 
     private func isCurrentRequest(_ generation: Int) -> Bool {
         requestGeneration == generation
+    }
+
+    private func invalidateProviderOperationsIfNeeded(previousSettings: AssistantSettings) {
+        guard ProviderConfiguration(previousSettings) != ProviderConfiguration(settings) else {
+            return
+        }
+
+        modelFetchGeneration &+= 1
+        modelFetchTask?.cancel()
+        modelFetchTask = nil
+        modelFetchState = .idle
+
+        apiTestGeneration &+= 1
+        apiTestTask?.cancel()
+        apiTestTask = nil
+        apiTestState = .idle
+    }
+}
+
+private struct ProviderConfiguration: Equatable {
+    let apiKey: String
+    let baseURL: String
+    let model: String
+
+    init(_ settings: AssistantSettings) {
+        apiKey = settings.apiKey
+        baseURL = settings.baseURL
+        model = settings.model
     }
 }

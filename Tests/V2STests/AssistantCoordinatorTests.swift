@@ -193,6 +193,85 @@ import Testing
         #expect(coordinator.apiTestState == .failed(.requestFailed(detail: nil)))
     }
 
+    @Test func providerConfigurationChangeDiscardsStaleSuccessfulOperationResults() async {
+        let responder = ProviderOperationResponderFake()
+        let coordinator = AssistantCoordinator(
+            settings: configuredSettings(),
+            responder: responder,
+            screenContextProvider: ScreenContextFake(contexts: []),
+            promptBuilder: PromptBuilderFake()
+        )
+
+        coordinator.fetchModels()
+        coordinator.testAPI()
+        await waitForProviderOperations(responder)
+
+        var updatedSettings = coordinator.settings
+        updatedSettings.model = "gpt-current"
+        coordinator.settings = updatedSettings
+
+        await responder.releaseModelFetchSuccess(["stale-model"])
+        await responder.releaseAPITestSuccess("stale connection")
+        await drainTasks()
+
+        #expect(coordinator.modelFetchState == .idle)
+        #expect(coordinator.apiTestState == .idle)
+    }
+
+    @Test func providerConfigurationChangeDiscardsStaleFailedOperationResults() async {
+        let responder = ProviderOperationResponderFake()
+        let coordinator = AssistantCoordinator(
+            settings: configuredSettings(),
+            responder: responder,
+            screenContextProvider: ScreenContextFake(contexts: []),
+            promptBuilder: PromptBuilderFake()
+        )
+
+        coordinator.fetchModels()
+        coordinator.testAPI()
+        await waitForProviderOperations(responder)
+
+        var updatedSettings = coordinator.settings
+        updatedSettings.baseURL = "https://new-provider.invalid/v1"
+        coordinator.settings = updatedSettings
+
+        await responder.releaseModelFetchFailure()
+        await responder.releaseAPITestFailure()
+        await drainTasks()
+
+        #expect(coordinator.modelFetchState == .idle)
+        #expect(coordinator.apiTestState == .idle)
+    }
+
+    @Test func skillsAndHotKeyChangesDoNotInvalidateProviderOperations() async {
+        let responder = ProviderOperationResponderFake()
+        let coordinator = AssistantCoordinator(
+            settings: configuredSettings(),
+            responder: responder,
+            screenContextProvider: ScreenContextFake(contexts: []),
+            promptBuilder: PromptBuilderFake()
+        )
+
+        coordinator.fetchModels()
+        coordinator.testAPI()
+        await waitForProviderOperations(responder)
+
+        var updatedSettings = coordinator.settings
+        updatedSettings.skills = "Prefer short answers."
+        updatedSettings.followUpHotKey.useShift = true
+        coordinator.settings = updatedSettings
+
+        await responder.releaseModelFetchSuccess(["current-model"])
+        await responder.releaseAPITestSuccess("current connection")
+        await waitUntil {
+            coordinator.modelFetchState == .fetched(["current-model"])
+                && coordinator.apiTestState == .passed("current connection")
+        }
+
+        #expect(coordinator.modelFetchState == .fetched(["current-model"]))
+        #expect(coordinator.apiTestState == .passed("current connection"))
+    }
+
     @Test func permissionDenialContinuesTextOnlyAndPublishesWarning() async {
         let responder = ResponderFake(steps: [.response("Text-only answer")])
         let coordinator = makeCoordinator(
@@ -434,6 +513,16 @@ import Testing
         Issue.record("Timed out waiting for responder call \(expected)")
     }
 
+    private func waitForProviderOperations(_ responder: ProviderOperationResponderFake) async {
+        for _ in 0..<200 {
+            if await responder.modelFetchCallCount() == 1, await responder.apiTestCallCount() == 1 {
+                return
+            }
+            await Task.yield()
+        }
+        Issue.record("Timed out waiting for provider operations")
+    }
+
     private func waitUntil(_ condition: @escaping () -> Bool) async {
         for _ in 0..<200 {
             if condition() { return }
@@ -592,6 +681,65 @@ private actor ResponderFake: AssistantResponding {
     }
 
     enum ResponderFailure: Error, Sendable {
+        case failed
+    }
+}
+
+private actor ProviderOperationResponderFake: AssistantResponding {
+    private var modelFetchCalls = 0
+    private var apiTestCalls = 0
+    private var modelFetchContinuation: CheckedContinuation<[String], Error>?
+    private var apiTestContinuation: CheckedContinuation<String, Error>?
+
+    nonisolated func validateRequestConfiguration(settings: AssistantSettings) throws {}
+
+    func fetchAvailableModels(settings: AssistantSettings) async throws -> [String] {
+        modelFetchCalls += 1
+        return try await withCheckedThrowingContinuation { continuation in
+            modelFetchContinuation = continuation
+        }
+    }
+
+    func testConnection(settings: AssistantSettings) async throws -> String {
+        apiTestCalls += 1
+        return try await withCheckedThrowingContinuation { continuation in
+            apiTestContinuation = continuation
+        }
+    }
+
+    func respond(
+        settings: AssistantSettings,
+        instructions: String,
+        prompt: String,
+        screenshotPNGData: Data?
+    ) async throws -> OpenAIResponsesClient.Response {
+        throw OperationFailure.failed
+    }
+
+    func releaseModelFetchSuccess(_ models: [String]) {
+        modelFetchContinuation?.resume(returning: models)
+        modelFetchContinuation = nil
+    }
+
+    func releaseModelFetchFailure() {
+        modelFetchContinuation?.resume(throwing: OperationFailure.failed)
+        modelFetchContinuation = nil
+    }
+
+    func releaseAPITestSuccess(_ response: String) {
+        apiTestContinuation?.resume(returning: response)
+        apiTestContinuation = nil
+    }
+
+    func releaseAPITestFailure() {
+        apiTestContinuation?.resume(throwing: OperationFailure.failed)
+        apiTestContinuation = nil
+    }
+
+    func modelFetchCallCount() -> Int { modelFetchCalls }
+    func apiTestCallCount() -> Int { apiTestCalls }
+
+    private enum OperationFailure: Error, Sendable {
         case failed
     }
 }
