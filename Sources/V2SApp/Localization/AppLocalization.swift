@@ -168,9 +168,78 @@ enum AppTextKey: String {
     case launchAtLoginUpdateFailedFormat
     case checkForUpdatesAutomatically
     case checkForUpdates
+    case assistant
+    case followUp
+    case askAssistant
+    case apiKey
+    case apiBaseURL
+    case model
+    case fetchModels
+    case testAPI
+    case skills
+    case autoDetectConversationLanguages
+    case hotKeys
+    case hotKeyFollowUp
+    case hotKeyAsk
+    case hotKeySwitchMode
+    case assistantThinking
+    case assistantRequestFailedFormat
+    case screenPermissionNeeded
+    case screenCaptureFailed
+    case providerRejectedImage
+    case invalidAssistantConfiguration
+    case assistantRequestFailed
+    case screenOCRFailed
+    case hotKeyInvalid
+    case hotKeyDuplicate
+    case hotKeyRegistrationFailedFormat
+    case assistantPrivacyDisclosure
+    case apiKeyPlaceholder
+    case apiBaseURLPlaceholder
+    case modelPlaceholder
+    case skillsPlaceholder
+    case fetchingModels
+    case testingAPI
+    case apiTestPassedFormat
 }
 
 enum AppLocalization {
+    static let assistantTextKeys: [AppTextKey] = [
+        .assistant,
+        .followUp,
+        .askAssistant,
+        .apiKey,
+        .apiBaseURL,
+        .model,
+        .fetchModels,
+        .testAPI,
+        .skills,
+        .autoDetectConversationLanguages,
+        .hotKeys,
+        .hotKeyFollowUp,
+        .hotKeyAsk,
+        .hotKeySwitchMode,
+        .assistantThinking,
+        .assistantRequestFailedFormat,
+        .screenPermissionNeeded,
+        .screenCaptureFailed,
+        .providerRejectedImage,
+        .invalidAssistantConfiguration,
+        .assistantRequestFailed,
+        .screenOCRFailed,
+        .hotKeyInvalid,
+        .hotKeyDuplicate,
+        .hotKeyRegistrationFailedFormat,
+        .assistantPrivacyDisclosure,
+        .apiKeyPlaceholder,
+        .apiBaseURLPlaceholder,
+        .modelPlaceholder,
+        .skillsPlaceholder,
+        .fetchingModels,
+        .testingAPI,
+        .apiTestPassedFormat,
+    ]
+
     static func resolvedInterfaceLanguageID(storedIdentifier: String?) -> String {
         if let storedIdentifier,
            LanguageCatalog.interface.contains(where: { $0.id == storedIdentifier }) {
@@ -251,6 +320,74 @@ enum AppLocalization {
         }
 
         return error.localizedDescription
+    }
+
+    static func hasLocalizedString(_ key: AppTextKey, languageID: String) -> Bool {
+        guard LanguageCatalog.interface.contains(where: { $0.id == languageID }) else {
+            return false
+        }
+        return tables[languageID]?[key.rawValue]?.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty == false
+    }
+
+    static func assistantActionTitle(_ action: AssistantAction, languageID: String) -> String {
+        switch action {
+        case .followUp:
+            string(.followUp, languageID: languageID)
+        case .ask:
+            string(.askAssistant, languageID: languageID)
+        }
+    }
+
+    static func assistantFailureText(_ failure: AssistantFailure, languageID: String) -> String {
+        switch failure {
+        case .invalidConfiguration:
+            return string(.invalidAssistantConfiguration, languageID: languageID)
+        case .requestFailed(let detail):
+            guard let detail, detail.isEmpty == false else {
+                return string(.assistantRequestFailed, languageID: languageID)
+            }
+            return string(.assistantRequestFailedFormat, languageID: languageID, detail)
+        }
+    }
+
+    static func assistantReplyText(_ content: AssistantReplyContent, languageID: String) -> String {
+        switch content {
+        case .thinking:
+            string(.assistantThinking, languageID: languageID)
+        case .response(let response):
+            response
+        case .failure(let failure):
+            assistantFailureText(failure, languageID: languageID)
+        }
+    }
+
+    static func screenContextWarning(_ status: ScreenContextStatus, languageID: String) -> String? {
+        switch status {
+        case .permissionNeeded:
+            string(.screenPermissionNeeded, languageID: languageID)
+        case .captureFailed:
+            string(.screenCaptureFailed, languageID: languageID)
+        case .ocrFailed:
+            string(.screenOCRFailed, languageID: languageID)
+        case .providerRejectedImage:
+            string(.providerRejectedImage, languageID: languageID)
+        case .unknown, .ready, .screenshotSent:
+            nil
+        }
+    }
+
+    static func hotKeyRegistrationErrorText(
+        _ error: HotKeyRegistrationError,
+        languageID: String
+    ) -> String {
+        switch error {
+        case .invalidBinding:
+            string(.hotKeyInvalid, languageID: languageID)
+        case .duplicateBinding:
+            string(.hotKeyDuplicate, languageID: languageID)
+        case .registrationFailed(let status):
+            string(.hotKeyRegistrationFailedFormat, languageID: languageID, String(status))
+        }
     }
 
     static func updateEmbeddedBundleLocalizationLanguageID(_ languageID: String) {
@@ -452,6 +589,39 @@ enum AppLocalization {
             "launchAtLoginUpdateFailedFormat": "Couldn't update launch-at-login setting: %@",
             "checkForUpdatesAutomatically": "Check for Updates Automatically",
             "checkForUpdates": "Check for Updates",
+            "assistant": "Assistant",
+            "followUp": "Follow Up",
+            "askAssistant": "Ask",
+            "apiKey": "API Key",
+            "apiBaseURL": "API Base URL",
+            "model": "Model",
+            "fetchModels": "Fetch Models",
+            "testAPI": "Test API",
+            "skills": "Skills",
+            "autoDetectConversationLanguages": "Auto-detect Conversation Languages",
+            "hotKeys": "Hotkeys",
+            "hotKeyFollowUp": "Follow Up",
+            "hotKeyAsk": "Ask",
+            "hotKeySwitchMode": "Switch Reply Mode",
+            "assistantThinking": "Thinking…",
+            "assistantRequestFailedFormat": "Assistant request failed: %@",
+            "screenPermissionNeeded": "Screen Recording permission is needed to include the current screen.",
+            "screenCaptureFailed": "The current screen couldn't be captured; continuing without it.",
+            "providerRejectedImage": "The provider rejected the screenshot; continuing without it.",
+            "invalidAssistantConfiguration": "Complete the API key, base URL, and model before continuing.",
+            "assistantRequestFailed": "Assistant request failed.",
+            "screenOCRFailed": "The current screen was sent, but its text couldn't be recognized.",
+            "hotKeyInvalid": "Choose a supported key with at least one modifier.",
+            "hotKeyDuplicate": "This hotkey is already used by another assistant action.",
+            "hotKeyRegistrationFailedFormat": "Couldn't register this hotkey (OSStatus %@).",
+            "assistantPrivacyDisclosure": "Assistant requests are sent only after you choose Follow Up or Ask. Your configured provider may receive the transcript, current screen, and OCR text. The API key stays in local settings. Invisible in Recording is the only privacy control for app windows.",
+            "apiKeyPlaceholder": "Enter API key",
+            "apiBaseURLPlaceholder": "https://api.openai.com/v1",
+            "modelPlaceholder": "Enter model name",
+            "skillsPlaceholder": "Optional instructions for the assistant",
+            "fetchingModels": "Fetching models…",
+            "testingAPI": "Testing API…",
+            "apiTestPassedFormat": "Connection succeeded: %@",
         ],
         "zh-Hans": [
             "start": "开始",
@@ -616,6 +786,39 @@ enum AppLocalization {
             "launchAtLoginUpdateFailedFormat": "无法更新登录时启动设置：%@",
             "checkForUpdatesAutomatically": "自动检查更新",
             "checkForUpdates": "检查更新",
+            "assistant": "助手",
+            "followUp": "追问",
+            "askAssistant": "提问",
+            "apiKey": "API 密钥",
+            "apiBaseURL": "API 基础 URL",
+            "model": "模型",
+            "fetchModels": "获取模型",
+            "testAPI": "测试 API",
+            "skills": "技能提示",
+            "autoDetectConversationLanguages": "自动识别对话语言",
+            "hotKeys": "快捷键",
+            "hotKeyFollowUp": "追问",
+            "hotKeyAsk": "提问",
+            "hotKeySwitchMode": "切换回复模式",
+            "assistantThinking": "思考中…",
+            "assistantRequestFailedFormat": "助手请求失败：%@",
+            "screenPermissionNeeded": "需要“屏幕录制”权限才能包含当前屏幕。",
+            "screenCaptureFailed": "无法捕获当前屏幕；将继续但不包含屏幕内容。",
+            "providerRejectedImage": "提供商拒绝了屏幕截图；将继续但不包含图片。",
+            "invalidAssistantConfiguration": "请先填写 API 密钥、基础 URL 和模型。",
+            "assistantRequestFailed": "助手请求失败。",
+            "screenOCRFailed": "已发送当前屏幕，但无法识别其中的文字。",
+            "hotKeyInvalid": "请选择受支持的按键并至少启用一个修饰键。",
+            "hotKeyDuplicate": "此快捷键已被另一项助手操作使用。",
+            "hotKeyRegistrationFailedFormat": "无法注册此快捷键（OSStatus %@）。",
+            "assistantPrivacyDisclosure": "仅在你点击“追问”或“提问”后才会发送助手请求。转录、当前屏幕及 OCR 文本可能会发送给你配置的提供商。API 密钥仅保存在本地设置中。“录屏中隐藏”是应用窗口唯一的隐私开关。",
+            "apiKeyPlaceholder": "输入 API 密钥",
+            "apiBaseURLPlaceholder": "https://api.openai.com/v1",
+            "modelPlaceholder": "输入模型名称",
+            "skillsPlaceholder": "可选的助手指令",
+            "fetchingModels": "正在获取模型…",
+            "testingAPI": "正在测试 API…",
+            "apiTestPassedFormat": "连接成功：%@",
         ],
         "es": [
             "start": "Iniciar",
@@ -780,6 +983,39 @@ enum AppLocalization {
             "launchAtLoginUpdateFailedFormat": "No se pudo actualizar el ajuste de inicio de sesión: %@",
             "checkForUpdatesAutomatically": "Buscar actualizaciones automáticamente",
             "checkForUpdates": "Buscar actualizaciones",
+            "assistant": "Asistente",
+            "followUp": "Seguimiento",
+            "askAssistant": "Preguntar",
+            "apiKey": "Clave de API",
+            "apiBaseURL": "URL base de API",
+            "model": "Modelo",
+            "fetchModels": "Obtener modelos",
+            "testAPI": "Probar API",
+            "skills": "Instrucciones",
+            "autoDetectConversationLanguages": "Detectar automáticamente los idiomas de la conversación",
+            "hotKeys": "Atajos de teclado",
+            "hotKeyFollowUp": "Seguimiento",
+            "hotKeyAsk": "Preguntar",
+            "hotKeySwitchMode": "Cambiar modo de respuestas",
+            "assistantThinking": "Pensando…",
+            "assistantRequestFailedFormat": "Falló la solicitud al asistente: %@",
+            "screenPermissionNeeded": "Se necesita permiso de Grabación de pantalla para incluir la pantalla actual.",
+            "screenCaptureFailed": "No se pudo capturar la pantalla actual; se continuará sin ella.",
+            "providerRejectedImage": "El proveedor rechazó la captura; se continuará sin ella.",
+            "invalidAssistantConfiguration": "Completa la clave de API, la URL base y el modelo antes de continuar.",
+            "assistantRequestFailed": "Falló la solicitud al asistente.",
+            "screenOCRFailed": "Se envió la pantalla actual, pero no se pudo reconocer su texto.",
+            "hotKeyInvalid": "Elige una tecla compatible con al menos un modificador.",
+            "hotKeyDuplicate": "Otro comando del asistente ya usa este atajo.",
+            "hotKeyRegistrationFailedFormat": "No se pudo registrar este atajo (OSStatus %@).",
+            "assistantPrivacyDisclosure": "Las solicitudes al asistente solo se envían después de elegir Seguimiento o Preguntar. Tu proveedor configurado puede recibir la transcripción, la pantalla actual y el texto OCR. La clave de API permanece en los ajustes locales. Invisible en grabaciones es el único control de privacidad de las ventanas de la app.",
+            "apiKeyPlaceholder": "Introduce la clave de API",
+            "apiBaseURLPlaceholder": "https://api.openai.com/v1",
+            "modelPlaceholder": "Introduce el nombre del modelo",
+            "skillsPlaceholder": "Instrucciones opcionales para el asistente",
+            "fetchingModels": "Obteniendo modelos…",
+            "testingAPI": "Probando API…",
+            "apiTestPassedFormat": "Conexión correcta: %@",
         ],
         "de": [
             "start": "Starten",
@@ -944,6 +1180,39 @@ enum AppLocalization {
             "launchAtLoginUpdateFailedFormat": "Die Einstellung für den Start bei der Anmeldung konnte nicht aktualisiert werden: %@",
             "checkForUpdatesAutomatically": "Automatisch nach Updates suchen",
             "checkForUpdates": "Nach Updates suchen",
+            "assistant": "Assistent",
+            "followUp": "Nachfrage",
+            "askAssistant": "Fragen",
+            "apiKey": "API-Schlüssel",
+            "apiBaseURL": "API-Basis-URL",
+            "model": "Modell",
+            "fetchModels": "Modelle abrufen",
+            "testAPI": "API testen",
+            "skills": "Anweisungen",
+            "autoDetectConversationLanguages": "Gesprächssprachen automatisch erkennen",
+            "hotKeys": "Tastenkürzel",
+            "hotKeyFollowUp": "Nachfrage",
+            "hotKeyAsk": "Fragen",
+            "hotKeySwitchMode": "Antwortmodus wechseln",
+            "assistantThinking": "Denkt nach…",
+            "assistantRequestFailedFormat": "Assistentenanfrage fehlgeschlagen: %@",
+            "screenPermissionNeeded": "Für die aktuelle Bildschirmaufnahme wird die Berechtigung „Bildschirmaufnahme“ benötigt.",
+            "screenCaptureFailed": "Der aktuelle Bildschirm konnte nicht erfasst werden; es wird ohne ihn fortgefahren.",
+            "providerRejectedImage": "Der Anbieter hat den Screenshot abgelehnt; es wird ohne ihn fortgefahren.",
+            "invalidAssistantConfiguration": "Vervollständigen Sie API-Schlüssel, Basis-URL und Modell, bevor Sie fortfahren.",
+            "assistantRequestFailed": "Assistentenanfrage fehlgeschlagen.",
+            "screenOCRFailed": "Der aktuelle Bildschirm wurde gesendet, sein Text konnte jedoch nicht erkannt werden.",
+            "hotKeyInvalid": "Wählen Sie eine unterstützte Taste mit mindestens einer Zusatztaste.",
+            "hotKeyDuplicate": "Dieses Tastenkürzel wird bereits von einer anderen Assistentenaktion verwendet.",
+            "hotKeyRegistrationFailedFormat": "Dieses Tastenkürzel konnte nicht registriert werden (OSStatus %@).",
+            "assistantPrivacyDisclosure": "Assistentenanfragen werden erst gesendet, nachdem Sie Nachfrage oder Fragen ausgewählt haben. Ihr konfigurierter Anbieter kann das Transkript, den aktuellen Bildschirm und OCR-Text erhalten. Der API-Schlüssel bleibt in lokalen Einstellungen. In Aufnahmen unsichtbar ist die einzige Datenschutzeinstellung für App-Fenster.",
+            "apiKeyPlaceholder": "API-Schlüssel eingeben",
+            "apiBaseURLPlaceholder": "https://api.openai.com/v1",
+            "modelPlaceholder": "Modellname eingeben",
+            "skillsPlaceholder": "Optionale Anweisungen für den Assistenten",
+            "fetchingModels": "Modelle werden abgerufen…",
+            "testingAPI": "API wird getestet…",
+            "apiTestPassedFormat": "Verbindung erfolgreich: %@",
         ],
         "ja": [
             "start": "開始",
@@ -1108,6 +1377,39 @@ enum AppLocalization {
             "launchAtLoginUpdateFailedFormat": "ログイン時に起動する設定を更新できませんでした: %@",
             "checkForUpdatesAutomatically": "アップデートを自動的に確認",
             "checkForUpdates": "アップデートを確認",
+            "assistant": "アシスタント",
+            "followUp": "追加質問",
+            "askAssistant": "質問",
+            "apiKey": "API キー",
+            "apiBaseURL": "API ベース URL",
+            "model": "モデル",
+            "fetchModels": "モデルを取得",
+            "testAPI": "API をテスト",
+            "skills": "指示",
+            "autoDetectConversationLanguages": "会話の言語を自動検出",
+            "hotKeys": "ホットキー",
+            "hotKeyFollowUp": "追加質問",
+            "hotKeyAsk": "質問",
+            "hotKeySwitchMode": "回答モードを切り替え",
+            "assistantThinking": "考え中…",
+            "assistantRequestFailedFormat": "アシスタントへのリクエストに失敗しました: %@",
+            "screenPermissionNeeded": "現在の画面を含めるには画面収録の許可が必要です。",
+            "screenCaptureFailed": "現在の画面をキャプチャできませんでした。画面なしで続行します。",
+            "providerRejectedImage": "プロバイダーがスクリーンショットを拒否しました。画像なしで続行します。",
+            "invalidAssistantConfiguration": "続行する前に API キー、ベース URL、モデルを入力してください。",
+            "assistantRequestFailed": "アシスタントへのリクエストに失敗しました。",
+            "screenOCRFailed": "現在の画面は送信されましたが、文字を認識できませんでした。",
+            "hotKeyInvalid": "少なくとも 1 つの修飾キーを含む対応キーを選択してください。",
+            "hotKeyDuplicate": "このホットキーは別のアシスタント操作で既に使われています。",
+            "hotKeyRegistrationFailedFormat": "このホットキーを登録できませんでした（OSStatus %@）。",
+            "assistantPrivacyDisclosure": "アシスタントへのリクエストは、追加質問または質問を選んだ後にのみ送信されます。設定したプロバイダーはトランスクリプト、現在の画面、OCR テキストを受け取ることがあります。API キーはローカル設定に保存されます。録画に映さないはアプリのウインドウに対する唯一のプライバシー設定です。",
+            "apiKeyPlaceholder": "API キーを入力",
+            "apiBaseURLPlaceholder": "https://api.openai.com/v1",
+            "modelPlaceholder": "モデル名を入力",
+            "skillsPlaceholder": "アシスタントへの任意の指示",
+            "fetchingModels": "モデルを取得中…",
+            "testingAPI": "API をテスト中…",
+            "apiTestPassedFormat": "接続に成功しました: %@",
         ],
         "fr": [
             "start": "Démarrer",
@@ -1272,6 +1574,39 @@ enum AppLocalization {
             "launchAtLoginUpdateFailedFormat": "Impossible de mettre à jour le réglage d’ouverture à la connexion : %@",
             "checkForUpdatesAutomatically": "Rechercher les mises à jour automatiquement",
             "checkForUpdates": "Rechercher les mises à jour",
+            "assistant": "Assistant",
+            "followUp": "Suivi",
+            "askAssistant": "Demander",
+            "apiKey": "Clé API",
+            "apiBaseURL": "URL de base API",
+            "model": "Modèle",
+            "fetchModels": "Récupérer les modèles",
+            "testAPI": "Tester l’API",
+            "skills": "Instructions",
+            "autoDetectConversationLanguages": "Détecter automatiquement les langues de la conversation",
+            "hotKeys": "Raccourcis clavier",
+            "hotKeyFollowUp": "Suivi",
+            "hotKeyAsk": "Demander",
+            "hotKeySwitchMode": "Changer le mode de réponse",
+            "assistantThinking": "Réflexion…",
+            "assistantRequestFailedFormat": "Échec de la demande à l’assistant : %@",
+            "screenPermissionNeeded": "L’autorisation d’enregistrement de l’écran est nécessaire pour inclure l’écran actuel.",
+            "screenCaptureFailed": "L’écran actuel n’a pas pu être capturé ; poursuite sans celui-ci.",
+            "providerRejectedImage": "Le fournisseur a refusé la capture ; poursuite sans celle-ci.",
+            "invalidAssistantConfiguration": "Renseignez la clé API, l’URL de base et le modèle avant de continuer.",
+            "assistantRequestFailed": "Échec de la demande à l’assistant.",
+            "screenOCRFailed": "L’écran actuel a été envoyé, mais son texte n’a pas pu être reconnu.",
+            "hotKeyInvalid": "Choisissez une touche prise en charge avec au moins un modificateur.",
+            "hotKeyDuplicate": "Ce raccourci est déjà utilisé par une autre action de l’assistant.",
+            "hotKeyRegistrationFailedFormat": "Impossible d’enregistrer ce raccourci (OSStatus %@).",
+            "assistantPrivacyDisclosure": "Les demandes à l’assistant ne sont envoyées qu’après avoir choisi Suivi ou Demander. Votre fournisseur configuré peut recevoir la transcription, l’écran actuel et le texte OCR. La clé API reste dans les réglages locaux. Invisible à l’enregistrement est le seul contrôle de confidentialité des fenêtres de l’app.",
+            "apiKeyPlaceholder": "Saisissez la clé API",
+            "apiBaseURLPlaceholder": "https://api.openai.com/v1",
+            "modelPlaceholder": "Saisissez le nom du modèle",
+            "skillsPlaceholder": "Instructions facultatives pour l’assistant",
+            "fetchingModels": "Récupération des modèles…",
+            "testingAPI": "Test de l’API…",
+            "apiTestPassedFormat": "Connexion réussie : %@",
         ],
         "ko": [
             "start": "시작",
@@ -1436,6 +1771,39 @@ enum AppLocalization {
             "launchAtLoginUpdateFailedFormat": "로그인 시 실행 설정을 업데이트할 수 없습니다: %@",
             "checkForUpdatesAutomatically": "자동으로 업데이트 확인",
             "checkForUpdates": "업데이트 확인",
+            "assistant": "어시스턴트",
+            "followUp": "추가 질문",
+            "askAssistant": "질문",
+            "apiKey": "API 키",
+            "apiBaseURL": "API 기본 URL",
+            "model": "모델",
+            "fetchModels": "모델 가져오기",
+            "testAPI": "API 테스트",
+            "skills": "지침",
+            "autoDetectConversationLanguages": "대화 언어 자동 감지",
+            "hotKeys": "단축키",
+            "hotKeyFollowUp": "추가 질문",
+            "hotKeyAsk": "질문",
+            "hotKeySwitchMode": "답변 모드 전환",
+            "assistantThinking": "생각하는 중…",
+            "assistantRequestFailedFormat": "어시스턴트 요청 실패: %@",
+            "screenPermissionNeeded": "현재 화면을 포함하려면 화면 기록 권한이 필요합니다.",
+            "screenCaptureFailed": "현재 화면을 캡처할 수 없어 화면 없이 계속합니다.",
+            "providerRejectedImage": "제공자가 스크린샷을 거부하여 이미지 없이 계속합니다.",
+            "invalidAssistantConfiguration": "계속하기 전에 API 키, 기본 URL 및 모델을 입력하세요.",
+            "assistantRequestFailed": "어시스턴트 요청에 실패했습니다.",
+            "screenOCRFailed": "현재 화면은 전송되었지만 텍스트를 인식할 수 없었습니다.",
+            "hotKeyInvalid": "하나 이상의 보조 키가 있는 지원 키를 선택하세요.",
+            "hotKeyDuplicate": "이 단축키는 다른 어시스턴트 작업에서 이미 사용 중입니다.",
+            "hotKeyRegistrationFailedFormat": "이 단축키를 등록할 수 없습니다(OSStatus %@).",
+            "assistantPrivacyDisclosure": "어시스턴트 요청은 추가 질문 또는 질문을 선택한 후에만 전송됩니다. 설정한 제공업체는 기록, 현재 화면 및 OCR 텍스트를 받을 수 있습니다. API 키는 로컬 설정에 유지됩니다. 녹화에 표시 안 함은 앱 창의 유일한 개인정보 보호 설정입니다.",
+            "apiKeyPlaceholder": "API 키 입력",
+            "apiBaseURLPlaceholder": "https://api.openai.com/v1",
+            "modelPlaceholder": "모델 이름 입력",
+            "skillsPlaceholder": "어시스턴트에 대한 선택적 지침",
+            "fetchingModels": "모델 가져오는 중…",
+            "testingAPI": "API 테스트 중…",
+            "apiTestPassedFormat": "연결 성공: %@",
         ],
         "ar": [
             "start": "ابدأ",
@@ -1600,6 +1968,39 @@ enum AppLocalization {
             "launchAtLoginUpdateFailedFormat": "تعذر تحديث إعداد التشغيل عند تسجيل الدخول: %@",
             "checkForUpdatesAutomatically": "التحقق من التحديثات تلقائيًا",
             "checkForUpdates": "التحقق من التحديثات",
+            "assistant": "المساعد",
+            "followUp": "متابعة",
+            "askAssistant": "اسأل",
+            "apiKey": "مفتاح API",
+            "apiBaseURL": "عنوان URL الأساسي لـ API",
+            "model": "النموذج",
+            "fetchModels": "جلب النماذج",
+            "testAPI": "اختبار API",
+            "skills": "التعليمات",
+            "autoDetectConversationLanguages": "اكتشاف لغات المحادثة تلقائيًا",
+            "hotKeys": "المفاتيح الساخنة",
+            "hotKeyFollowUp": "متابعة",
+            "hotKeyAsk": "اسأل",
+            "hotKeySwitchMode": "تبديل وضع الإجابات",
+            "assistantThinking": "جارٍ التفكير…",
+            "assistantRequestFailedFormat": "فشل طلب المساعد: %@",
+            "screenPermissionNeeded": "يلزم إذن تسجيل الشاشة لتضمين الشاشة الحالية.",
+            "screenCaptureFailed": "تعذر التقاط الشاشة الحالية؛ ستتم المتابعة بدونها.",
+            "providerRejectedImage": "رفض الموفّر لقطة الشاشة؛ ستتم المتابعة بدونها.",
+            "invalidAssistantConfiguration": "أكمل مفتاح API وعنوان URL الأساسي والنموذج قبل المتابعة.",
+            "assistantRequestFailed": "فشل طلب المساعد.",
+            "screenOCRFailed": "أُرسلت الشاشة الحالية، لكن تعذر التعرف على النص فيها.",
+            "hotKeyInvalid": "اختر مفتاحًا مدعومًا مع مفتاح تعديل واحد على الأقل.",
+            "hotKeyDuplicate": "هذا المفتاح الساخن مستخدم بالفعل لإجراء مساعد آخر.",
+            "hotKeyRegistrationFailedFormat": "تعذر تسجيل هذا المفتاح الساخن (OSStatus %@).",
+            "assistantPrivacyDisclosure": "لا تُرسل طلبات المساعد إلا بعد اختيار متابعة أو اسأل. قد يتلقى الموفّر الذي أعددته النص المفرغ والشاشة الحالية ونص OCR. يبقى مفتاح API في الإعدادات المحلية. غير مرئي في التسجيل هو إعداد الخصوصية الوحيد لنوافذ التطبيق.",
+            "apiKeyPlaceholder": "أدخل مفتاح API",
+            "apiBaseURLPlaceholder": "https://api.openai.com/v1",
+            "modelPlaceholder": "أدخل اسم النموذج",
+            "skillsPlaceholder": "تعليمات اختيارية للمساعد",
+            "fetchingModels": "جارٍ جلب النماذج…",
+            "testingAPI": "جارٍ اختبار API…",
+            "apiTestPassedFormat": "نجح الاتصال: %@",
         ],
         "pt": [
             "start": "Iniciar",
@@ -1764,6 +2165,39 @@ enum AppLocalization {
             "launchAtLoginUpdateFailedFormat": "Não foi possível atualizar a configuração de início de sessão: %@",
             "checkForUpdatesAutomatically": "Verificar atualizações automaticamente",
             "checkForUpdates": "Verificar atualizações",
+            "assistant": "Assistente",
+            "followUp": "Acompanhar",
+            "askAssistant": "Perguntar",
+            "apiKey": "Chave de API",
+            "apiBaseURL": "URL base da API",
+            "model": "Modelo",
+            "fetchModels": "Buscar modelos",
+            "testAPI": "Testar API",
+            "skills": "Instruções",
+            "autoDetectConversationLanguages": "Detectar idiomas da conversa automaticamente",
+            "hotKeys": "Atalhos de teclado",
+            "hotKeyFollowUp": "Acompanhar",
+            "hotKeyAsk": "Perguntar",
+            "hotKeySwitchMode": "Alternar modo de respostas",
+            "assistantThinking": "Pensando…",
+            "assistantRequestFailedFormat": "Falha na solicitação ao assistente: %@",
+            "screenPermissionNeeded": "É necessária permissão de Gravação de Tela para incluir a tela atual.",
+            "screenCaptureFailed": "Não foi possível capturar a tela atual; continuando sem ela.",
+            "providerRejectedImage": "O provedor recusou a captura de tela; continuando sem ela.",
+            "invalidAssistantConfiguration": "Preencha a chave de API, a URL base e o modelo antes de continuar.",
+            "assistantRequestFailed": "Falha na solicitação ao assistente.",
+            "screenOCRFailed": "A tela atual foi enviada, mas o texto não pôde ser reconhecido.",
+            "hotKeyInvalid": "Escolha uma tecla compatível com pelo menos um modificador.",
+            "hotKeyDuplicate": "Este atalho já é usado por outra ação do assistente.",
+            "hotKeyRegistrationFailedFormat": "Não foi possível registrar este atalho (OSStatus %@).",
+            "assistantPrivacyDisclosure": "As solicitações ao assistente só são enviadas depois que você escolhe Acompanhar ou Perguntar. Seu provedor configurado pode receber a transcrição, a tela atual e o texto OCR. A chave de API permanece nas configurações locais. Invisível em gravações é o único controle de privacidade das janelas do app.",
+            "apiKeyPlaceholder": "Insira a chave de API",
+            "apiBaseURLPlaceholder": "https://api.openai.com/v1",
+            "modelPlaceholder": "Insira o nome do modelo",
+            "skillsPlaceholder": "Instruções opcionais para o assistente",
+            "fetchingModels": "Buscando modelos…",
+            "testingAPI": "Testando API…",
+            "apiTestPassedFormat": "Conexão bem-sucedida: %@",
         ],
         "ru": [
             "start": "Запустить",
@@ -1928,6 +2362,39 @@ enum AppLocalization {
             "launchAtLoginUpdateFailedFormat": "Не удалось обновить параметр запуска при входе: %@",
             "checkForUpdatesAutomatically": "Автоматически проверять обновления",
             "checkForUpdates": "Проверить обновления",
+            "assistant": "Ассистент",
+            "followUp": "Уточнить",
+            "askAssistant": "Спросить",
+            "apiKey": "Ключ API",
+            "apiBaseURL": "Базовый URL API",
+            "model": "Модель",
+            "fetchModels": "Получить модели",
+            "testAPI": "Проверить API",
+            "skills": "Инструкции",
+            "autoDetectConversationLanguages": "Автоматически определять языки разговора",
+            "hotKeys": "Горячие клавиши",
+            "hotKeyFollowUp": "Уточнить",
+            "hotKeyAsk": "Спросить",
+            "hotKeySwitchMode": "Переключить режим ответов",
+            "assistantThinking": "Думаю…",
+            "assistantRequestFailedFormat": "Ошибка запроса к ассистенту: %@",
+            "screenPermissionNeeded": "Чтобы включить текущий экран, требуется разрешение на запись экрана.",
+            "screenCaptureFailed": "Не удалось захватить текущий экран; продолжение без него.",
+            "providerRejectedImage": "Поставщик отклонил снимок экрана; продолжение без него.",
+            "invalidAssistantConfiguration": "Перед продолжением заполните ключ API, базовый URL и модель.",
+            "assistantRequestFailed": "Ошибка запроса к ассистенту.",
+            "screenOCRFailed": "Текущий экран был отправлен, но его текст не удалось распознать.",
+            "hotKeyInvalid": "Выберите поддерживаемую клавишу хотя бы с одним модификатором.",
+            "hotKeyDuplicate": "Эта горячая клавиша уже используется другим действием ассистента.",
+            "hotKeyRegistrationFailedFormat": "Не удалось зарегистрировать эту горячую клавишу (OSStatus %@).",
+            "assistantPrivacyDisclosure": "Запросы к ассистенту отправляются только после выбора «Уточнить» или «Спросить». Настроенный поставщик может получить транскрипцию, текущий экран и текст OCR. Ключ API хранится в локальных настройках. Скрыть при записи — единственный элемент управления приватностью для окон приложения.",
+            "apiKeyPlaceholder": "Введите ключ API",
+            "apiBaseURLPlaceholder": "https://api.openai.com/v1",
+            "modelPlaceholder": "Введите имя модели",
+            "skillsPlaceholder": "Необязательные инструкции для ассистента",
+            "fetchingModels": "Получение моделей…",
+            "testingAPI": "Проверка API…",
+            "apiTestPassedFormat": "Подключение успешно: %@",
         ],
     ]
 }

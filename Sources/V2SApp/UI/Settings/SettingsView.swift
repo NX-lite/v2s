@@ -181,6 +181,12 @@ struct SettingsView: View {
                     LanguageResourcesFooter(model: model)
                 }
                 settingsCard {
+                    AssistantSettingsSection(
+                        assistant: model.assistant,
+                        interfaceLanguageID: model.resolvedInterfaceLanguageID
+                    )
+                }
+                settingsCard {
                     sectionHeader(model.localized(.updates), icon: "arrow.triangle.2.circlepath")
                     settingsRow(model.localized(.openAtLogin)) {
                         Toggle("", isOn: launchAtLoginBinding)
