@@ -583,6 +583,9 @@ final class AppModel: ObservableObject {
         guard selectedSources.isEmpty == false else {
             sessionState = .error
             setStatus(.chooseInputSourceBeforeStarting)
+            isOverlayVisible = false
+            overlayState = nil
+            overlayHistoryScrollOffset = 0
             return
         }
         let selectedSourceName = selectedSourceDisplayName
@@ -2174,14 +2177,6 @@ final class AppModel: ObservableObject {
     private func presentAssistantRepliesIfNeeded(_ replies: [AssistantReply]) {
         guard replies.isEmpty == false else {
             return
-        }
-
-        if overlayState == nil {
-            overlayState = OverlayPreviewState(
-                translatedText: "",
-                sourceText: "",
-                sourceName: selectedSourceDisplayName
-            )
         }
         isOverlayVisible = true
     }

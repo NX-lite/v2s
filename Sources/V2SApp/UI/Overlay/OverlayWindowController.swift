@@ -289,10 +289,41 @@ final class OverlayWindowController {
     var overlayContentAcceptsInputForTesting: Bool {
         panel.ignoresMouseEvents == false
     }
+
+    var shouldShowContentForTesting: Bool {
+        shouldShowContent
+    }
+
+    var panelsShownForTesting: Bool {
+        panelsShown
+    }
+
+    var hasPendingHideSnapshotForTesting: Bool {
+        pendingHideSnapshot != nil
+    }
 #endif
 
     private var isInteractiveAssistantReplyMode: Bool {
         model.assistant.overlayMode == .assistantReplies && model.assistant.replies.isEmpty == false
+    }
+
+    private var shouldShowContent: Bool {
+        shouldShowContent(
+            isOverlayVisible: model.isOverlayVisible,
+            overlayState: model.overlayState,
+            overlayMode: model.assistant.overlayMode,
+            hasAssistantReplies: model.assistant.replies.isEmpty == false
+        )
+    }
+
+    private func shouldShowContent(
+        isOverlayVisible: Bool,
+        overlayState: OverlayPreviewState?,
+        overlayMode: OverlayViewMode,
+        hasAssistantReplies: Bool
+    ) -> Bool {
+        isOverlayVisible
+            && (overlayState != nil || (overlayMode == .assistantReplies && hasAssistantReplies))
     }
 
     private func syncOverlayContentInputMode(
@@ -331,13 +362,28 @@ final class OverlayWindowController {
 
         model.assistant.$overlayMode
             .sink { [weak self] mode in
-                self?.syncOverlayContentInputMode(overlayMode: mode)
+                guard let self else { return }
+                self.syncOverlayContentInputMode(overlayMode: mode)
+                self.captureHideSnapshotIfNeeded(
+                    newVisible: self.model.isOverlayVisible,
+                    newState: self.model.overlayState,
+                    newOverlayMode: mode
+                )
+                self.scheduleWindowSync()
             }
             .store(in: &cancellables)
 
         model.assistant.$replies
             .sink { [weak self] replies in
-                self?.syncOverlayContentInputMode(hasReplies: replies.isEmpty == false)
+                guard let self else { return }
+                let hasReplies = replies.isEmpty == false
+                self.syncOverlayContentInputMode(hasReplies: hasReplies)
+                self.captureHideSnapshotIfNeeded(
+                    newVisible: self.model.isOverlayVisible,
+                    newState: self.model.overlayState,
+                    newHasAssistantReplies: hasReplies
+                )
+                self.scheduleWindowSync()
             }
             .store(in: &cancellables)
 
@@ -368,8 +414,18 @@ final class OverlayWindowController {
 
     /// Pre-capture a snapshot of the overlay while content is still rendered.
     /// Called synchronously from Combine sinks (during willSet, before SwiftUI updates).
-    private func captureHideSnapshotIfNeeded(newVisible: Bool, newState: OverlayPreviewState?) {
-        let willShow = newVisible && newState != nil
+    private func captureHideSnapshotIfNeeded(
+        newVisible: Bool,
+        newState: OverlayPreviewState?,
+        newOverlayMode: OverlayViewMode? = nil,
+        newHasAssistantReplies: Bool? = nil
+    ) {
+        let willShow = shouldShowContent(
+            isOverlayVisible: newVisible,
+            overlayState: newState,
+            overlayMode: newOverlayMode ?? model.assistant.overlayMode,
+            hasAssistantReplies: newHasAssistantReplies ?? (model.assistant.replies.isEmpty == false)
+        )
         guard !willShow, panelsShown, pendingHideSnapshot == nil else { return }
         pendingHideSnapshot = createSnapshotWindow(of: panel, frame: panel.frame)
     }
@@ -398,7 +454,7 @@ final class OverlayWindowController {
     }
 
     private func syncWindow() {
-        let shouldShow = model.isOverlayVisible && model.overlayState != nil
+        let shouldShow = shouldShowContent
 
         if shouldShow && !panelsShown {
             // Transition: hidden → visible
@@ -980,8 +1036,7 @@ final class OverlayWindowController {
     }
 
     private func updatePassThroughBubble() {
-        guard model.isOverlayVisible,
-              model.overlayState != nil else {
+        guard shouldShowContent else {
             interactionState.updateScrollbarRevealProgress(0.0)
             interactionState.updatePassThroughBubble(nil)
             return
@@ -1032,8 +1087,7 @@ final class OverlayWindowController {
     }
 
     private func desiredMouseTrackingMode(for mouseLocation: NSPoint) -> MouseTrackingMode {
-        guard model.isOverlayVisible,
-              model.overlayState != nil,
+        guard shouldShowContent,
               panelsShown else {
             return .idle
         }

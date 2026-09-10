@@ -197,7 +197,7 @@ import Testing
         #expect(model.assistant.replies.map(\.content) == [.thinking])
         #expect(model.assistant.overlayMode == .assistantReplies)
         #expect(model.isOverlayVisible)
-        #expect(model.overlayState != nil)
+        #expect(model.overlayState == nil)
 
         await responder.release(text: "Answer after capture")
         await drainTasks()
@@ -220,7 +220,7 @@ import Testing
         ])
         #expect(model.assistant.overlayMode == .assistantReplies)
         #expect(model.isOverlayVisible)
-        #expect(model.overlayState != nil)
+        #expect(model.overlayState == nil)
     }
 
     @Test func startingANewSessionResetsAssistantRepliesAndDiscardsLateResponse() async {
@@ -269,6 +269,8 @@ import Testing
         #expect(assistant.replyScrollOffset == 0)
         #expect(assistant.replyVisibleCount == 0)
         #expect(assistant.overlayMode == .subtitles)
+        #expect(model.isOverlayVisible == false)
+        #expect(model.overlayState == nil)
 
         await responder.release(text: "Late reply from the old session")
         await drainTasks()
