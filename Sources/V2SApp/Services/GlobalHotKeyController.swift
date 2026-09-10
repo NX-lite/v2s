@@ -154,6 +154,7 @@ final class GlobalHotKeyController: ObservableObject {
     func invalidate() {
         unregisterAll()
         removeEventHandler()
+        errors = [:]
     }
 
     static func makePlan(
@@ -236,6 +237,30 @@ final class GlobalHotKeyController: ObservableObject {
         if binding.useControl { modifiers |= UInt32(controlKey) }
         if binding.useShift { modifiers |= UInt32(shiftKey) }
         return modifiers
+    }
+}
+
+@MainActor
+final class AssistantHotKeyRegistrationErrorBridge {
+    private weak var assistant: AssistantCoordinator?
+    private var errorsCancellable: AnyCancellable?
+
+    init(controller: GlobalHotKeyController, assistant: AssistantCoordinator) {
+        self.assistant = assistant
+        errorsCancellable = controller.$errors
+            .sink { [weak assistant] errors in
+                assistant?.updateHotKeyRegistrationErrors(errors)
+            }
+    }
+
+    func invalidate() {
+        errorsCancellable?.cancel()
+        errorsCancellable = nil
+        assistant?.updateHotKeyRegistrationErrors([:])
+    }
+
+    deinit {
+        errorsCancellable?.cancel()
     }
 }
 

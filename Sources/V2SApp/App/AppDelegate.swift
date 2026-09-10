@@ -13,6 +13,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     private var settingsWindowController: SettingsWindowController?
     private var overlayWindowController: OverlayWindowController?
     private var globalHotKeyController: GlobalHotKeyController?
+    private var hotKeyRegistrationErrorBridge: AssistantHotKeyRegistrationErrorBridge?
     private var singleInstanceWakeObserver: NSObjectProtocol?
     private var singleInstanceLockDescriptor: Int32 = -1
     private var sourceRefreshTimer: Timer?
@@ -110,6 +111,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             switchMode: currentHotKeys.switchMode
         )
         self.globalHotKeyController = globalHotKeyController
+        self.hotKeyRegistrationErrorBridge = AssistantHotKeyRegistrationErrorBridge(
+            controller: globalHotKeyController,
+            assistant: appModel.assistant
+        )
 
         overlayWindowController.trayIconRectProvider = { [weak self] in
             self?.statusBarController?.statusItemScreenRect
@@ -428,6 +433,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     func applicationWillTerminate(_ notification: Notification) {
         appModel.assistant.cancelRequest()
         globalHotKeyController?.invalidate()
+        hotKeyRegistrationErrorBridge?.invalidate()
+        hotKeyRegistrationErrorBridge = nil
+        appModel.assistant.updateHotKeyRegistrationErrors([:])
         globalHotKeyController = nil
         if let singleInstanceWakeObserver {
             DistributedNotificationCenter.default().removeObserver(singleInstanceWakeObserver)

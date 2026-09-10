@@ -106,6 +106,7 @@ final class AssistantCoordinator: ObservableObject {
     @Published private(set) var apiTestState: AssistantAPITestState = .idle
     @Published private(set) var replies: [AssistantReply] = []
     @Published private(set) var screenStatus: ScreenContextStatus = .unknown
+    @Published private(set) var hotKeyRegistrationErrors: [GlobalHotKeyAction: HotKeyRegistrationError] = [:]
     @Published var overlayMode: OverlayViewMode = .subtitles
     @Published private(set) var replyScrollOffset = 0
     @Published private(set) var replyVisibleCount = 0
@@ -219,6 +220,12 @@ final class AssistantCoordinator: ObservableObject {
 
     func toggleOverlayMode() {
         overlayMode = overlayMode == .subtitles ? .assistantReplies : .subtitles
+    }
+
+    func updateHotKeyRegistrationErrors(
+        _ errors: [GlobalHotKeyAction: HotKeyRegistrationError]
+    ) {
+        hotKeyRegistrationErrors = errors
     }
 
     func scrollReplies(by delta: Int) {

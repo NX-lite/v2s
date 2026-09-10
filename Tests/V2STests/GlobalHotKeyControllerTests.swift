@@ -183,6 +183,51 @@ import Testing
         #expect(controller.errors.isEmpty)
     }
 
+    @Test func errorBridgePublishesExistingAndSubsequentRegistrationErrorsToAssistant() {
+        let registrar = RecordingHotKeyRegistrar()
+        let controller = GlobalHotKeyController(
+            onAction: { _ in },
+            registrar: registrar,
+            eventInstaller: RecordingHotKeyEventInstaller()
+        )
+        controller.update(
+            followUp: binding(key: "f"),
+            ask: binding(key: "f", command: true),
+            switchMode: binding(key: "F", command: true)
+        )
+        let assistant = AssistantCoordinator()
+        let bridge = AssistantHotKeyRegistrationErrorBridge(
+            controller: controller,
+            assistant: assistant
+        )
+
+        #expect(assistant.hotKeyRegistrationErrors == [
+            .followUp: .invalidBinding,
+            .ask: .duplicateBinding,
+            .switchMode: .duplicateBinding,
+        ])
+
+        controller.update(
+            followUp: .defaultFollowUp,
+            ask: .defaultAsk,
+            switchMode: .defaultSwitchMode
+        )
+        #expect(assistant.hotKeyRegistrationErrors.isEmpty)
+
+        registrar.setFailure(status: -8080, for: .ask)
+        controller.update(
+            followUp: .defaultFollowUp,
+            ask: .defaultAsk,
+            switchMode: .defaultSwitchMode
+        )
+        #expect(assistant.hotKeyRegistrationErrors == [.ask: .registrationFailed(-8080)])
+
+        controller.invalidate()
+        #expect(controller.errors.isEmpty)
+        #expect(assistant.hotKeyRegistrationErrors.isEmpty)
+        bridge.invalidate()
+    }
+
     @Test func eventRoutingIgnoresForeignSignaturesAndUnknownActions() {
         #expect(GlobalHotKeyController.action(for: .init(
             signature: GlobalHotKeyController.eventSignature,
@@ -216,13 +261,17 @@ import Testing
 }
 
 private final class RecordingHotKeyRegistrar: GlobalHotKeyRegistering {
-    private let failing: [GlobalHotKeyAction: OSStatus]
+    private var failing: [GlobalHotKeyAction: OSStatus]
     private(set) var registeredActions: [GlobalHotKeyAction] = []
     private(set) var unregisteredActions: [GlobalHotKeyAction] = []
     private(set) var activeActions: [GlobalHotKeyAction] = []
 
     init(failing: [GlobalHotKeyAction: OSStatus] = [:]) {
         self.failing = failing
+    }
+
+    func setFailure(status: OSStatus?, for action: GlobalHotKeyAction) {
+        failing[action] = status
     }
 
     func register(
