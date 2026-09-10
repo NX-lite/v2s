@@ -178,6 +178,19 @@ final class AssistantCoordinator: ObservableObject {
         clampReplyScrollOffset()
     }
 
+    func resetForNewSession() {
+        requestGeneration &+= 1
+        requestTask?.cancel()
+        requestTask = nil
+        pendingReplyID = nil
+        replies.removeAll()
+        requestState = .idle
+        screenStatus = .unknown
+        replyScrollOffset = 0
+        replyVisibleCount = 0
+        overlayMode = .subtitles
+    }
+
     func fetchModels() {
         modelFetchGeneration &+= 1
         modelFetchTask?.cancel()

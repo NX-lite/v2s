@@ -34,6 +34,7 @@ final class AppModel: ObservableObject {
     private let sourceCatalogService: SourceCatalogService
     let assistant: AssistantCoordinator
     private var assistantSettingsCancellable: AnyCancellable?
+    private var assistantRepliesCancellable: AnyCancellable?
     private let translationCoordinator = TranslationCoordinator()
     private let glossaryService = GlossaryService()
     private let speedMonitor = SpeedMonitor()
@@ -242,6 +243,11 @@ final class AppModel: ObservableObject {
             .removeDuplicates()
             .sink { [weak self] assistantSettings in
                 self?.persistSettings(assistantSettings: assistantSettings)
+            }
+
+        assistantRepliesCancellable = self.assistant.$replies
+            .sink { [weak self] replies in
+                self?.presentAssistantRepliesIfNeeded(replies)
             }
     }
 
@@ -568,6 +574,7 @@ final class AppModel: ObservableObject {
     }
 
     func startSession() async {
+        assistant.resetForNewSession()
         // Finish releasing any earlier capture resources before opening replacements.
         await stopLiveTranscriptionSessionsAndWait()
         refreshSources()
@@ -2162,6 +2169,21 @@ final class AppModel: ObservableObject {
 
     func requestAssistant(_ action: AssistantAction) {
         assistant.request(action, snapshot: assistantTranscriptSnapshot())
+    }
+
+    private func presentAssistantRepliesIfNeeded(_ replies: [AssistantReply]) {
+        guard replies.isEmpty == false else {
+            return
+        }
+
+        if overlayState == nil {
+            overlayState = OverlayPreviewState(
+                translatedText: "",
+                sourceText: "",
+                sourceName: selectedSourceDisplayName
+            )
+        }
+        isOverlayVisible = true
     }
 
     func transcriptText(isTranslation: Bool) -> String {

@@ -331,6 +331,38 @@ import Testing
         #expect(coordinator.replyScrollOffset == 0)
     }
 
+    @Test func resetForNewSessionClearsReplyPresentationState() async {
+        let responder = ResponderFake(steps: [.response("First"), .response("Second")])
+        let coordinator = makeCoordinator(
+            responder: responder,
+            screen: ScreenContextFake(contexts: [
+                .init(pngData: nil, ocrText: nil, status: .permissionNeeded),
+                .init(pngData: nil, ocrText: nil, status: .permissionNeeded),
+            ])
+        )
+        coordinator.updateReplyVisibleCount(1)
+
+        coordinator.request(.ask, snapshot: sampleSnapshot())
+        await waitUntil { coordinator.replies.map(\.content) == [.response("First")] }
+
+        coordinator.request(.followUp, snapshot: sampleSnapshot())
+        await waitUntil { coordinator.replies.map(\.content) == [.response("First"), .response("Second")] }
+        coordinator.setReplyScrollOffset(1)
+
+        #expect(coordinator.overlayMode == .assistantReplies)
+        #expect(coordinator.screenStatus == .permissionNeeded)
+        #expect(coordinator.replyScrollOffset == 1)
+
+        coordinator.resetForNewSession()
+
+        #expect(coordinator.replies.isEmpty)
+        #expect(coordinator.requestState == .idle)
+        #expect(coordinator.screenStatus == .unknown)
+        #expect(coordinator.replyScrollOffset == 0)
+        #expect(coordinator.replyVisibleCount == 0)
+        #expect(coordinator.overlayMode == .subtitles)
+    }
+
     @Test func missingConfigurationFailsBeforeScreenCapture() async {
         var settings = configuredSettings()
         settings.apiKey = " \n "

@@ -163,6 +163,121 @@ import Testing
         await drainTasks()
     }
 
+    @Test func firstAssistantReplyShowsAHiddenOverlayOnlyAfterScreenCaptureCompletes() async {
+        let settingsURL = makeSettingsURL()
+        defer { try? FileManager.default.removeItem(at: settingsURL) }
+
+        let responder = HeldResponder()
+        let screen = GatedScreenContextProvider()
+        let assistant = AssistantCoordinator(
+            settings: configuredAssistantSettings(),
+            responder: responder,
+            screenContextProvider: screen,
+            promptBuilder: StaticPromptBuilder()
+        )
+        let model = AppModel(
+            settingsStore: SettingsStore(fileURL: settingsURL),
+            sourceCatalogService: SourceCatalogService(),
+            assistant: assistant
+        )
+
+        #expect(model.isOverlayVisible == false)
+        #expect(model.overlayState == nil)
+
+        model.requestAssistant(.ask)
+        await waitForCapture(on: screen)
+
+        #expect(model.isOverlayVisible == false)
+        #expect(model.overlayState == nil)
+        #expect(model.assistant.replies.isEmpty)
+
+        await screen.release()
+        await waitForCall(on: responder)
+
+        #expect(model.assistant.replies.map(\.content) == [.thinking])
+        #expect(model.assistant.overlayMode == .assistantReplies)
+        #expect(model.isOverlayVisible)
+        #expect(model.overlayState != nil)
+
+        await responder.release(text: "Answer after capture")
+        await drainTasks()
+    }
+
+    @Test func invalidAssistantRequestShowsAHiddenOverlaySynchronously() {
+        let settingsURL = makeSettingsURL()
+        defer { try? FileManager.default.removeItem(at: settingsURL) }
+
+        let model = AppModel(
+            settingsStore: SettingsStore(fileURL: settingsURL),
+            sourceCatalogService: SourceCatalogService(),
+            assistant: AssistantCoordinator()
+        )
+
+        model.requestAssistant(.ask)
+
+        #expect(model.assistant.replies == [
+            .init(id: model.assistant.replies[0].id, action: .ask, content: .failure(.invalidConfiguration)),
+        ])
+        #expect(model.assistant.overlayMode == .assistantReplies)
+        #expect(model.isOverlayVisible)
+        #expect(model.overlayState != nil)
+    }
+
+    @Test func startingANewSessionResetsAssistantRepliesAndDiscardsLateResponse() async {
+        let settingsURL = makeSettingsURL()
+        defer { try? FileManager.default.removeItem(at: settingsURL) }
+
+        let responder = HeldResponder()
+        let assistant = AssistantCoordinator(
+            settings: configuredAssistantSettings(),
+            responder: responder,
+            screenContextProvider: WarningScreenContextProvider(),
+            promptBuilder: StaticPromptBuilder()
+        )
+        let model = AppModel(
+            settingsStore: SettingsStore(fileURL: settingsURL),
+            sourceCatalogService: SourceCatalogService(),
+            assistant: assistant
+        )
+
+        model.requestAssistant(.ask)
+        await waitForCall(on: responder, expected: 1)
+        await responder.release(text: "First reply")
+        await drainTasks()
+
+        model.requestAssistant(.followUp)
+        await waitForCall(on: responder, expected: 2)
+        await responder.release(text: "Second reply")
+        await drainTasks()
+
+        assistant.updateReplyVisibleCount(1)
+        assistant.setReplyScrollOffset(1)
+
+        #expect(assistant.replies.count == 2)
+        #expect(assistant.replyScrollOffset == 1)
+        #expect(assistant.overlayMode == .assistantReplies)
+        #expect(assistant.screenStatus == .permissionNeeded)
+
+        model.requestAssistant(.ask)
+        await waitForCall(on: responder, expected: 3)
+
+        await model.startSession()
+
+        #expect(assistant.replies.isEmpty)
+        #expect(assistant.requestState == .idle)
+        #expect(assistant.screenStatus == .unknown)
+        #expect(assistant.replyScrollOffset == 0)
+        #expect(assistant.replyVisibleCount == 0)
+        #expect(assistant.overlayMode == .subtitles)
+
+        await responder.release(text: "Late reply from the old session")
+        await drainTasks()
+
+        #expect(assistant.replies.isEmpty)
+        #expect(assistant.requestState == .idle)
+        #expect(assistant.overlayMode == .subtitles)
+    }
+
     @Test func stopSessionCancelsAnInFlightAssistantRequestAndIgnoresItsLateResponse() async {
         let settingsURL = makeSettingsURL()
         defer { try? FileManager.default.removeItem(at: settingsURL) }
@@ -269,14 +384,24 @@ import Testing
         return style
     }
 
-    private func waitForCall(on responder: HeldResponder) async {
+    private func waitForCall(on responder: HeldResponder, expected: Int = 1) async {
         for _ in 0..<200 {
-            if await responder.callCount() == 1 {
+            if await responder.callCount() == expected {
                 return
             }
             await Task.yield()
         }
         Issue.record("Timed out waiting for the held assistant request")
+    }
+
+    private func waitForCapture(on screen: GatedScreenContextProvider) async {
+        for _ in 0..<200 {
+            if await screen.hasStarted() {
+                return
+            }
+            await Task.yield()
+        }
+        Issue.record("Timed out waiting for screen capture")
     }
 
     private func drainTasks() async {
@@ -289,6 +414,33 @@ import Testing
 private struct ReadyScreenContextProvider: AssistantScreenContextProviding {
     func current() async -> ScreenContext {
         ScreenContext(pngData: nil, ocrText: nil, status: .ready)
+    }
+}
+
+private struct WarningScreenContextProvider: AssistantScreenContextProviding {
+    func current() async -> ScreenContext {
+        ScreenContext(pngData: nil, ocrText: nil, status: .permissionNeeded)
+    }
+}
+
+private actor GatedScreenContextProvider: AssistantScreenContextProviding {
+    private var started = false
+    private var continuation: CheckedContinuation<ScreenContext, Never>?
+
+    func current() async -> ScreenContext {
+        started = true
+        return await withCheckedContinuation { continuation in
+            self.continuation = continuation
+        }
+    }
+
+    func hasStarted() -> Bool {
+        started
+    }
+
+    func release() {
+        continuation?.resume(returning: .init(pngData: nil, ocrText: nil, status: .ready))
+        continuation = nil
     }
 }
 
