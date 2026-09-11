@@ -1,5 +1,16 @@
 import SwiftUI
 
+@MainActor
+enum OverlayPopoverActions {
+    static func toggle(model: AppModel) {
+        if model.isOverlayVisible {
+            model.toggleOverlayVisibility()
+        } else {
+            model.showOverlayPreview()
+        }
+    }
+}
+
 struct StatusBarPopoverView: View {
     @ObservedObject var model: AppModel
     let closePopover: () -> Void
@@ -161,8 +172,7 @@ struct StatusBarPopoverView: View {
                 .buttonStyle(.bordered)
                 .controlSize(.small)
                 Button {
-                    if model.isOverlayVisible { model.toggleOverlayVisibility() }
-                    else { model.showOverlayPreview() }
+                    OverlayPopoverActions.toggle(model: model)
                 } label: {
                     Text(model.isOverlayVisible ? model.localized(.hideOverlay) : model.localized(.showPreview))
                         .font(.caption)

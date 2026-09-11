@@ -122,6 +122,93 @@ import Testing
         #expect(controller.panelsShownForTesting)
     }
 
+    @Test func switchingReplyOnlyModeToSubtitlesResetsVisibilityAndCanReopen() async {
+        let settingsURL = FileManager.default.temporaryDirectory
+            .appendingPathComponent("v2s-overlay-mode-switch-\(UUID().uuidString).json")
+        defer { try? FileManager.default.removeItem(at: settingsURL) }
+
+        let assistant = AssistantCoordinator()
+        let model = AppModel(
+            settingsStore: SettingsStore(fileURL: settingsURL),
+            sourceCatalogService: SourceCatalogService(),
+            assistant: assistant
+        )
+        let controller = OverlayWindowController(model: model, showTranscript: {})
+
+        model.requestAssistant(.ask)
+        await drainMainQueue()
+        #expect(model.overlayState == nil)
+        #expect(model.isOverlayVisible)
+        #expect(controller.panelsShownForTesting)
+
+        assistant.overlayMode = .subtitles
+        await drainMainQueue()
+
+        #expect(model.overlayState == nil)
+        #expect(model.isOverlayVisible == false)
+        #expect(controller.shouldShowContentForTesting == false)
+        #expect(controller.panelsShownForTesting == false)
+
+        // This is the status-bar button route: after a reply-only overlay is
+        // hidden by the mode switch, one click must show a subtitle preview.
+        OverlayPopoverActions.toggle(model: model)
+        await drainMainQueue()
+
+        #expect(model.overlayState != nil)
+        #expect(model.isOverlayVisible)
+        #expect(controller.panelsShownForTesting)
+
+        // Switching back to assistant replies restores the retained reply-only
+        // presentation after a regular user hide.
+        model.toggleOverlayVisibility()
+        await drainMainQueue()
+        #expect(model.isOverlayVisible == false)
+        #expect(controller.panelsShownForTesting == false)
+
+        assistant.overlayMode = .assistantReplies
+        await drainMainQueue()
+
+        #expect(model.overlayState == nil)
+        #expect(model.isOverlayVisible)
+        #expect(controller.panelsShownForTesting)
+    }
+
+    @Test func reShowingContentInvalidatesAnObsoleteReplyHideSnapshot() async {
+        let settingsURL = FileManager.default.temporaryDirectory
+            .appendingPathComponent("v2s-overlay-stale-snapshot-\(UUID().uuidString).json")
+        defer { try? FileManager.default.removeItem(at: settingsURL) }
+
+        let assistant = AssistantCoordinator()
+        let model = AppModel(
+            settingsStore: SettingsStore(fileURL: settingsURL),
+            sourceCatalogService: SourceCatalogService(),
+            assistant: assistant
+        )
+        let controller = OverlayWindowController(model: model, showTranscript: {})
+
+        model.requestAssistant(.ask)
+        await drainMainQueue()
+        #expect(controller.panelsShownForTesting)
+
+        // resetForNewSession emits a non-displayable reply state and captures the
+        // currently rendered reply for a pending hide.
+        assistant.resetForNewSession()
+        #expect(controller.hasPendingHideSnapshotForTesting)
+
+        // A subtitle preview arrives in the same main-thread turn before the
+        // queued sync. The old reply snapshot must be discarded, not reused by
+        // the next hide animation.
+        model.showOverlayPreview()
+        await drainMainQueue()
+
+        #expect(controller.shouldShowContentForTesting)
+        #expect(controller.panelsShownForTesting)
+        #expect(controller.hasPendingHideSnapshotForTesting == false)
+
+        model.toggleOverlayVisibility()
+        #expect(controller.hasPendingHideSnapshotForTesting)
+    }
+
     @Test func assistantAndSubtitleScrollRoutesKeepTheirOffsetsIndependent() {
         let settingsURL = FileManager.default.temporaryDirectory
             .appendingPathComponent("v2s-overlay-scroll-routing-\(UUID().uuidString).json")

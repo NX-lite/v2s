@@ -34,7 +34,7 @@ final class AppModel: ObservableObject {
     private let sourceCatalogService: SourceCatalogService
     let assistant: AssistantCoordinator
     private var assistantSettingsCancellable: AnyCancellable?
-    private var assistantRepliesCancellable: AnyCancellable?
+    private var assistantPresentationCancellable: AnyCancellable?
     private let translationCoordinator = TranslationCoordinator()
     private let glossaryService = GlossaryService()
     private let speedMonitor = SpeedMonitor()
@@ -245,9 +245,15 @@ final class AppModel: ObservableObject {
                 self?.persistSettings(assistantSettings: assistantSettings)
             }
 
-        assistantRepliesCancellable = self.assistant.$replies
-            .sink { [weak self] replies in
-                self?.presentAssistantRepliesIfNeeded(replies)
+        assistantPresentationCancellable = Publishers.CombineLatest(
+            self.assistant.$overlayMode,
+            self.assistant.$replies
+        )
+            .sink { [weak self] overlayMode, replies in
+                self?.synchronizeAssistantOverlayPresentation(
+                    overlayMode: overlayMode,
+                    replies: replies
+                )
             }
     }
 
@@ -2174,11 +2180,21 @@ final class AppModel: ObservableObject {
         assistant.request(action, snapshot: assistantTranscriptSnapshot())
     }
 
-    private func presentAssistantRepliesIfNeeded(_ replies: [AssistantReply]) {
-        guard replies.isEmpty == false else {
+    private func synchronizeAssistantOverlayPresentation(
+        overlayMode: OverlayViewMode,
+        replies: [AssistantReply]
+    ) {
+        // Subtitle state owns its own visibility. Assistant publisher updates only
+        // coordinate a reply-only overlay, so an explicit user hide remains hidden
+        // until the next assistant state change.
+        guard overlayState == nil else {
             return
         }
-        isOverlayVisible = true
+        let shouldShowReplyOnlyOverlay = overlayMode == .assistantReplies && replies.isEmpty == false
+        guard isOverlayVisible != shouldShowReplyOnlyOverlay else {
+            return
+        }
+        isOverlayVisible = shouldShowReplyOnlyOverlay
     }
 
     func transcriptText(isTranslation: Bool) -> String {

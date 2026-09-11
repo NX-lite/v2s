@@ -456,6 +456,14 @@ final class OverlayWindowController {
     private func syncWindow() {
         let shouldShow = shouldShowContent
 
+        // A state change can briefly schedule a hide snapshot before another
+        // same-turn update restores displayable content. Once the existing panels
+        // remain visible, that snapshot is stale and must not animate later.
+        if shouldShow, panelsShown, geniePhase == .idle {
+            pendingHideSnapshot?.orderOut(nil)
+            pendingHideSnapshot = nil
+        }
+
         if shouldShow && !panelsShown {
             // Transition: hidden → visible
             panelsShown = true
