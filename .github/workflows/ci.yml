@@ -1,0 +1,61 @@
+name: CI
+
+on:
+  push:
+    branches:
+      - main
+      - 'codex/**'
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    runs-on: macos-26
+    steps:
+      - uses: actions/checkout@v4
+      - name: Swift tests
+        run: swift test
+      - name: Documentation structure tests
+        run: node --test Tests/Docs/*.test.cjs
+
+  build:
+    needs: test
+    runs-on: macos-26
+    steps:
+      - uses: actions/checkout@v4
+      - name: Build Debug app
+        run: |
+          xcodebuild \
+            -project v2s.xcodeproj \
+            -scheme v2s \
+            -configuration Debug \
+            -derivedDataPath .build/debug \
+            build
+      - name: Build Release app
+        run: |
+          xcodebuild \
+            -project v2s.xcodeproj \
+            -scheme v2s \
+            -configuration Release \
+            -derivedDataPath .build/release \
+            build
+      - name: Verify universal Release binary
+        run: |
+          APP_BINARY=".build/release/Build/Products/Release/v2s.app/Contents/MacOS/v2s"
+          ARCHS="$(lipo -archs "$APP_BINARY")"
+          echo "Built architectures: $ARCHS"
+
+          for required in arm64 x86_64; do
+            case " $ARCHS " in
+              *" $required "*)
+                ;;
+              *)
+                echo "::error::Release binary is missing the $required slice"
+                exit 1
+                ;;
+            esac
+          done
