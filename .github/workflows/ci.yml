@@ -33,6 +33,7 @@ jobs:
             -project v2s.xcodeproj \
             -scheme v2s \
             -configuration Debug \
+            CODE_SIGNING_ALLOWED=NO \
             -derivedDataPath .build/debug \
             build
       - name: Build Release app
@@ -41,6 +42,7 @@ jobs:
             -project v2s.xcodeproj \
             -scheme v2s \
             -configuration Release \
+            CODE_SIGNING_ALLOWED=NO \
             -derivedDataPath .build/release \
             build
       - name: Verify universal Release binary

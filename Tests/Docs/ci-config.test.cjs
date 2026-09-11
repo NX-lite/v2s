@@ -8,10 +8,11 @@ const workflowPath = path.join(root, '.github', 'workflows', 'ci.yml');
 
 function indentedBlock(text, key, indent) {
   const lines = text.split(/\r?\n/);
-  const prefix = ' '.repeat(indent);
-  const header = `${prefix}${key}:`;
+  const header = `${' '.repeat(indent)}${key}:`;
   const start = lines.findIndex((line) => line === header || line.startsWith(`${header} `));
-  assert.notEqual(start, -1, `missing ${key} at indentation ${indent}`);
+  if (start === -1) {
+    return null;
+  }
 
   const block = [];
   for (let index = start + 1; index < lines.length; index += 1) {
@@ -27,11 +28,15 @@ function indentedBlock(text, key, indent) {
 function branchValues(eventBlock) {
   const lines = eventBlock.split(/\r?\n/);
   const branchLine = lines.findIndex((line) => /^\s*branches:\s*/.test(line));
-  assert.notEqual(branchLine, -1, 'event must restrict branches');
+  if (branchLine === -1) {
+    return null;
+  }
 
   const [, inlineValues = ''] = lines[branchLine].match(/^\s*branches:\s*(.*)$/) ?? [];
   if (inlineValues !== '') {
-    assert.match(inlineValues, /^\[.*\]$/, 'inline branches must use a YAML list');
+    if (/^\[.*\]$/.test(inlineValues) === false) {
+      return null;
+    }
     return inlineValues.slice(1, -1).split(',').map((value) => value.trim().replace(/^['"]|['"]$/g, ''));
   }
 
@@ -45,43 +50,242 @@ function branchValues(eventBlock) {
     .map((line) => line.replace(/^\s*-\s+/, '').trim().replace(/^['"]|['"]$/g, ''));
 }
 
-function requireRunBlock(job, description, pattern) {
-  assert.match(job, pattern, `${description} must be a run step in its intended job`);
+function stepsIn(job) {
+  const lines = job.split(/\r?\n/);
+  const startIndices = lines
+    .map((line, index) => (/^      - /.test(line) ? index : -1))
+    .filter((index) => index !== -1);
+
+  return startIndices.map((start, stepIndex) => {
+    const end = startIndices[stepIndex + 1] ?? lines.length;
+    const linesInStep = lines.slice(start, end);
+    const name = linesInStep[0].match(/^      - name: (.+)$/)?.[1] ?? null;
+    const uses = linesInStep[0].match(/^      - uses: (.+)$/)?.[1] ?? null;
+    const runLine = linesInStep.findIndex((line) => /^        run:\s*/.test(line));
+    let run = null;
+    if (runLine !== -1) {
+      const [, value = ''] = linesInStep[runLine].match(/^        run:\s*(.*)$/) ?? [];
+      if (value === '|') {
+        run = linesInStep.slice(runLine + 1)
+          .filter((line) => line.trim() === '' || line.length - line.trimStart().length >= 10)
+          .map((line) => line.startsWith('          ') ? line.slice(10) : line)
+          .join('\n');
+      } else {
+        run = value;
+      }
+    }
+    return { name, uses, run };
+  });
 }
 
-test('CI workflow tests supported branches, Swift package, documentation, debug app, and universal release app', () => {
-  const workflow = fs.readFileSync(workflowPath, 'utf8');
-  const triggers = indentedBlock(workflow, 'on', 0);
-  const push = indentedBlock(triggers, 'push', 2);
-  const pullRequest = indentedBlock(triggers, 'pull_request', 2);
-
-  assert.deepEqual(branchValues(push).sort(), ['codex/**', 'main']);
-  assert.deepEqual(branchValues(pullRequest), ['main']);
-  assert.match(triggers, /^  workflow_dispatch:\s*$/m);
-
-  const jobs = indentedBlock(workflow, 'jobs', 0);
-  const testJob = indentedBlock(jobs, 'test', 2);
-  const buildJob = indentedBlock(jobs, 'build', 2);
-  for (const job of [testJob, buildJob]) {
-    assert.match(job, /^    runs-on: macos-26$/m);
-    assert.match(job, /^      - uses: actions\/checkout@v4$/m);
+function executableShellCommands(run) {
+  if (typeof run !== 'string') {
+    return [];
   }
 
-  requireRunBlock(testJob, 'Swift test', /^      - name: Swift tests\n        run: swift test$/m);
-  requireRunBlock(testJob, 'documentation test', /^      - name: Documentation structure tests\n        run: node --test Tests\/Docs\/\*\.test\.cjs$/m);
-  assert.match(buildJob, /^    needs: test$/m);
-  requireRunBlock(
-    buildJob,
-    'Debug build',
-    /xcodebuild[\s\\]+-project v2s\.xcodeproj[\s\\]+-scheme v2s[\s\\]+-configuration Debug[\s\\]+-derivedDataPath \.build\/debug[\s\\]+build/
-  );
-  requireRunBlock(
-    buildJob,
-    'Release build',
-    /xcodebuild[\s\\]+-project v2s\.xcodeproj[\s\\]+-scheme v2s[\s\\]+-configuration Release[\s\\]+-derivedDataPath \.build\/release[\s\\]+build/
-  );
-  assert.match(buildJob, /\.build\/release\/Build\/Products\/Release\/v2s\.app\/Contents\/MacOS\/v2s/);
-  assert.match(buildJob, /lipo -archs "\$APP_BINARY"/);
-  assert.match(buildJob, /for required in arm64 x86_64;/);
-  assert.match(buildJob, /missing the \$required slice/);
+  const commands = [];
+  let command = '';
+  for (const rawLine of run.split(/\r?\n/)) {
+    const line = rawLine.trim();
+    if (line === '' || line.startsWith('#')) {
+      continue;
+    }
+
+    const continues = line.endsWith('\\');
+    command += `${line.slice(0, continues ? -1 : undefined).trim()} `;
+    if (continues === false) {
+      commands.push(command.trim());
+      command = '';
+    }
+  }
+  if (command !== '') {
+    commands.push(command.trim());
+  }
+  return commands;
+}
+
+function namedStep(steps, name) {
+  return steps.find((step) => step.name === name) ?? null;
+}
+
+function xcodebuildCommand(step) {
+  return executableShellCommands(step?.run).find((command) => command.startsWith('xcodebuild ')) ?? null;
+}
+
+function validateWorkflow(workflow) {
+  const errors = [];
+  const triggers = indentedBlock(workflow, 'on', 0);
+  if (triggers === null) {
+    errors.push('missing top-level on trigger configuration');
+  } else {
+    const push = indentedBlock(triggers, 'push', 2);
+    const pullRequest = indentedBlock(triggers, 'pull_request', 2);
+    const expectedPushBranches = ['codex/**', 'main'];
+    if (push === null || JSON.stringify((branchValues(push) ?? []).sort()) !== JSON.stringify(expectedPushBranches)) {
+      errors.push('push must be limited to main and codex/**');
+    }
+    if (pullRequest === null || JSON.stringify(branchValues(pullRequest)) !== JSON.stringify(['main'])) {
+      errors.push('pull_request must be limited to main');
+    }
+    if (/^  workflow_dispatch:\s*$/m.test(triggers) === false) {
+      errors.push('workflow_dispatch must be enabled');
+    }
+  }
+
+  const permissions = indentedBlock(workflow, 'permissions', 0);
+  if (permissions === null || /^  contents: read$/m.test(permissions) === false) {
+    errors.push('CI must grant only read access to repository contents');
+  }
+  if (/^\s*contents:\s*write\s*(?:#.*)?$/m.test(workflow)) {
+    errors.push('CI must not grant contents: write');
+  }
+  if (/\$\{\{\s*secrets\./.test(workflow)) {
+    errors.push('CI must not reference secrets');
+  }
+
+  const jobs = indentedBlock(workflow, 'jobs', 0);
+  const testJob = jobs === null ? null : indentedBlock(jobs, 'test', 2);
+  const buildJob = jobs === null ? null : indentedBlock(jobs, 'build', 2);
+  if (testJob === null) {
+    errors.push('missing test job');
+  }
+  if (buildJob === null) {
+    errors.push('missing build job');
+  }
+  if (testJob === null || buildJob === null) {
+    return errors;
+  }
+
+  if (/^    runs-on: macos-26$/m.test(testJob) === false) {
+    errors.push('test job must run on macos-26');
+  }
+  if (/^    runs-on: macos-26$/m.test(buildJob) === false) {
+    errors.push('build job must run on macos-26');
+  }
+  if (/^    needs: test$/m.test(buildJob) === false) {
+    errors.push('build job must depend on test');
+  }
+
+  const testSteps = stepsIn(testJob);
+  const buildSteps = stepsIn(buildJob);
+  for (const [jobName, steps] of [['test', testSteps], ['build', buildSteps]]) {
+    if (steps.some((step) => step.uses === 'actions/checkout@v4') === false) {
+      errors.push(`${jobName} job must use actions/checkout@v4`);
+    }
+  }
+
+  if (namedStep(testSteps, 'Swift tests')?.run?.trim() !== 'swift test') {
+    errors.push('Swift tests step must run swift test');
+  }
+  if (namedStep(testSteps, 'Documentation structure tests')?.run?.trim() !== 'node --test Tests/Docs/*.test.cjs') {
+    errors.push('documentation step must run all Tests/Docs checks');
+  }
+
+  const debugCommand = xcodebuildCommand(namedStep(buildSteps, 'Build Debug app'));
+  const releaseCommand = xcodebuildCommand(namedStep(buildSteps, 'Build Release app'));
+  const expectedCommonXcodeArguments = [
+    '-project v2s.xcodeproj',
+    '-scheme v2s',
+    'CODE_SIGNING_ALLOWED=NO',
+    'build',
+  ];
+  for (const [name, command, configuration, derivedDataPath] of [
+    ['Debug', debugCommand, 'Debug', '.build/debug'],
+    ['Release', releaseCommand, 'Release', '.build/release'],
+  ]) {
+    if (command === null) {
+      errors.push(`${name} build step must execute xcodebuild`);
+      continue;
+    }
+    for (const argument of [...expectedCommonXcodeArguments, `-configuration ${configuration}`, `-derivedDataPath ${derivedDataPath}`]) {
+      if (command.includes(argument) === false) {
+        errors.push(`${name} build xcodebuild command must include ${argument}`);
+      }
+    }
+  }
+
+  const universalStep = namedStep(buildSteps, 'Verify universal Release binary');
+  const universalCommands = executableShellCommands(universalStep?.run).join('\n');
+  if (universalCommands.includes('.build/release/Build/Products/Release/v2s.app/Contents/MacOS/v2s') === false) {
+    errors.push('universal binary check must target the Release app executable');
+  }
+  if (/\blipo -archs "\$APP_BINARY"/.test(universalCommands) === false) {
+    errors.push('universal binary check must execute lipo -archs');
+  }
+  if (/for required in\s+arm64\s+x86_64; do/.test(universalCommands) === false) {
+    errors.push('universal binary check must guard both arm64 and x86_64');
+  }
+  if (/missing the \$required slice/.test(universalCommands) === false) {
+    errors.push('universal binary check must fail when a required slice is absent');
+  }
+
+  return errors;
+}
+
+function transformStepRun(workflow, name, transform) {
+  const header = `      - name: ${name}\n        run: |\n`;
+  const start = workflow.indexOf(header);
+  assert.notEqual(start, -1, `missing ${name} step in test fixture`);
+  const runStart = start + header.length;
+  const nextStep = workflow.indexOf('\n      - ', runStart);
+  const runEnd = nextStep === -1 ? workflow.length : nextStep + 1;
+  return `${workflow.slice(0, runStart)}${transform(workflow.slice(runStart, runEnd))}${workflow.slice(runEnd)}`;
+}
+
+test('CI workflow has executable gated test and universal-build steps', () => {
+  const workflow = fs.readFileSync(workflowPath, 'utf8');
+  assert.deepEqual(validateWorkflow(workflow), []);
+});
+
+test('CI validator rejects commented or removed build checks and privileged workflow mutations', () => {
+  const workflow = fs.readFileSync(workflowPath, 'utf8');
+  const commentFirstCommand = (run) => run.replace('          xcodebuild \\\n', '          # xcodebuild \\\n');
+
+  const cases = [
+    [
+      'Debug xcodebuild command',
+      transformStepRun(workflow, 'Build Debug app', commentFirstCommand),
+      /Debug build step must execute xcodebuild/,
+    ],
+    [
+      'Release xcodebuild command',
+      transformStepRun(workflow, 'Build Release app', commentFirstCommand),
+      /Release build step must execute xcodebuild/,
+    ],
+    [
+      'lipo command',
+      transformStepRun(workflow, 'Verify universal Release binary', (run) =>
+        run.replace('          ARCHS="$(lipo -archs "$APP_BINARY")"', '          # ARCHS="$(lipo -archs "$APP_BINARY")"')
+      ),
+      /universal binary check must execute lipo -archs/,
+    ],
+    [
+      'arm64 guard',
+      transformStepRun(workflow, 'Verify universal Release binary', (run) =>
+        run.replace('for required in arm64 x86_64; do', 'for required in x86_64; do')
+      ),
+      /guard both arm64 and x86_64/,
+    ],
+    [
+      'x86_64 guard',
+      transformStepRun(workflow, 'Verify universal Release binary', (run) =>
+        run.replace('for required in arm64 x86_64; do', 'for required in arm64; do')
+      ),
+      /guard both arm64 and x86_64/,
+    ],
+    [
+      'secret reference',
+      `${workflow}\n      - name: leaked\n        run: echo \${{ secrets.X }}\n`,
+      /must not reference secrets/,
+    ],
+    [
+      'write permission',
+      workflow.replace('  contents: read', '  contents: write'),
+      /must not grant contents: write/,
+    ],
+  ];
+
+  for (const [name, mutation, expectedError] of cases) {
+    assert.match(validateWorkflow(mutation).join('\n'), expectedError, name);
+  }
 });
