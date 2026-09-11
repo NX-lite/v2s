@@ -169,12 +169,22 @@ final class SileroVADEngine {
     }
 
     private static let compiledPackageModelURL: Result<URL, Error> = Result {
+#if V2S_CLT_TESTING
+        let packageURL = URL(fileURLWithPath: #filePath)
+            .deletingLastPathComponent()
+            .deletingLastPathComponent()
+            .appendingPathComponent("Resources/SileroVAD.mlpackage", isDirectory: true)
+        guard FileManager.default.fileExists(atPath: packageURL.path) else {
+            throw SileroVADError.modelNotFound
+        }
+#else
         guard let packageURL = resourceBundle.url(
             forResource: "SileroVAD",
             withExtension: "mlpackage"
         ) else {
             throw SileroVADError.modelNotFound
         }
+#endif
         return try MLModel.compileModel(at: packageURL)
     }
 

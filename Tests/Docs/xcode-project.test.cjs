@@ -26,12 +26,32 @@ const updater = fs.readFileSync(
 const infoPlist = fs.readFileSync(path.join(root, 'Config', 'Info.plist'), 'utf8');
 const readme = fs.readFileSync(path.join(root, 'README.md'), 'utf8');
 const readmeChinese = fs.readFileSync(path.join(root, 'README.zh-CN.md'), 'utf8');
+const websiteIndex = fs.readFileSync(path.join(root, 'docs', 'index.html'), 'utf8');
+const websiteI18n = fs.readFileSync(path.join(root, 'docs', 'js', 'i18n.js'), 'utf8');
+const websiteReadme = fs.readFileSync(path.join(root, 'docs', 'README.md'), 'utf8');
+const homebrewTemplate = fs.readFileSync(
+  path.join(root, 'packaging', 'homebrew', 'v2s.rb.template'),
+  'utf8'
+);
+const homebrewReadme = fs.readFileSync(
+  path.join(root, 'packaging', 'homebrew', 'README.md'),
+  'utf8'
+);
+const releaseWorkflow = fs.readFileSync(
+  path.join(root, '.github', 'workflows', 'release.yml'),
+  'utf8'
+);
 const designSpec = fs.readFileSync(
   path.join(root, 'docs', 'superpowers', 'specs', '2026-09-04-mainline-rebuild-design.md'),
   'utf8'
 );
 const implementationPlan = fs.readFileSync(
   path.join(root, 'docs', 'superpowers', 'plans', '2026-09-04-mainline-rebuild.md'),
+  'utf8'
+);
+const swiftTestScript = fs.readFileSync(path.join(root, 'scripts', 'test-swift.sh'), 'utf8');
+const sileroVADEngine = fs.readFileSync(
+  path.join(root, 'Sources', 'V2SApp', 'Services', 'SileroVADEngine.swift'),
   'utf8'
 );
 
@@ -374,6 +394,31 @@ test('Xcode project keeps Core ML and excludes legacy ONNX runtime, package, and
   assert.match(project, /ARCHS = "\$\(ARCHS_STANDARD\)";/);
 });
 
+test('Command Line Tools tests bypass unavailable coremlc without changing Xcode resources', () => {
+  assert.match(swiftTestScript, /V2S_CLT_TESTING=1/);
+  assert.match(packageManifest, /ProcessInfo\.processInfo\.environment\["V2S_CLT_TESTING"\]/);
+  assert.match(packageManifest, /\.define\("V2S_CLT_TESTING"\)/);
+  assert.match(packageManifest, /v2sExcludedResources[\s\S]*SileroVAD\.mlpackage/);
+  assert.match(packageManifest, /exclude: v2sExcludedResources/);
+  assert.match(sileroVADEngine, /#if V2S_CLT_TESTING/);
+  assert.match(sileroVADEngine, /Resources\/SileroVAD\.mlpackage/);
+  assert.match(swiftTestScript, /SwiftUIMacros/);
+  assert.match(swiftTestScript, /testing\/libTestingMacros\.dylib/);
+  assert.match(swiftTestScript, /-load-plugin-library/);
+  assert.match(swiftTestScript, /COPYFILE_DISABLE=1/);
+  assert.match(swiftTestScript, /xattr -cr "\$clt_scratch_dir\/out"/);
+  assert.match(swiftTestScript, /task_tmp_root="\$\{TMPDIR:-\/private\/tmp\}"/);
+  assert.match(swiftTestScript, /clt_scratch_dir="\$\{task_tmp_root%\/?\}\/v2s-swiftpm-/);
+  assert.doesNotMatch(swiftTestScript, /clt_scratch_dir="\$repo_root\/\.build\/clt-scratch/);
+  const fullXcodeBranch = swiftTestScript.indexOf('if xcodebuild -version');
+  const fullXcodeBranchEnd = swiftTestScript.indexOf('\nfi', fullXcodeBranch);
+  const cltTestExport = swiftTestScript.indexOf('export V2S_CLT_TESTING=1');
+  assert.ok(fullXcodeBranch >= 0);
+  assert.ok(fullXcodeBranchEnd > fullXcodeBranch);
+  assert.ok(cltTestExport > fullXcodeBranchEnd);
+  assert.match(project, /SileroVAD\.mlpackage in Sources/);
+});
+
 test('fork identity keeps upstream versioning and documents the opt-in assistant data flow', () => {
   assert.match(appModel, /static let marketingVersion = "0\.3\.38"/);
   assert.match(appModel, /static let buildNumber = "42"/);
@@ -401,6 +446,18 @@ test('fork identity keeps upstream versioning and documents the opt-in assistant
   assert.match(readmeChinese, /纯文本回退/);
   assert.match(readmeChinese, /你配置的服务商/);
   assert.match(readmeChinese, /快捷键/);
+
+  for (const forkFacingArtifact of [websiteIndex, websiteI18n, homebrewTemplate, homebrewReadme]) {
+    assert.doesNotMatch(forkFacingArtifact, /github\.com\/franklioxygen\/v2s/i);
+  }
+  assert.doesNotMatch(websiteReadme, /franklioxygen\.github\.io\/v2s/i);
+  assert.match(websiteIndex, /github\.com\/NX-lite\/v2s/);
+  assert.match(websiteI18n, /github\.com\/NX-lite\/v2s/);
+  assert.match(websiteReadme, /NX-lite\.github\.io\/v2s/i);
+  assert.match(homebrewTemplate, /github\.com\/NX-lite\/v2s/);
+  assert.match(homebrewReadme, /NX-lite\/homebrew-v2s/);
+  assert.match(releaseWorkflow, /TAP_REPO: NX-lite\/homebrew-v2s/);
+  assert.doesNotMatch(releaseWorkflow, /TAP_REPO: franklioxygen\/homebrew-v2s/);
 });
 
 test('documentation records bounded meeting-assistant references and local provider-key handling', () => {

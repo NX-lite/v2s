@@ -1,13 +1,13 @@
 # Homebrew distribution
 
-Users install v2s with:
+After the NX-lite tap has been created and seeded, users install v2s with:
 
 ```bash
-brew install --cask franklioxygen/v2s/v2s
+brew install --cask NX-lite/v2s/v2s
 ```
 
 That name resolves to the cask `Casks/v2s.rb` in the tap repository
-`franklioxygen/homebrew-v2s`. Homebrew taps it automatically on first install.
+`NX-lite/homebrew-v2s`. Homebrew taps it automatically on first install.
 
 `v2s.rb.template` in this directory is the source of truth for that cask. The
 `Update Homebrew tap` step in `.github/workflows/release.yml` fills in
@@ -22,8 +22,9 @@ same version again is allowed, so a rebuilt asset can correct a checksum.
 
 ## Setup
 
-Setup is complete: the tap repository is seeded with the cask for v0.3.35, and
-the `HOMEBREW_TAP_TOKEN` secret is set, so releases update the tap on their own.
+Before enabling automated Homebrew updates, create `NX-lite/homebrew-v2s`, seed
+its `Casks/v2s.rb`, and configure the `HOMEBREW_TAP_TOKEN` repository secret.
+Do not advertise the install command as available until that setup is complete.
 
 That secret is a fine-grained personal access token scoped to `homebrew-v2s`
 with `Contents: Read and write` permission. If it is ever removed or expires,
@@ -34,7 +35,7 @@ To regenerate the cask by hand, from a checkout of the tap:
 
 ```bash
 VERSION=0.3.35
-SHA256=$(curl -fsSL "https://github.com/franklioxygen/v2s/releases/download/v${VERSION}/v2s-${VERSION}.sha256" | awk '{print $1}')
+SHA256=$(curl -fsSL "https://github.com/NX-lite/v2s/releases/download/v${VERSION}/v2s-${VERSION}.sha256" | awk '{print $1}')
 sed -e "s/__VERSION__/${VERSION}/g" -e "s/__SHA256__/${SHA256}/g" \
   ../v2s/packaging/homebrew/v2s.rb.template > Casks/v2s.rb
 ```

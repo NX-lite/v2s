@@ -97,7 +97,7 @@
         outputExamples: "Additional subtitle-output examples:",
         noteBefore: "The app shows the exact choices available on your Mac and validates each translation pair before starting. ",
         readmeLink: "Read the full README →",
-        readmeHref: "https://github.com/franklioxygen/v2s/blob/main/README.md",
+        readmeHref: "https://github.com/NX-lite/v2s/blob/main/README.md",
         chipCantonese: "Cantonese",
         chipZh: "Chinese (Simplified)",
         chipZhHant: "Chinese (Traditional)",
@@ -159,7 +159,7 @@
       footer: {
         license: "MIT License · ",
         docLink: "中文文档",
-        docHref: "https://github.com/franklioxygen/v2s/blob/main/README.zh-CN.md",
+        docHref: "https://github.com/NX-lite/v2s/blob/main/README.zh-CN.md",
       },
     },
     zh: {
@@ -244,7 +244,7 @@
         outputExamples: "其他字幕输出语言示例：",
         noteBefore: "应用会显示当前 Mac 上实际可用的选项，并在开始前验证所选翻译语言组合。 ",
         readmeLink: "阅读完整 README →",
-        readmeHref: "https://github.com/franklioxygen/v2s/blob/main/README.zh-CN.md",
+        readmeHref: "https://github.com/NX-lite/v2s/blob/main/README.zh-CN.md",
         chipCantonese: "粤语",
         chipZh: "简体中文",
         chipZhHant: "繁体中文",
@@ -305,7 +305,7 @@
       footer: {
         license: "MIT 许可证 · ",
         docLink: "English Doc",
-        docHref: "https://github.com/franklioxygen/v2s/blob/main/README.md",
+        docHref: "https://github.com/NX-lite/v2s/blob/main/README.md",
       },
     },
   };

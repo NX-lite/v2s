@@ -145,7 +145,7 @@ jobs:
       - name: Update Homebrew tap
         env:
           TAP_TOKEN: ${{ secrets.HOMEBREW_TAP_TOKEN }}
-          TAP_REPO: franklioxygen/homebrew-v2s
+          TAP_REPO: NX-lite/homebrew-v2s
           VERSION: ${{ steps.version.outputs.version }}
         run: |
           if [ -z "$TAP_TOKEN" ]; then
