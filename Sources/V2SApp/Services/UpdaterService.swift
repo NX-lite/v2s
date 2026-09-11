@@ -117,6 +117,6 @@ final class LaunchAtLoginService: ObservableObject {
 }
 
 private extension Logger {
-    static let updater = Logger(subsystem: "com.franklioxygen.v2s", category: "updater")
-    static let launchAtLogin = Logger(subsystem: "com.franklioxygen.v2s", category: "launchAtLogin")
+    static let updater = Logger(subsystem: "com.nxlite.v2s", category: "updater")
+    static let launchAtLogin = Logger(subsystem: "com.nxlite.v2s", category: "launchAtLogin")
 }
