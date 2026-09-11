@@ -30,6 +30,16 @@ on the fork's `multi-source-input` or `test` branches.
 - Never put a real API key, provider response, captured screen, or private transcript
   into source control, fixtures, CI logs, or error messages.
 
+## Reference boundary
+
+[Meetily](https://github.com/Zackriya-Solutions/meetily/tree/a2cb62e827da7ef59f65064c97233efb2313878e)
+and the [1meeting-summary-ai candidate](https://github.com/Disalazario/meeting-summary-ai/tree/640efa955e62f6dfebfe4ac7e8c9651119469229)
+are design references only. This is an independent Swift implementation; no code is
+copied. Structured meeting minutes, action items, templates, export, archive,
+robots, Telegram, Ollama, and bundled Whisper are outside `origin/main` and are not
+added. If the user provides a different 1meeting-summary-ai URL, replace the
+candidate reference before using it.
+
 ## Functional Scope
 
 ### Upstream behavior to retain as the foundation

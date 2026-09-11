@@ -67,12 +67,17 @@ v2s asks Apple's Speech and Translation frameworks which languages the current M
 - Only after an explicit Follow Up or Ask, v2s may send the configured transcript (including timestamps and source/language context), skills prompt, current-screen image, and OCR text to your configured provider. What that provider retains or processes is governed by its own terms.
 - If the provider rejects image input, v2s makes one text-only fallback request without the image while retaining available OCR text. Missing screen permission also degrades to text-only context; it does not block the request.
 - Model discovery and the connection test contact the configured provider. They are configuration tools, not a claim that any particular provider, account, or model has been tested by this project.
+- The API key is stored only in local settings on this Mac. Model discovery and API test use it to contact your configured provider; transcript, current-screen image, and OCR text are sent only after an explicit Follow Up or Ask.
 
 ## Optional assistant
 
 Configure your API key, base URL, model, skills prompt, and three hotkeys in Settings. `Follow Up` asks for a concise continuation from the current context; `Ask` asks for an answer using the same context. A request may use an empty transcript with the fork-compatible placeholder, so a screen-only Ask is still possible. Provider reply text is displayed unchanged in the reply overlay, which has its own scroll position and can be switched back to subtitles without interrupting audio capture.
 
 The assistant works with OpenAI Responses-compatible and Gemini-compatible API shapes. It can fetch offered models and run a configured connection test, but no real provider request is included in automated tests or documented as verified here.
+
+## Design references
+
+This is an independent Swift implementation; no code was copied. It only borrows high-level design references from [Meetily](https://github.com/Zackriya-Solutions/meetily/tree/a2cb62e827da7ef59f65064c97233efb2313878e) and the [1meeting-summary-ai candidate](https://github.com/Disalazario/meeting-summary-ai/tree/640efa955e62f6dfebfe4ac7e8c9651119469229): local-first privacy, cancellable provider operations, and synthetic tests/structural assertions. v2s is not fully local: Apple capabilities and configured provider operations can send data as disclosed above.
 
 ## Getting Started
 
