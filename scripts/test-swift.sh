@@ -68,12 +68,8 @@ repo_cache_key="${repo_cache_key%% *}"
 clt_scratch_dir="${task_tmp_root%/}/v2s-swiftpm-$repo_cache_key-$sdk_cache_key"
 mkdir -p "$CLANG_MODULE_CACHE_PATH" "$clt_cache_dir" "$clt_config_dir" "$clt_security_dir" "$clt_scratch_dir"
 
-# File Provider volumes can attach Finder metadata to copied package artifacts,
-# which makes ad-hoc test-bundle signing fail even though the binaries are valid.
+# Do not preserve Finder metadata when SwiftPM copies package artifacts.
 export COPYFILE_DISABLE=1
-if [[ -d "$clt_scratch_dir/out" ]]; then
-    xattr -cr "$clt_scratch_dir/out"
-fi
 
 clt_swiftpm_local_cache_args=(
     --scratch-path "$clt_scratch_dir"

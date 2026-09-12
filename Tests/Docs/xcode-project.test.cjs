@@ -406,7 +406,7 @@ test('Command Line Tools tests bypass unavailable coremlc without changing Xcode
   assert.match(swiftTestScript, /testing\/libTestingMacros\.dylib/);
   assert.match(swiftTestScript, /-load-plugin-library/);
   assert.match(swiftTestScript, /COPYFILE_DISABLE=1/);
-  assert.match(swiftTestScript, /xattr -cr "\$clt_scratch_dir\/out"/);
+  assert.doesNotMatch(swiftTestScript, /xattr -cr/);
   assert.match(swiftTestScript, /task_tmp_root="\$\{TMPDIR:-\/private\/tmp\}"/);
   assert.match(swiftTestScript, /clt_scratch_dir="\$\{task_tmp_root%\/?\}\/v2s-swiftpm-/);
   assert.doesNotMatch(swiftTestScript, /clt_scratch_dir="\$repo_root\/\.build\/clt-scratch/);
