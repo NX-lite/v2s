@@ -146,9 +146,9 @@ function validateWorkflow(workflow) {
   } else {
     const push = indentedBlock(triggers, 'push', 2);
     const pullRequest = indentedBlock(triggers, 'pull_request', 2);
-    const expectedPushBranches = ['codex/**', 'main'];
+    const expectedPushBranches = ['codex/**', 'main', 'test'];
     if (push === null || JSON.stringify((branchValues(push) ?? []).sort()) !== JSON.stringify(expectedPushBranches)) {
-      errors.push('push must be limited to main and codex/**');
+      errors.push('push must be limited to main, test, and codex/**');
     }
     if (pullRequest === null || JSON.stringify(branchValues(pullRequest)) !== JSON.stringify(['main'])) {
       errors.push('pull_request must be limited to main');
