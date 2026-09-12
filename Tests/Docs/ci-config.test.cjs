@@ -210,8 +210,8 @@ function validateWorkflow(workflow) {
     }
   }
 
-  if (namedStep(testSteps, 'Swift tests')?.run?.trim() !== 'swift test') {
-    errors.push('Swift tests step must run swift test');
+  if (namedStep(testSteps, 'Swift tests')?.run?.trim() !== 'swift test --no-parallel') {
+    errors.push('Swift tests step must run swift test --no-parallel');
   }
   if (namedStep(testSteps, 'Documentation structure tests')?.run?.trim() !== 'node --test Tests/Docs/*.test.cjs') {
     errors.push('documentation step must run all Tests/Docs checks');
