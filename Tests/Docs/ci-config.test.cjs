@@ -74,8 +74,7 @@ function stepsIn(job) {
         run = value;
       }
     }
-    const continueOnError = linesInStep.some((line) => /^        continue-on-error:\s*true\s*(?:#.*)?$/i.test(line));
-    return { name, uses, run, continueOnError };
+    return { name, uses, run };
   });
 }
 
@@ -109,8 +108,34 @@ function namedStep(steps, name) {
   return steps.find((step) => step.name === name) ?? null;
 }
 
-function xcodebuildCommand(step) {
-  return executableShellCommands(step?.run).find((command) => command.startsWith('xcodebuild ')) ?? null;
+function expectedXcodebuildCommand(configuration, derivedDataPath) {
+  return [
+    'xcodebuild',
+    '-project v2s.xcodeproj',
+    '-scheme v2s',
+    `-configuration ${configuration}`,
+    'CODE_SIGNING_ALLOWED=NO',
+    `-derivedDataPath ${derivedDataPath}`,
+    'build',
+  ].join(' ');
+}
+
+function expectedUniversalSafetyCommands() {
+  return [
+    'APP_BINARY=".build/release/Build/Products/Release/v2s.app/Contents/MacOS/v2s"',
+    'ARCHS="$(lipo -archs "$APP_BINARY")"',
+    'echo "Built architectures: $ARCHS"',
+    'for required in arm64 x86_64; do',
+    'case " $ARCHS " in',
+    '*" $required "*)',
+    ';;',
+    '*)',
+    'echo "::error::Release binary is missing the $required slice"',
+    'exit 1',
+    ';;',
+    'esac',
+    'done',
+  ];
 }
 
 function validateWorkflow(workflow) {
@@ -133,6 +158,10 @@ function validateWorkflow(workflow) {
     }
   }
 
+  const permissionHeaders = [...workflow.matchAll(/^[ \t]*(?:["']permissions["']|permissions)\s*:/gm)];
+  if (permissionHeaders.length !== 1 || /^permissions:\s*$/m.test(workflow) === false) {
+    errors.push('permissions must appear exactly once as the top-level contents: read block');
+  }
   const permissions = indentedBlock(workflow, 'permissions', 0);
   const permissionLines = (permissions ?? '')
     .split(/\r?\n/)
@@ -143,8 +172,11 @@ function validateWorkflow(workflow) {
   if (/^\s*contents:\s*write\s*(?:#.*)?$/m.test(workflow)) {
     errors.push('CI must not grant contents: write');
   }
-  if (/\$\{\{[^}]*\bsecrets\s*(?:\.|\[)/.test(workflow)) {
+  if (/\$\{\{[^}]*\bsecrets\b[^}]*\}\}/.test(workflow)) {
     errors.push('CI must not reference secrets');
+  }
+  if (/^[ \t]*(?:["']continue-on-error["']|continue-on-error)\s*:/mi.test(workflow)) {
+    errors.push('CI must not use continue-on-error');
   }
 
   const jobs = indentedBlock(workflow, 'jobs', 0);
@@ -185,57 +217,32 @@ function validateWorkflow(workflow) {
     errors.push('documentation step must run all Tests/Docs checks');
   }
 
-  const debugCommand = xcodebuildCommand(namedStep(buildSteps, 'Build Debug app'));
-  const releaseCommand = xcodebuildCommand(namedStep(buildSteps, 'Build Release app'));
   const debugStep = namedStep(buildSteps, 'Build Debug app');
   const releaseStep = namedStep(buildSteps, 'Build Release app');
-  const expectedCommonXcodeArguments = [
-    '-project v2s.xcodeproj',
-    '-scheme v2s',
-    'CODE_SIGNING_ALLOWED=NO',
-    'build',
-  ];
-  for (const [name, command, configuration, derivedDataPath] of [
-    ['Debug', debugCommand, 'Debug', '.build/debug'],
-    ['Release', releaseCommand, 'Release', '.build/release'],
+  for (const [name, step, configuration, derivedDataPath] of [
+    ['Debug', debugStep, 'Debug', '.build/debug'],
+    ['Release', releaseStep, 'Release', '.build/release'],
   ]) {
-    if (command === null) {
+    const commands = executableShellCommands(step?.run);
+    if (commands.some((command) => command.startsWith('xcodebuild ')) === false) {
       errors.push(`${name} build step must execute xcodebuild`);
-      continue;
     }
-    for (const argument of [...expectedCommonXcodeArguments, `-configuration ${configuration}`, `-derivedDataPath ${derivedDataPath}`]) {
-      if (command.includes(argument) === false) {
-        errors.push(`${name} build xcodebuild command must include ${argument}`);
-      }
+    if (commands.length !== 1 || commands[0] !== expectedXcodebuildCommand(configuration, derivedDataPath)) {
+      errors.push(`${name} build step must contain only the exact xcodebuild command`);
     }
-  }
-
-  const failureMask = /(?:\|\||&&)\s*(?:true|:)\b/;
-  if (debugCommand !== null && failureMask.test(debugCommand)) {
-    errors.push('Debug build step must not mask xcodebuild failures');
-  }
-  if (releaseCommand !== null && failureMask.test(releaseCommand)) {
-    errors.push('Release build step must not mask xcodebuild failures');
-  }
-  if (debugStep?.continueOnError === true) {
-    errors.push('Debug build step must not continue after an error');
-  }
-  if (releaseStep?.continueOnError === true) {
-    errors.push('Release build step must not continue after an error');
   }
 
   const universalStep = namedStep(buildSteps, 'Verify universal Release binary');
   const universalShellCommands = executableShellCommands(universalStep?.run);
   const universalCommands = universalShellCommands.join('\n');
+  if (JSON.stringify(universalShellCommands) !== JSON.stringify(expectedUniversalSafetyCommands())) {
+    errors.push('universal binary check must match the exact safety command sequence');
+  }
   if (universalCommands.includes('.build/release/Build/Products/Release/v2s.app/Contents/MacOS/v2s') === false) {
     errors.push('universal binary check must target the Release app executable');
   }
   if (/\blipo -archs "\$APP_BINARY"/.test(universalCommands) === false) {
     errors.push('universal binary check must execute lipo -archs');
-  }
-  const lipoCommand = universalShellCommands.find((command) => /\blipo -archs "\$APP_BINARY"/.test(command));
-  if (lipoCommand !== undefined && failureMask.test(lipoCommand)) {
-    errors.push('universal binary check must not mask lipo failures');
   }
   if (/for required in\s+arm64\s+x86_64; do/.test(universalCommands) === false) {
     errors.push('universal binary check must guard both arm64 and x86_64');
@@ -247,10 +254,6 @@ function validateWorkflow(workflow) {
   if (missingSliceBranch === null || /\bexit\s+1\b/.test(missingSliceBranch[1]) === false) {
     errors.push('universal binary check must exit with failure when a required slice is absent');
   }
-  if (universalStep?.continueOnError === true) {
-    errors.push('universal binary check must not continue after an error');
-  }
-
   return errors;
 }
 
@@ -321,6 +324,11 @@ test('CI validator rejects commented or removed build checks and privileged work
       /must not reference secrets/,
     ],
     [
+      'whole secrets context expression',
+      `${workflow}\n      - name: leaked\n        run: echo \${{ toJSON(secrets) }}\n`,
+      /must not reference secrets/,
+    ],
+    [
       'write permission',
       workflow.replace('  contents: read', '  contents: write'),
       /must not grant contents: write/,
@@ -346,31 +354,49 @@ test('CI validator rejects commented or removed build checks and privileged work
       /grant only read access to repository contents/,
     ],
     [
+      'job-level inline permissions',
+      workflow.replace(
+        '  test:\n    runs-on: macos-26',
+        '  test:\n    permissions: { id-token: write }\n    runs-on: macos-26'
+      ),
+      /permissions must appear exactly once as the top-level contents: read block/,
+    ],
+    [
       'Debug xcodebuild failure mask',
       transformStepRun(workflow, 'Build Debug app', (run) => run.replace('            build', '            build || true')),
-      /Debug build step must not mask xcodebuild failures/,
+      /Debug build step must contain only the exact xcodebuild command/,
     ],
     [
       'Release xcodebuild failure mask',
       transformStepRun(workflow, 'Build Release app', (run) => run.replace('            build', '            build || true')),
-      /Release build step must not mask xcodebuild failures/,
+      /Release build step must contain only the exact xcodebuild command/,
+    ],
+    [
+      'Debug xcodebuild alternate failure mask',
+      transformStepRun(workflow, 'Build Debug app', (run) => run.replace('            build', '            build || echo ignored')),
+      /Debug build step must contain only the exact xcodebuild command/,
     ],
     [
       'lipo failure mask',
       transformStepRun(workflow, 'Verify universal Release binary', (run) =>
         run.replace('          ARCHS="$(lipo -archs "$APP_BINARY")"', '          ARCHS="$(lipo -archs "$APP_BINARY")" || true')
       ),
-      /universal binary check must not mask lipo failures/,
+      /universal binary check must match the exact safety command sequence/,
     ],
     [
       'missing-slice exit',
       transformStepRun(workflow, 'Verify universal Release binary', (run) => run.replace('                exit 1\n', '')),
-      /must exit with failure when a required slice is absent/,
+      /universal binary check must match the exact safety command sequence/,
     ],
     [
       'critical step continue-on-error',
       workflow.replace('      - name: Build Debug app\n        run:', '      - name: Build Debug app\n        continue-on-error: true\n        run:'),
-      /Debug build step must not continue after an error/,
+      /CI must not use continue-on-error/,
+    ],
+    [
+      'expression-based continue-on-error',
+      workflow.replace('      - name: Swift tests\n        run:', '      - name: Swift tests\n        continue-on-error: \${{ true }}\n        run:'),
+      /CI must not use continue-on-error/,
     ],
   ];
 
