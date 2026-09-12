@@ -10,7 +10,7 @@ import Testing
 
         let model = AppModel(
             settingsStore: SettingsStore(fileURL: settingsURL),
-            sourceCatalogService: SourceCatalogService()
+            sourceCatalogService: TestSourceCatalogService()
         )
         let controller = SettingsWindowController(
             model: model,

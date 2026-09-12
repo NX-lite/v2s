@@ -10,7 +10,7 @@ import Testing
 
         let model = AppModel(
             settingsStore: SettingsStore(fileURL: settingsURL),
-            sourceCatalogService: SourceCatalogService(),
+            sourceCatalogService: TestSourceCatalogService(),
             assistant: AssistantCoordinator(settings: configuredAssistantSettings())
         )
         let first = TranscriptEntry(
@@ -47,7 +47,7 @@ import Testing
 
         let model = AppModel(
             settingsStore: SettingsStore(fileURL: settingsURL),
-            sourceCatalogService: SourceCatalogService(),
+            sourceCatalogService: TestSourceCatalogService(),
             assistant: AssistantCoordinator(settings: configuredAssistantSettings())
         )
         let identifier = UUID(uuidString: "00000000-0000-0000-0000-000000000003")!
@@ -86,7 +86,7 @@ import Testing
         let coordinator = AssistantCoordinator(settings: originalAssistant)
         let model = AppModel(
             settingsStore: store,
-            sourceCatalogService: SourceCatalogService(),
+            sourceCatalogService: TestSourceCatalogService(),
             assistant: coordinator
         )
         model.selectedSourceID = "source:primary"
@@ -128,7 +128,7 @@ import Testing
 
         let model = AppModel(
             settingsStore: store,
-            sourceCatalogService: SourceCatalogService()
+            sourceCatalogService: TestSourceCatalogService()
         )
 
         #expect(model.assistant.settings == persistedAssistant)
@@ -148,7 +148,7 @@ import Testing
         )
         let model = AppModel(
             settingsStore: SettingsStore(fileURL: settingsURL),
-            sourceCatalogService: SourceCatalogService(),
+            sourceCatalogService: TestSourceCatalogService(),
             assistant: assistant
         )
 
@@ -177,7 +177,7 @@ import Testing
         )
         let model = AppModel(
             settingsStore: SettingsStore(fileURL: settingsURL),
-            sourceCatalogService: SourceCatalogService(),
+            sourceCatalogService: TestSourceCatalogService(),
             assistant: assistant
         )
 
@@ -209,7 +209,7 @@ import Testing
 
         let model = AppModel(
             settingsStore: SettingsStore(fileURL: settingsURL),
-            sourceCatalogService: SourceCatalogService(),
+            sourceCatalogService: TestSourceCatalogService(),
             assistant: AssistantCoordinator()
         )
 
@@ -236,7 +236,7 @@ import Testing
         )
         let model = AppModel(
             settingsStore: SettingsStore(fileURL: settingsURL),
-            sourceCatalogService: EmptySourceCatalogService(),
+            sourceCatalogService: TestSourceCatalogService(),
             assistant: assistant
         )
 
@@ -293,7 +293,7 @@ import Testing
         )
         let model = AppModel(
             settingsStore: SettingsStore(fileURL: settingsURL),
-            sourceCatalogService: SourceCatalogService(),
+            sourceCatalogService: TestSourceCatalogService(),
             assistant: assistant
         )
 
@@ -325,7 +325,7 @@ import Testing
         )
         let model = AppModel(
             settingsStore: SettingsStore(fileURL: settingsURL),
-            sourceCatalogService: SourceCatalogService(),
+            sourceCatalogService: TestSourceCatalogService(),
             assistant: assistant
         )
 
@@ -410,13 +410,6 @@ import Testing
         for _ in 0..<20 {
             await Task.yield()
         }
-    }
-}
-
-@MainActor
-private struct EmptySourceCatalogService: SourceCatalogLoading {
-    func loadSnapshot() -> SourceCatalogSnapshot {
-        SourceCatalogSnapshot(applications: [], microphones: [])
     }
 }
 

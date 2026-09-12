@@ -10,7 +10,7 @@ import Testing
 
         let model = AppModel(
             settingsStore: SettingsStore(fileURL: settingsURL),
-            sourceCatalogService: SourceCatalogService(),
+            sourceCatalogService: TestSourceCatalogService(),
             assistant: AssistantCoordinator()
         )
         var closeCount = 0
@@ -35,7 +35,7 @@ import Testing
         let assistant = AssistantCoordinator()
         let model = AppModel(
             settingsStore: SettingsStore(fileURL: settingsURL),
-            sourceCatalogService: SourceCatalogService(),
+            sourceCatalogService: TestSourceCatalogService(),
             assistant: assistant
         )
 

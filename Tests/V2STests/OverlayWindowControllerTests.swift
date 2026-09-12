@@ -10,7 +10,7 @@ import Testing
 
         let model = AppModel(
             settingsStore: SettingsStore(fileURL: settingsURL),
-            sourceCatalogService: SourceCatalogService()
+            sourceCatalogService: TestSourceCatalogService()
         )
         let controller = OverlayWindowController(model: model, showTranscript: {})
 
@@ -34,7 +34,7 @@ import Testing
         let assistant = AssistantCoordinator()
         let model = AppModel(
             settingsStore: SettingsStore(fileURL: settingsURL),
-            sourceCatalogService: SourceCatalogService(),
+            sourceCatalogService: TestSourceCatalogService(),
             assistant: assistant
         )
         let controller = OverlayWindowController(model: model, showTranscript: {})
@@ -61,7 +61,7 @@ import Testing
 
         let model = AppModel(
             settingsStore: SettingsStore(fileURL: settingsURL),
-            sourceCatalogService: SourceCatalogService(),
+            sourceCatalogService: TestSourceCatalogService(),
             assistant: AssistantCoordinator()
         )
         let controller = OverlayWindowController(model: model, showTranscript: {})
@@ -95,7 +95,7 @@ import Testing
 
         let model = AppModel(
             settingsStore: SettingsStore(fileURL: settingsURL),
-            sourceCatalogService: SourceCatalogService(),
+            sourceCatalogService: TestSourceCatalogService(),
             assistant: AssistantCoordinator()
         )
         let controller = OverlayWindowController(model: model, showTranscript: {})
@@ -130,7 +130,7 @@ import Testing
         let assistant = AssistantCoordinator()
         let model = AppModel(
             settingsStore: SettingsStore(fileURL: settingsURL),
-            sourceCatalogService: SourceCatalogService(),
+            sourceCatalogService: TestSourceCatalogService(),
             assistant: assistant
         )
         let controller = OverlayWindowController(model: model, showTranscript: {})
@@ -181,7 +181,7 @@ import Testing
         let assistant = AssistantCoordinator()
         let model = AppModel(
             settingsStore: SettingsStore(fileURL: settingsURL),
-            sourceCatalogService: SourceCatalogService(),
+            sourceCatalogService: TestSourceCatalogService(),
             assistant: assistant
         )
         let controller = OverlayWindowController(model: model, showTranscript: {})
@@ -217,7 +217,7 @@ import Testing
         let assistant = AssistantCoordinator()
         let model = AppModel(
             settingsStore: SettingsStore(fileURL: settingsURL),
-            sourceCatalogService: SourceCatalogService(),
+            sourceCatalogService: TestSourceCatalogService(),
             assistant: assistant
         )
 
