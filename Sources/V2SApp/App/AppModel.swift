@@ -31,7 +31,7 @@ private enum AppBuildInfo {
 @MainActor
 final class AppModel: ObservableObject {
     private let settingsStore: SettingsStore
-    private let sourceCatalogService: SourceCatalogService
+    private let sourceCatalogService: any SourceCatalogLoading
     let assistant: AssistantCoordinator
     private var assistantSettingsCancellable: AnyCancellable?
     private var assistantPresentationCancellable: AnyCancellable?
@@ -192,7 +192,7 @@ final class AppModel: ObservableObject {
 
     init(
         settingsStore: SettingsStore,
-        sourceCatalogService: SourceCatalogService,
+        sourceCatalogService: any SourceCatalogLoading,
         assistant: AssistantCoordinator? = nil
     ) {
         let settings = settingsStore.load()

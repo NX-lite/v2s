@@ -19,7 +19,7 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - name: Swift tests
-        run: bash scripts/diagnose-swift-tests.sh
+        run: swift test --no-parallel
       - name: Documentation structure tests
         run: node --test Tests/Docs/*.test.cjs
 

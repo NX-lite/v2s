@@ -236,7 +236,7 @@ import Testing
         )
         let model = AppModel(
             settingsStore: SettingsStore(fileURL: settingsURL),
-            sourceCatalogService: SourceCatalogService(),
+            sourceCatalogService: EmptySourceCatalogService(),
             assistant: assistant
         )
 
@@ -410,6 +410,13 @@ import Testing
         for _ in 0..<20 {
             await Task.yield()
         }
+    }
+}
+
+@MainActor
+private struct EmptySourceCatalogService: SourceCatalogLoading {
+    func loadSnapshot() -> SourceCatalogSnapshot {
+        SourceCatalogSnapshot(applications: [], microphones: [])
     }
 }
 
