@@ -350,37 +350,53 @@ struct OpenAIResponsesClient: Sendable {
     }
 
     private static func urlByReplacingAPIKey(in components: URLComponents, with apiKey: String) throws -> URL {
+        let tracesQueryRegression = components.percentEncodedQuery?.contains("trace=a%2Bb") == true
+        traceQueryRegression("before query filtering", enabled: tracesQueryRegression)
         let retainedPairs = (components.percentEncodedQuery ?? "").split(separator: "&", omittingEmptySubsequences: false).filter { pair in
             let name = pair.split(separator: "=", maxSplits: 1, omittingEmptySubsequences: false).first ?? pair
             return name.caseInsensitiveCompare("key") != .orderedSame
         }
+        traceQueryRegression("after query filtering", enabled: tracesQueryRegression)
         let allowed = CharacterSet.urlQueryAllowed.subtracting(CharacterSet(charactersIn: "&=+#?"))
         guard let encodedKey = apiKey.addingPercentEncoding(withAllowedCharacters: allowed) else {
             throw ClientError.invalidRequest
         }
 
         var endpointComponents = components
+        traceQueryRegression("before clearing query", enabled: tracesQueryRegression)
         endpointComponents.percentEncodedQuery = nil
+        traceQueryRegression("after clearing query", enabled: tracesQueryRegression)
         let endpoint = try requiredURL(endpointComponents)
+        traceQueryRegression("after endpoint URL", enabled: tracesQueryRegression)
         let query = (retainedPairs.map(String.init) + ["key=\(encodedKey)"]).joined(separator: "&")
         guard let url = URL(string: "\(endpoint.absoluteString)?\(query)") else {
             throw ClientError.invalidRequest
         }
+        traceQueryRegression("after final URL", enabled: tracesQueryRegression)
         return url
     }
 
     private static func baseComponents(from baseURLString: String) -> URLComponents? {
         let source = baseURLString.trimmingCharacters(in: .whitespacesAndNewlines)
+        let tracesQueryRegression = source.contains("trace=a%2Bb")
+        traceQueryRegression("before base parsing", enabled: tracesQueryRegression)
         guard !source.isEmpty, var components = URLComponents(string: source),
               let scheme = components.scheme?.lowercased(), ["http", "https"].contains(scheme),
               components.host?.isEmpty == false else {
             return nil
         }
+        traceQueryRegression("after base parsing", enabled: tracesQueryRegression)
         var normalizedPath = components.percentEncodedPath
         while normalizedPath.last == "/" { normalizedPath.removeLast() }
         components.percentEncodedPath = normalizedPath
         components.fragment = nil
+        traceQueryRegression("after base normalization", enabled: tracesQueryRegression)
         return components
+    }
+
+    private static func traceQueryRegression(_ message: String, enabled: Bool) {
+        guard enabled else { return }
+        FileHandle.standardError.write(Data("query-regression: \(message)\n".utf8))
     }
 
     private static func requiredBaseComponents(from baseURLString: String) throws -> URLComponents {
