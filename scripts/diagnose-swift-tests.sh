@@ -17,6 +17,8 @@ swift_pid=$!
     ps -axo pid,ppid,state,etime,command >&2
     test_pid="$(pgrep -n -f '/v2sPackageTests\.xctest/Contents/MacOS/v2sPackageTests' || true)"
     if [[ -n "$test_pid" ]]; then
+        echo "Dumping Swift concurrency state for test process $test_pid" >&2
+        xcrun swift-inspect dump-concurrency "$test_pid" >&2 || true
         echo "Sampling test process $test_pid" >&2
         sample "$test_pid" 3 1 >&2 || true
         kill -TERM "$test_pid" 2>/dev/null || true
