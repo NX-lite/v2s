@@ -323,16 +323,14 @@ struct OpenAIResponsesClient: Sendable {
             if segments.last != "models" { segments.append("models") }
             components.percentEncodedPath = Self.path(from: segments)
         }
-        Self.replaceAPIKey(in: &components, with: apiKey)
-        return try Self.requiredURL(components)
+        return try Self.urlByReplacingAPIKey(in: components, with: apiKey)
     }
 
     private func geminiGenerateContentURL(model: String, apiKey: String) throws -> URL {
         var components = try Self.requiredBaseComponents(from: baseURLString)
         if case .generateContent(let segments) = Self.geminiBasePath(for: components.percentEncodedPath) {
             components.percentEncodedPath = Self.path(from: segments)
-            Self.replaceAPIKey(in: &components, with: apiKey)
-            return try Self.requiredURL(components)
+            return try Self.urlByReplacingAPIKey(in: components, with: apiKey)
         }
         let allowed = CharacterSet.urlPathAllowed.subtracting(CharacterSet(charactersIn: "/?#"))
         guard let encodedModel = model.addingPercentEncoding(withAllowedCharacters: allowed) else {
@@ -348,18 +346,27 @@ struct OpenAIResponsesClient: Sendable {
             throw ClientError.invalidRequest
         }
         components.percentEncodedPath = Self.path(from: segments)
-        Self.replaceAPIKey(in: &components, with: apiKey)
-        return try Self.requiredURL(components)
+        return try Self.urlByReplacingAPIKey(in: components, with: apiKey)
     }
 
-    private static func replaceAPIKey(in components: inout URLComponents, with apiKey: String) {
+    private static func urlByReplacingAPIKey(in components: URLComponents, with apiKey: String) throws -> URL {
         let retainedPairs = (components.percentEncodedQuery ?? "").split(separator: "&", omittingEmptySubsequences: false).filter { pair in
             let name = pair.split(separator: "=", maxSplits: 1, omittingEmptySubsequences: false).first ?? pair
             return name.caseInsensitiveCompare("key") != .orderedSame
         }
         let allowed = CharacterSet.urlQueryAllowed.subtracting(CharacterSet(charactersIn: "&=+#?"))
-        guard let encodedKey = apiKey.addingPercentEncoding(withAllowedCharacters: allowed) else { return }
-        components.percentEncodedQuery = (retainedPairs.map(String.init) + ["key=\(encodedKey)"]).joined(separator: "&")
+        guard let encodedKey = apiKey.addingPercentEncoding(withAllowedCharacters: allowed) else {
+            throw ClientError.invalidRequest
+        }
+
+        var endpointComponents = components
+        endpointComponents.percentEncodedQuery = nil
+        let endpoint = try requiredURL(endpointComponents)
+        let query = (retainedPairs.map(String.init) + ["key=\(encodedKey)"]).joined(separator: "&")
+        guard let url = URL(string: "\(endpoint.absoluteString)?\(query)") else {
+            throw ClientError.invalidRequest
+        }
+        return url
     }
 
     private static func baseComponents(from baseURLString: String) -> URLComponents? {
