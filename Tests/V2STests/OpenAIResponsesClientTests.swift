@@ -287,16 +287,10 @@ import Testing
             transport: transport
         )
 
-        FileHandle.standardError.write(Data("query-regression: before validation\n".utf8))
-        try client.validateRequestConfiguration()
-        FileHandle.standardError.write(Data("query-regression: after validation\n".utf8))
         _ = try await client.respond(instructions: "System", prompt: "Question", screenshotPNGData: nil)
-        FileHandle.standardError.write(Data("query-regression: after response\n".utf8))
         let request = try #require(await transport.firstRequest())
-        FileHandle.standardError.write(Data("query-regression: after request capture\n".utf8))
         let url = try #require(request.url)
         let components = try #require(URLComponents(url: url, resolvingAgainstBaseURL: false))
-        FileHandle.standardError.write(Data("query-regression: after URL parsing\n".utf8))
 
         #expect(components.percentEncodedQuery == "trace=a%2Bb&route=a%2Fb&key=test-placeholder-key")
     }

@@ -90,7 +90,7 @@ struct OpenAIResponsesClient: Sendable {
     }
 
     private var isGeminiProvider: Bool {
-        guard let host = Self.baseComponents(from: baseURLString)?.host else { return false }
+        guard let host = Self.baseEndpointSeparatingQuery(from: baseURLString)?.components.host else { return false }
         return host.caseInsensitiveCompare("generativelanguage.googleapis.com") == .orderedSame
     }
 
@@ -270,6 +270,11 @@ struct OpenAIResponsesClient: Sendable {
         case generateContent([String])
     }
 
+    private struct BaseEndpoint {
+        var components: URLComponents
+        let percentEncodedQuery: String?
+    }
+
     private func validatedRequestConfiguration() throws -> (apiKey: String, model: String, endpoint: RequestEndpoint) {
         let key = try validatedAPIKey()
         let resolvedModel = try validatedModel()
@@ -312,32 +317,40 @@ struct OpenAIResponsesClient: Sendable {
     }
 
     private func geminiModelsURL(apiKey: String) throws -> URL {
-        var components = try Self.requiredBaseComponents(from: baseURLString)
-        switch Self.geminiBasePath(for: components.percentEncodedPath) {
+        var endpoint = try Self.requiredBaseEndpointSeparatingQuery(from: baseURLString)
+        switch Self.geminiBasePath(for: endpoint.components.percentEncodedPath) {
         case .root(let segments):
-            components.percentEncodedPath = Self.path(from: segments + ["models"])
+            endpoint.components.percentEncodedPath = Self.path(from: segments + ["models"])
         case .models(let segments):
-            components.percentEncodedPath = Self.path(from: segments)
+            endpoint.components.percentEncodedPath = Self.path(from: segments)
         case .generateContent(var segments):
             segments.removeLast()
             if segments.last != "models" { segments.append("models") }
-            components.percentEncodedPath = Self.path(from: segments)
+            endpoint.components.percentEncodedPath = Self.path(from: segments)
         }
-        return try Self.urlByReplacingAPIKey(in: components, with: apiKey)
+        return try Self.urlByReplacingAPIKey(
+            in: endpoint.components,
+            percentEncodedQuery: endpoint.percentEncodedQuery,
+            with: apiKey
+        )
     }
 
     private func geminiGenerateContentURL(model: String, apiKey: String) throws -> URL {
-        var components = try Self.requiredBaseComponents(from: baseURLString)
-        if case .generateContent(let segments) = Self.geminiBasePath(for: components.percentEncodedPath) {
-            components.percentEncodedPath = Self.path(from: segments)
-            return try Self.urlByReplacingAPIKey(in: components, with: apiKey)
+        var endpoint = try Self.requiredBaseEndpointSeparatingQuery(from: baseURLString)
+        if case .generateContent(let segments) = Self.geminiBasePath(for: endpoint.components.percentEncodedPath) {
+            endpoint.components.percentEncodedPath = Self.path(from: segments)
+            return try Self.urlByReplacingAPIKey(
+                in: endpoint.components,
+                percentEncodedQuery: endpoint.percentEncodedQuery,
+                with: apiKey
+            )
         }
         let allowed = CharacterSet.urlPathAllowed.subtracting(CharacterSet(charactersIn: "/?#"))
         guard let encodedModel = model.addingPercentEncoding(withAllowedCharacters: allowed) else {
             throw ClientError.invalidRequest
         }
         let segments: [String]
-        switch Self.geminiBasePath(for: components.percentEncodedPath) {
+        switch Self.geminiBasePath(for: endpoint.components.percentEncodedPath) {
         case .root(let prefix):
             segments = prefix + ["models", "\(encodedModel):generateContent"]
         case .models(let prefix):
@@ -345,63 +358,81 @@ struct OpenAIResponsesClient: Sendable {
         case .generateContent:
             throw ClientError.invalidRequest
         }
-        components.percentEncodedPath = Self.path(from: segments)
-        return try Self.urlByReplacingAPIKey(in: components, with: apiKey)
+        endpoint.components.percentEncodedPath = Self.path(from: segments)
+        return try Self.urlByReplacingAPIKey(
+            in: endpoint.components,
+            percentEncodedQuery: endpoint.percentEncodedQuery,
+            with: apiKey
+        )
     }
 
-    private static func urlByReplacingAPIKey(in components: URLComponents, with apiKey: String) throws -> URL {
-        let tracesQueryRegression = components.percentEncodedQuery?.contains("trace=a%2Bb") == true
-        traceQueryRegression("before query filtering", enabled: tracesQueryRegression)
-        let retainedPairs = (components.percentEncodedQuery ?? "").split(separator: "&", omittingEmptySubsequences: false).filter { pair in
+    private static func urlByReplacingAPIKey(
+        in components: URLComponents,
+        percentEncodedQuery: String?,
+        with apiKey: String
+    ) throws -> URL {
+        let retainedPairs = (percentEncodedQuery ?? "").split(separator: "&", omittingEmptySubsequences: false).filter { pair in
             let name = pair.split(separator: "=", maxSplits: 1, omittingEmptySubsequences: false).first ?? pair
             return name.caseInsensitiveCompare("key") != .orderedSame
         }
-        traceQueryRegression("after query filtering", enabled: tracesQueryRegression)
         let allowed = CharacterSet.urlQueryAllowed.subtracting(CharacterSet(charactersIn: "&=+#?"))
         guard let encodedKey = apiKey.addingPercentEncoding(withAllowedCharacters: allowed) else {
             throw ClientError.invalidRequest
         }
 
-        var endpointComponents = components
-        traceQueryRegression("before clearing query", enabled: tracesQueryRegression)
-        endpointComponents.percentEncodedQuery = nil
-        traceQueryRegression("after clearing query", enabled: tracesQueryRegression)
-        let endpoint = try requiredURL(endpointComponents)
-        traceQueryRegression("after endpoint URL", enabled: tracesQueryRegression)
+        let endpoint = try requiredURL(components)
         let query = (retainedPairs.map(String.init) + ["key=\(encodedKey)"]).joined(separator: "&")
         guard let url = URL(string: "\(endpoint.absoluteString)?\(query)") else {
             throw ClientError.invalidRequest
         }
-        traceQueryRegression("after final URL", enabled: tracesQueryRegression)
         return url
+    }
+
+    private static func baseEndpointSeparatingQuery(from baseURLString: String) -> BaseEndpoint? {
+        let source = baseURLString.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !source.isEmpty else { return nil }
+
+        let withoutFragment = source.split(separator: "#", maxSplits: 1, omittingEmptySubsequences: false)[0]
+        let parts = withoutFragment.split(separator: "?", maxSplits: 1, omittingEmptySubsequences: false)
+        let endpointString = String(parts[0])
+        let percentEncodedQuery = parts.count == 2 ? String(parts[1]) : nil
+        guard var components = URLComponents(string: endpointString),
+              let scheme = components.scheme?.lowercased(), ["http", "https"].contains(scheme),
+              components.host?.isEmpty == false else {
+            return nil
+        }
+
+        var normalizedPath = components.percentEncodedPath
+        while normalizedPath.last == "/" { normalizedPath.removeLast() }
+        components.percentEncodedPath = normalizedPath
+        components.fragment = nil
+        return BaseEndpoint(components: components, percentEncodedQuery: percentEncodedQuery)
     }
 
     private static func baseComponents(from baseURLString: String) -> URLComponents? {
         let source = baseURLString.trimmingCharacters(in: .whitespacesAndNewlines)
-        let tracesQueryRegression = source.contains("trace=a%2Bb")
-        traceQueryRegression("before base parsing", enabled: tracesQueryRegression)
         guard !source.isEmpty, var components = URLComponents(string: source),
               let scheme = components.scheme?.lowercased(), ["http", "https"].contains(scheme),
               components.host?.isEmpty == false else {
             return nil
         }
-        traceQueryRegression("after base parsing", enabled: tracesQueryRegression)
         var normalizedPath = components.percentEncodedPath
         while normalizedPath.last == "/" { normalizedPath.removeLast() }
         components.percentEncodedPath = normalizedPath
         components.fragment = nil
-        traceQueryRegression("after base normalization", enabled: tracesQueryRegression)
         return components
-    }
-
-    private static func traceQueryRegression(_ message: String, enabled: Bool) {
-        guard enabled else { return }
-        FileHandle.standardError.write(Data("query-regression: \(message)\n".utf8))
     }
 
     private static func requiredBaseComponents(from baseURLString: String) throws -> URLComponents {
         guard let components = baseComponents(from: baseURLString) else { throw ClientError.invalidRequest }
         return components
+    }
+
+    private static func requiredBaseEndpointSeparatingQuery(from baseURLString: String) throws -> BaseEndpoint {
+        guard let endpoint = baseEndpointSeparatingQuery(from: baseURLString) else {
+            throw ClientError.invalidRequest
+        }
+        return endpoint
     }
 
     private static func requiredURL(_ components: URLComponents) throws -> URL {
