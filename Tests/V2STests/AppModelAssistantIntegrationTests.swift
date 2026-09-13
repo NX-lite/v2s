@@ -27,6 +27,40 @@ import Testing
         #expect(entry.localTranslatedText == "本地翻译")
     }
 
+    @Test func transcriptEntryFallsBackToLocalValuesForEmptyCorrections() {
+        let entry = TranscriptEntry(
+            id: UUID(),
+            sourceID: "mic-1",
+            sourceName: "Desk Mic",
+            sourceLanguageID: "en",
+            targetLanguageID: "zh-Hans",
+            localSourceText: "local source",
+            localTranslatedText: "本地翻译",
+            correctedSourceText: "",
+            correctedTranslatedText: ""
+        )
+
+        #expect(entry.sourceText == "local source")
+        #expect(entry.translatedText == "本地翻译")
+    }
+
+    @Test func transcriptEntryFallsBackToLocalValuesForWhitespaceOnlyCorrections() {
+        let entry = TranscriptEntry(
+            id: UUID(),
+            sourceID: "mic-1",
+            sourceName: "Desk Mic",
+            sourceLanguageID: "en",
+            targetLanguageID: "zh-Hans",
+            localSourceText: "local source",
+            localTranslatedText: "本地翻译",
+            correctedSourceText: " \n\t ",
+            correctedTranslatedText: "\n  \t"
+        )
+
+        #expect(entry.sourceText == "local source")
+        #expect(entry.translatedText == "本地翻译")
+    }
+
     @Test func snapshotCopiesTranscriptEntriesInTheirStoredOrder() {
         let settingsURL = makeSettingsURL()
         defer { try? FileManager.default.removeItem(at: settingsURL) }
