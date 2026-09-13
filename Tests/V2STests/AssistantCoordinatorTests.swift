@@ -556,9 +556,11 @@ import Testing
     }
 
     private func waitUntil(_ condition: @escaping () -> Bool) async {
-        for _ in 0..<200 {
+        let clock = ContinuousClock()
+        let deadline = clock.now.advanced(by: .seconds(2))
+        while clock.now < deadline {
             if condition() { return }
-            await Task.yield()
+            try? await Task.sleep(for: .milliseconds(10))
         }
         Issue.record("Timed out waiting for coordinator state")
     }
