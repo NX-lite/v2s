@@ -218,6 +218,7 @@ import Testing
         let data = try JSONEncoder().encode(settings)
         let decoded = try JSONDecoder().decode(AppSettings.self, from: data)
 
+        #expect(decoded.correction.isEnabled)
         #expect(decoded.correction.disabledSourceIDs == ["app-1", "mic-1"])
         #expect(decoded.correction.isolatedContextSourceIDs == ["browser-1", "mic-1"])
         #expect(decoded.assistant.apiKey == "assistant-key")
