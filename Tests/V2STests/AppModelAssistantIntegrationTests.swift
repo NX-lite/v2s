@@ -4,6 +4,29 @@ import Testing
 
 @MainActor
 @Suite struct AppModelAssistantIntegrationTests {
+    @Test func transcriptEntryPrefersCorrectionsButRetainsLocalValues() {
+        var entry = TranscriptEntry(
+            id: UUID(),
+            sourceID: "mic-1",
+            sourceName: "Desk Mic",
+            sourceLanguageID: "en",
+            targetLanguageID: "zh-Hans",
+            localSourceText: "local source",
+            localTranslatedText: "本地翻译"
+        )
+
+        #expect(entry.sourceText == "local source")
+        #expect(entry.translatedText == "本地翻译")
+
+        entry.correctedSourceText = "correct source"
+        entry.correctedTranslatedText = "纠正翻译"
+
+        #expect(entry.sourceText == "correct source")
+        #expect(entry.translatedText == "纠正翻译")
+        #expect(entry.localSourceText == "local source")
+        #expect(entry.localTranslatedText == "本地翻译")
+    }
+
     @Test func snapshotCopiesTranscriptEntriesInTheirStoredOrder() {
         let settingsURL = makeSettingsURL()
         defer { try? FileManager.default.removeItem(at: settingsURL) }
@@ -15,14 +38,22 @@ import Testing
         )
         let first = TranscriptEntry(
             id: UUID(uuidString: "00000000-0000-0000-0000-000000000001")!,
-            sourceText: "First source",
-            translatedText: "First translation",
+            sourceID: "mic-1",
+            sourceName: "Desk Mic",
+            sourceLanguageID: "en",
+            targetLanguageID: "zh-Hans",
+            localSourceText: "First source",
+            localTranslatedText: "First translation",
             timestamp: Date(timeIntervalSince1970: 200)
         )
         let second = TranscriptEntry(
             id: UUID(uuidString: "00000000-0000-0000-0000-000000000002")!,
-            sourceText: "Second source",
-            translatedText: "Second translation",
+            sourceID: "mic-2",
+            sourceName: "Remote Mic",
+            sourceLanguageID: "ja",
+            targetLanguageID: "en",
+            localSourceText: "Second source",
+            localTranslatedText: "Second translation",
             timestamp: Date(timeIntervalSince1970: 100)
         )
 
@@ -36,8 +67,8 @@ import Testing
         #expect(snapshot.outputLanguageID == model.outputLanguageID)
         #expect(snapshot.outputLanguageName == model.languageName(for: model.outputLanguageID))
         #expect(snapshot.entries == [
-            .init(timestamp: first.timestamp, sourceText: "First source", translatedText: "First translation"),
-            .init(timestamp: second.timestamp, sourceText: "Second source", translatedText: "Second translation"),
+            .init(timestamp: first.timestamp, sourceName: "Desk Mic", sourceLanguageID: "en", targetLanguageID: "zh-Hans", sourceText: "First source", translatedText: "First translation"),
+            .init(timestamp: second.timestamp, sourceName: "Remote Mic", sourceLanguageID: "ja", targetLanguageID: "en", sourceText: "Second source", translatedText: "Second translation"),
         ])
     }
 
@@ -53,7 +84,16 @@ import Testing
         let identifier = UUID(uuidString: "00000000-0000-0000-0000-000000000003")!
         let originalTimestamp = Date(timeIntervalSince1970: 42)
         model.replaceTranscriptEntriesForTesting([
-            .init(id: identifier, sourceText: "Original", translatedText: "初始", timestamp: originalTimestamp),
+            .init(
+                id: identifier,
+                sourceID: "mic-1",
+                sourceName: "Desk Mic",
+                sourceLanguageID: "en",
+                targetLanguageID: "zh-Hans",
+                localSourceText: "Original",
+                localTranslatedText: "初始",
+                timestamp: originalTimestamp
+            ),
         ])
 
         model.upsertTranscriptEntryForTesting(

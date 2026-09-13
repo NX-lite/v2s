@@ -2031,6 +2031,7 @@ final class AppModel: ObservableObject {
             let caption = QueuedCaption(
                 id: UUID(),
                 promotionID: promotionID,
+                sourceID: source.id,
                 sourceText: sourceText,
                 sourceName: source.name,
                 sourceLanguageID: sourceLanguageID,
@@ -2051,6 +2052,7 @@ final class AppModel: ObservableObject {
             let caption = QueuedCaption(
                 id: UUID(),
                 promotionID: UUID(),
+                sourceID: source.id,
                 sourceText: sourceText,
                 sourceName: source.name,
                 sourceLanguageID: sourceLanguageID,
@@ -2122,6 +2124,10 @@ final class AppModel: ObservableObject {
                 )
                 upsertTranscriptEntry(
                     id: displayedCaption.id,
+                    sourceID: displayedCaption.sourceID,
+                    sourceName: displayedCaption.sourceName,
+                    sourceLanguageID: displayedCaption.sourceLanguageID,
+                    targetLanguageID: displayedCaption.targetLanguageID,
                     sourceText: displayedCaption.sourceText,
                     translatedText: resolvedTranslation
                 )
@@ -2169,6 +2175,9 @@ final class AppModel: ObservableObject {
             entries: transcriptEntries.map {
                 AssistantTranscriptEntry(
                     timestamp: $0.timestamp,
+                    sourceName: $0.sourceName,
+                    sourceLanguageID: $0.sourceLanguageID,
+                    targetLanguageID: $0.targetLanguageID,
                     sourceText: $0.sourceText,
                     translatedText: $0.translatedText
                 )
@@ -2222,7 +2231,27 @@ final class AppModel: ObservableObject {
         sourceText: String,
         translatedText: String
     ) {
-        upsertTranscriptEntry(id: id, sourceText: sourceText, translatedText: translatedText)
+        if let entry = transcriptEntries.first(where: { $0.id == id }) {
+            upsertTranscriptEntry(
+                id: id,
+                sourceID: entry.sourceID,
+                sourceName: entry.sourceName,
+                sourceLanguageID: entry.sourceLanguageID,
+                targetLanguageID: entry.targetLanguageID,
+                sourceText: sourceText,
+                translatedText: translatedText
+            )
+        } else {
+            upsertTranscriptEntry(
+                id: id,
+                sourceID: selectedSourceID ?? "unknown",
+                sourceName: selectedSourceDisplayName,
+                sourceLanguageID: inputLanguageID,
+                targetLanguageID: outputLanguageID,
+                sourceText: sourceText,
+                translatedText: translatedText
+            )
+        }
     }
     #endif
 
@@ -2337,6 +2366,10 @@ final class AppModel: ObservableObject {
             )
             upsertTranscriptEntry(
                 id: caption.id,
+                sourceID: caption.sourceID,
+                sourceName: caption.sourceName,
+                sourceLanguageID: caption.sourceLanguageID,
+                targetLanguageID: caption.targetLanguageID,
                 sourceText: caption.sourceText,
                 translatedText: initialTranslation ?? (translationExpected ? "" : caption.sourceText)
             )
@@ -2398,6 +2431,10 @@ final class AppModel: ObservableObject {
             )
             upsertTranscriptEntry(
                 id: caption.id,
+                sourceID: caption.sourceID,
+                sourceName: caption.sourceName,
+                sourceLanguageID: caption.sourceLanguageID,
+                targetLanguageID: caption.targetLanguageID,
                 sourceText: caption.sourceText,
                 translatedText: resolvedTranslation
             )
@@ -2772,7 +2809,7 @@ final class AppModel: ObservableObject {
 
         if let index = transcriptEntries.firstIndex(where: { $0.id == captionID }),
            shouldReplaceCommittedTranslation(transcriptEntries[index].translatedText, for: captionID) {
-            transcriptEntries[index].translatedText = translatedText
+            transcriptEntries[index].localTranslatedText = translatedText
             didApplyTranslation = true
         }
 
@@ -3000,21 +3037,36 @@ final class AppModel: ObservableObject {
 
     private func upsertTranscriptEntry(
         id: UUID,
+        sourceID: String,
+        sourceName: String,
+        sourceLanguageID: String,
+        targetLanguageID: String,
         sourceText: String,
         translatedText: String
     ) {
         if let existingIndex = transcriptEntries.firstIndex(where: { $0.id == id }) {
+            let existingEntry = transcriptEntries[existingIndex]
             transcriptEntries[existingIndex] = TranscriptEntry(
                 id: id,
-                sourceText: sourceText,
-                translatedText: translatedText,
-                timestamp: transcriptEntries[existingIndex].timestamp
+                sourceID: sourceID,
+                sourceName: sourceName,
+                sourceLanguageID: sourceLanguageID,
+                targetLanguageID: targetLanguageID,
+                localSourceText: sourceText,
+                localTranslatedText: translatedText,
+                correctedSourceText: existingEntry.correctedSourceText,
+                correctedTranslatedText: existingEntry.correctedTranslatedText,
+                timestamp: existingEntry.timestamp
             )
         } else {
             transcriptEntries.append(TranscriptEntry(
                 id: id,
-                sourceText: sourceText,
-                translatedText: translatedText
+                sourceID: sourceID,
+                sourceName: sourceName,
+                sourceLanguageID: sourceLanguageID,
+                targetLanguageID: targetLanguageID,
+                localSourceText: sourceText,
+                localTranslatedText: translatedText
             ))
         }
     }
@@ -3321,18 +3373,12 @@ private struct LanguagePairRequirement: Hashable {
 private struct QueuedCaption: Identifiable, Equatable {
     let id: UUID
     let promotionID: UUID
+    let sourceID: String
     let sourceText: String
     let sourceName: String
     let sourceLanguageID: String
     let targetLanguageID: String
     let promotedDraftTranslation: String?
-}
-
-struct TranscriptEntry: Identifiable, Equatable {
-    let id: UUID
-    var sourceText: String
-    var translatedText: String
-    var timestamp: Date = Date()
 }
 
 private struct SpeechLanguageCatalog {

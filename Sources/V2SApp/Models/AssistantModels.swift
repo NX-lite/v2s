@@ -43,8 +43,38 @@ enum AssistantAPITestState: Equatable, Sendable {
 
 struct AssistantTranscriptEntry: Equatable, Sendable {
     let timestamp: Date
+    let sourceName: String
+    let sourceLanguageID: String
+    let targetLanguageID: String
     let sourceText: String
     let translatedText: String
+
+    init(
+        timestamp: Date,
+        sourceName: String,
+        sourceLanguageID: String,
+        targetLanguageID: String,
+        sourceText: String,
+        translatedText: String
+    ) {
+        self.timestamp = timestamp
+        self.sourceName = sourceName
+        self.sourceLanguageID = sourceLanguageID
+        self.targetLanguageID = targetLanguageID
+        self.sourceText = sourceText
+        self.translatedText = translatedText
+    }
+
+    init(timestamp: Date, sourceText: String, translatedText: String) {
+        self.init(
+            timestamp: timestamp,
+            sourceName: "Unknown Source",
+            sourceLanguageID: "unknown",
+            targetLanguageID: "unknown",
+            sourceText: sourceText,
+            translatedText: translatedText
+        )
+    }
 }
 
 struct AssistantTranscriptSnapshot: Equatable, Sendable {

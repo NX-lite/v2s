@@ -59,6 +59,9 @@ struct AssistantPromptBuilder {
     private func transcriptLine(_ entry: AssistantTranscriptEntry) -> String {
         """
         - time: \(timestamp(entry.timestamp))
+          source name: \(displayText(entry.sourceName))
+          source language ID: \(displayText(entry.sourceLanguageID))
+          target language ID: \(displayText(entry.targetLanguageID))
           original: \(displayText(entry.sourceText))
           translation: \(displayText(entry.translatedText))
         """
