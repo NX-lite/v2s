@@ -33,6 +33,7 @@ import Testing
         #expect(settings.selectedSourceIDs == ["mic-1"])
         #expect(settings.sourceLanguageOverrides.isEmpty)
         #expect(settings.sourceOutputLanguageOverrides.isEmpty)
+        #expect(settings.correction == .default)
     }
 
     @Test func multiSourceSettingsRoundTripPreservesOverrides() throws {
@@ -177,7 +178,49 @@ import Testing
         let object = try #require(JSONSerialization.jsonObject(with: data) as? [String: Any])
 
         #expect(object["assistant"] != nil)
+        #expect(object["correction"] != nil)
         #expect(object["gptAPIKey"] == nil)
         #expect(object["privacyModeEnabled"] == nil)
+    }
+
+    @Test func correctionRoundTripPreservesAssistantCredentials() throws {
+        let assistant = AssistantSettings(
+            apiKey: "assistant-key",
+            baseURL: "https://assistant.example.invalid/v1",
+            model: "assistant-model",
+            skills: "",
+            autoDetectConversationLanguages: true,
+            followUpHotKey: .defaultFollowUp,
+            askHotKey: .defaultAsk,
+            switchModeHotKey: .defaultSwitchMode
+        )
+        let correction = CorrectionSettings(
+            isEnabled: true,
+            apiKey: "correction-key",
+            baseURL: "https://correction.example.invalid/v1",
+            model: "correction-model",
+            disabledSourceIDs: ["app-1", "mic-1"],
+            isolatedContextSourceIDs: ["browser-1", "mic-1"]
+        )
+        let settings = AppSettings(
+            selectedSourceID: nil,
+            inputLanguageID: "en",
+            outputLanguageID: "zh-Hans",
+            interfaceLanguageID: nil,
+            overlayStyle: .default,
+            subtitleMode: .balanced,
+            subtitleDisplayMode: .both,
+            glossary: [:],
+            assistant: assistant,
+            correction: correction
+        )
+
+        let data = try JSONEncoder().encode(settings)
+        let decoded = try JSONDecoder().decode(AppSettings.self, from: data)
+
+        #expect(decoded.correction == correction)
+        #expect(decoded.assistant.apiKey == "assistant-key")
+        #expect(decoded.assistant.baseURL == "https://assistant.example.invalid/v1")
+        #expect(decoded.assistant.model == "assistant-model")
     }
 }

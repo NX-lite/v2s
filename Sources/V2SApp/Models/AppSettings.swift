@@ -13,6 +13,7 @@ struct AppSettings: Codable {
     var subtitleDisplayMode: SubtitleDisplayMode
     var glossary: [String: String]
     var assistant: AssistantSettings
+    var correction: CorrectionSettings
 
     static let `default` = AppSettings(
         selectedSourceID: nil,
@@ -26,7 +27,8 @@ struct AppSettings: Codable {
         subtitleMode: .balanced,
         subtitleDisplayMode: .both,
         glossary: [:],
-        assistant: .default
+        assistant: .default,
+        correction: .default
     )
 
     private enum LegacyCodingKeys: String, CodingKey {
@@ -90,6 +92,8 @@ struct AppSettings: Codable {
             )
         }
 
+        correction = (try? c.decodeIfPresent(CorrectionSettings.self, forKey: .correction)) ?? .default
+
         if let privacyModeEnabled = try? legacy.decodeIfPresent(Bool.self, forKey: .privacyModeEnabled) {
             overlayStyle.invisibleInRecording = privacyModeEnabled
         }
@@ -107,7 +111,8 @@ struct AppSettings: Codable {
         subtitleMode: SubtitleMode,
         subtitleDisplayMode: SubtitleDisplayMode,
         glossary: [String: String],
-        assistant: AssistantSettings = .default
+        assistant: AssistantSettings = .default,
+        correction: CorrectionSettings = .default
     ) {
         self.selectedSourceID = selectedSourceID
         self.selectedSourceIDs = selectedSourceIDs
@@ -121,5 +126,6 @@ struct AppSettings: Codable {
         self.subtitleDisplayMode = subtitleDisplayMode
         self.glossary         = glossary
         self.assistant = assistant
+        self.correction = correction
     }
 }
