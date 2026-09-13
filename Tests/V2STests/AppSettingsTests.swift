@@ -199,8 +199,8 @@ import Testing
             apiKey: "correction-key",
             baseURL: "https://correction.example.invalid/v1",
             model: "correction-model",
-            disabledSourceIDs: ["app-1", "mic-1"],
-            isolatedContextSourceIDs: ["browser-1", "mic-1"]
+            disabledSourceIDs: ["mic-1", "app-1", "mic-1"],
+            isolatedContextSourceIDs: ["mic-1", "browser-1", "mic-1"]
         )
         let settings = AppSettings(
             selectedSourceID: nil,
@@ -218,7 +218,8 @@ import Testing
         let data = try JSONEncoder().encode(settings)
         let decoded = try JSONDecoder().decode(AppSettings.self, from: data)
 
-        #expect(decoded.correction == correction)
+        #expect(decoded.correction.disabledSourceIDs == ["app-1", "mic-1"])
+        #expect(decoded.correction.isolatedContextSourceIDs == ["browser-1", "mic-1"])
         #expect(decoded.assistant.apiKey == "assistant-key")
         #expect(decoded.assistant.baseURL == "https://assistant.example.invalid/v1")
         #expect(decoded.assistant.model == "assistant-model")

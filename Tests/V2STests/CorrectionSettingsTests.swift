@@ -32,6 +32,20 @@ import Testing
         #expect(value.isolatedContextSourceIDs == ["app-1", "mic-2"])
     }
 
+    @Test func sourceIDInitializationIsUniqueAndSorted() {
+        let value = CorrectionSettings(
+            isEnabled: true,
+            apiKey: "key",
+            baseURL: "https://example.invalid/v1",
+            model: "model",
+            disabledSourceIDs: ["z", "a", "z"],
+            isolatedContextSourceIDs: ["b", "a", "b"]
+        )
+
+        #expect(value.disabledSourceIDs == ["a", "z"])
+        #expect(value.isolatedContextSourceIDs == ["a", "b"])
+    }
+
     @Test func sourceEnablementRespectsGlobalAndPerSourceSettings() {
         var value = CorrectionSettings.default
         value.isEnabled = true

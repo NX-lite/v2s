@@ -16,6 +16,22 @@ struct CorrectionSettings: Codable, Equatable, Sendable {
         }
     }
 
+    init(
+        isEnabled: Bool,
+        apiKey: String,
+        baseURL: String,
+        model: String,
+        disabledSourceIDs: [String],
+        isolatedContextSourceIDs: [String]
+    ) {
+        self.isEnabled = isEnabled
+        self.apiKey = apiKey
+        self.baseURL = baseURL
+        self.model = model
+        self.disabledSourceIDs = Self.normalized(disabledSourceIDs)
+        self.isolatedContextSourceIDs = Self.normalized(isolatedContextSourceIDs)
+    }
+
     static let `default` = Self(
         isEnabled: false,
         apiKey: "",
