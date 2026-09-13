@@ -88,7 +88,7 @@ final class GlobalHotKeyController: ObservableObject {
     private let onAction: (GlobalHotKeyAction) -> Void
     private let registrar: any GlobalHotKeyRegistering
     private let eventInstaller: any GlobalHotKeyEventInstalling
-    private var registrations: [GlobalHotKeyRegistration] = []
+    private var registrations: [GlobalHotKeyAction: ActiveHotKeyRegistration] = [:]
     private var eventHandlerInstallation: GlobalHotKeyEventHandlerInstallation?
     private var eventHandlerFailure: OSStatus?
 
@@ -107,8 +107,8 @@ final class GlobalHotKeyController: ObservableObject {
     }
 
     deinit {
-        for registration in registrations {
-            registrar.unregister(registration)
+        for activeRegistration in registrations.values {
+            registrar.unregister(activeRegistration.registration)
         }
         if let eventHandlerInstallation {
             eventInstaller.remove(eventHandlerInstallation)
@@ -116,8 +116,6 @@ final class GlobalHotKeyController: ObservableObject {
     }
 
     func update(followUp: HotKeyBinding, ask: HotKeyBinding, switchMode: HotKeyBinding) {
-        unregisterAll()
-
         let plan = Self.makePlan(
             followUp: followUp,
             ask: ask,
@@ -133,7 +131,17 @@ final class GlobalHotKeyController: ObservableObject {
         }
 
         for action in GlobalHotKeyAction.allCases {
-            guard let binding = plan.bindings[action],
+            let binding = plan.bindings[action]
+            if let binding,
+               registrations[action]?.binding == NormalizedHotKeyBinding(binding) {
+                continue
+            }
+
+            if let activeRegistration = registrations.removeValue(forKey: action) {
+                registrar.unregister(activeRegistration.registration)
+            }
+
+            guard let binding,
                   let keyCode = Self.keyCodeMap[binding.normalizedKey] else {
                 continue
             }
@@ -144,7 +152,10 @@ final class GlobalHotKeyController: ObservableObject {
                 action: action
             ) {
             case .success(let registration):
-                registrations.append(registration)
+                registrations[action] = ActiveHotKeyRegistration(
+                    binding: NormalizedHotKeyBinding(binding),
+                    registration: registration
+                )
             case .failure(let failure):
                 errors[action] = .registrationFailed(failure.status)
             }
@@ -217,10 +228,12 @@ final class GlobalHotKeyController: ObservableObject {
     }
 
     private func unregisterAll() {
-        for registration in registrations {
-            registrar.unregister(registration)
+        for action in GlobalHotKeyAction.allCases {
+            guard let activeRegistration = registrations.removeValue(forKey: action) else {
+                continue
+            }
+            registrar.unregister(activeRegistration.registration)
         }
-        registrations.removeAll()
     }
 
     fileprivate func handle(hotKeyID: EventHotKeyID) {
@@ -238,6 +251,11 @@ final class GlobalHotKeyController: ObservableObject {
         if binding.useShift { modifiers |= UInt32(shiftKey) }
         return modifiers
     }
+}
+
+private struct ActiveHotKeyRegistration {
+    let binding: NormalizedHotKeyBinding
+    let registration: GlobalHotKeyRegistration
 }
 
 @MainActor

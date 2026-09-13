@@ -83,7 +83,7 @@ import Testing
         #expect(plan.errors.isEmpty)
     }
 
-    @Test func updateUnregistersOldBindingsAndRegistersOnlyTheValidatedPlan() {
+    @Test func updatePreservesAnUnrelatedActiveBindingWhenOtherBindingsConflict() {
         let registrar = RecordingHotKeyRegistrar()
         let controller = GlobalHotKeyController(
             onAction: { _ in },
@@ -96,18 +96,18 @@ import Testing
             switchMode: .defaultSwitchMode
         )
         let duplicate = binding(key: "f", command: true)
-        let distinct = binding(key: "g", option: true)
 
         controller.update(
             followUp: duplicate,
             ask: binding(key: "F", command: true),
-            switchMode: distinct
+            switchMode: .defaultSwitchMode
         )
 
-        #expect(registrar.unregisteredActions == [.followUp, .ask, .switchMode])
+        #expect(registrar.unregisteredActions == [.followUp, .ask])
         #expect(registrar.registeredActions == [
-            .followUp, .ask, .switchMode, .switchMode,
+            .followUp, .ask, .switchMode,
         ])
+        #expect(registrar.activeActions == [.switchMode])
         #expect(controller.errors == [
             .followUp: .duplicateBinding,
             .ask: .duplicateBinding,
@@ -217,7 +217,7 @@ import Testing
         registrar.setFailure(status: -8080, for: .ask)
         controller.update(
             followUp: .defaultFollowUp,
-            ask: .defaultAsk,
+            ask: binding(key: "h", command: true, option: true),
             switchMode: .defaultSwitchMode
         )
         #expect(assistant.hotKeyRegistrationErrors == [.ask: .registrationFailed(-8080)])
