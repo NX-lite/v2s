@@ -211,6 +211,9 @@ final class LiveTranscriptionSession: NSObject, @unchecked Sendable {
     /// Legacy Speech timestamps can rebase with their segment array. Keep the audio
     /// cursor boundary independent so a replayed/regressed timestamp cannot consume data.
     private var lastCorrectionAudioBoundaryTime: TimeInterval?
+    /// A raw legacy sample bypassed the normalized PCM path. Its utterance cannot safely
+    /// receive a partial correction WAV, so the next committed boundary discards it.
+    private var legacyCorrectionAudioHasConversionGap = false
     private var queuedCommittedEmissionForTesting: CommittedEmission?
     private var committedSegmentCount = 0
     private let committedBoundaryToleranceSec: TimeInterval = 0.08
@@ -589,6 +592,15 @@ final class LiveTranscriptionSession: NSObject, @unchecked Sendable {
         }
     }
 
+    func markLegacyCorrectionAudioConversionGapForTesting() async {
+        await withCheckedContinuation { continuation in
+            captureQueue.async { [weak self] in
+                self?.markLegacyCorrectionAudioConversionGap()
+                continuation.resume()
+            }
+        }
+    }
+
     func triggerModernTaskFailureForTesting(epoch: Int) async {
         await withCheckedContinuation { continuation in
             captureQueue.async { [weak self] in
@@ -769,6 +781,7 @@ final class LiveTranscriptionSession: NSObject, @unchecked Sendable {
     private func resetCorrectionAudioBuffer() {
         correctionAudioBuffer.reset()
         lastCorrectionAudioBoundaryTime = nil
+        legacyCorrectionAudioHasConversionGap = false
     }
 
     private func resetRecognitionEpoch() {
@@ -780,6 +793,9 @@ final class LiveTranscriptionSession: NSObject, @unchecked Sendable {
     }
 
     private func setRecognitionBackend(_ backend: RecognitionBackend) {
+        if recognitionBackend != backend {
+            legacyCorrectionAudioHasConversionGap = false
+        }
         recognitionBackend = backend
         transcriptDeliveryLock.lock()
         deliveryRecognitionBackend = backend
@@ -1357,10 +1373,12 @@ final class LiveTranscriptionSession: NSObject, @unchecked Sendable {
         // Fall back to direct append if conversion fails.
         if let pcmBuffer = pcmBuffer(from: sampleBuffer) {
             append(audioBuffer: pcmBuffer)
-        } else if recognitionBackend == .legacy {
+        } else if recognitionBackend == .legacy, let recognitionRequest {
             // Keep legacy recognition alive without inventing a second normalization path.
-            // No processed 16 kHz buffer means the committed audio attachment stays nil.
-            recognitionRequest?.appendAudioSampleBuffer(sampleBuffer)
+            // The next boundary drops its normalized attachment instead of emitting a
+            // partial WAV around this raw-only conversion gap.
+            markLegacyCorrectionAudioConversionGap()
+            recognitionRequest.appendAudioSampleBuffer(sampleBuffer)
         }
     }
 
@@ -1439,6 +1457,13 @@ final class LiveTranscriptionSession: NSObject, @unchecked Sendable {
     private func finishCorrectionAudio(through absoluteTime: TimeInterval? = nil) -> Data? {
         guard correctionAudioCaptureEnabled else { return nil }
 
+        if recognitionBackend == .legacy, legacyCorrectionAudioHasConversionGap {
+            legacyCorrectionAudioHasConversionGap = false
+            correctionAudioBuffer.reset()
+            lastCorrectionAudioBoundaryTime = absoluteTime?.isFinite == true ? absoluteTime : nil
+            return nil
+        }
+
         if let absoluteTime {
             guard absoluteTime.isFinite,
                   lastCorrectionAudioBoundaryTime.map({ absoluteTime > $0 }) ?? true else {
@@ -1448,6 +1473,11 @@ final class LiveTranscriptionSession: NSObject, @unchecked Sendable {
         }
 
         return correctionAudioBuffer.finish(through: absoluteTime)
+    }
+
+    private func markLegacyCorrectionAudioConversionGap() {
+        guard recognitionBackend == .legacy, correctionAudioCaptureEnabled else { return }
+        legacyCorrectionAudioHasConversionGap = true
     }
 
     private func makeCommittedEmission(

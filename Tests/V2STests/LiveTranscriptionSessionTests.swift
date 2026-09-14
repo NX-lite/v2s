@@ -412,6 +412,74 @@ import Testing
         #expect(pcm16Samples(from: wav) == [24_575, -16_384])
     }
 
+    @Test @MainActor func legacyConversionGapDropsAffectedAudioBoundaryAndStartsFreshWAV() async throws {
+        let session = LiveTranscriptionSession()
+        let recorder = RecognizedSentenceRecorder()
+        session.setTranscriptHandlerForTesting { recorder.record($0) }
+
+        session.setCorrectionAudioCaptureEnabled(true)
+        await session.appendCorrectionAudioBufferForTesting(
+            try makeMono16KBuffer(samples: [0.125, -0.25])
+        )
+        await session.markLegacyCorrectionAudioConversionGapForTesting()
+        await session.appendCorrectionAudioBufferForTesting(
+            try makeMono16KBuffer(samples: [0.5, -0.5])
+        )
+        await session.captureCommittedEmissionForDeferredDeliveryAfterAudioExtractionForTesting(
+            text: "Gap boundary.",
+            through: 0.00025
+        )
+        await session.deliverQueuedCommittedEmissionForTesting()
+
+        #expect(recorder.sentences.map(\.audioWAVData) == [nil])
+        #expect(await session.correctionAudioFrameCountForTesting() == 0)
+
+        await session.appendCorrectionAudioBufferForTesting(
+            try makeMono16KBuffer(samples: [0.75, -0.5])
+        )
+        await session.captureCommittedEmissionForDeferredDeliveryAfterAudioExtractionForTesting(
+            text: "Clean boundary.",
+            through: 0.0005
+        )
+        await session.deliverQueuedCommittedEmissionForTesting()
+
+        let freshWAV = try #require(recorder.sentences.last?.audioWAVData)
+        #expect(pcm16Samples(from: freshWAV) == [24_575, -16_384])
+    }
+
+    @Test @MainActor func disablingOrResettingRecognitionClearsLegacyConversionGap() async throws {
+        let session = LiveTranscriptionSession()
+        let recorder = RecognizedSentenceRecorder()
+        session.setTranscriptHandlerForTesting { recorder.record($0) }
+
+        session.setCorrectionAudioCaptureEnabled(true)
+        await session.markLegacyCorrectionAudioConversionGapForTesting()
+        session.setCorrectionAudioCaptureEnabled(false)
+        session.setCorrectionAudioCaptureEnabled(true)
+        await session.appendCorrectionAudioBufferForTesting(
+            try makeMono16KBuffer(samples: [0.25, -0.25])
+        )
+        await session.captureCommittedEmissionForDeferredDeliveryAfterAudioExtractionForTesting(
+            text: "After disable.",
+            through: 0.000125
+        )
+        await session.deliverQueuedCommittedEmissionForTesting()
+
+        await session.markLegacyCorrectionAudioConversionGapForTesting()
+        await session.resetRecognitionGenerationForTesting()
+        await session.appendCorrectionAudioBufferForTesting(
+            try makeMono16KBuffer(samples: [0.5, -0.5])
+        )
+        await session.captureCommittedEmissionForDeferredDeliveryAfterAudioExtractionForTesting(
+            text: "After reset.",
+            through: 0.000125
+        )
+        await session.deliverQueuedCommittedEmissionForTesting()
+
+        #expect(recorder.sentences.count == 2)
+        #expect(recorder.sentences.allSatisfy { $0.audioWAVData != nil })
+    }
+
     private func disposition(
         code: Int,
         message: String = ""
