@@ -8,11 +8,17 @@ import Speech
 struct RecognizedSentence: Equatable, Sendable {
     let text: String
     let promotionSegmentID: UUID?
+    let audioWAVData: Data?
 
-    init(text: String, promotionSegmentID: UUID? = nil) {
+    init(text: String, promotionSegmentID: UUID? = nil, audioWAVData: Data? = nil) {
         self.text = text
         self.promotionSegmentID = promotionSegmentID
+        self.audioWAVData = audioWAVData
     }
+}
+
+private struct UncheckedSendablePCMBuffer: @unchecked Sendable {
+    let value: AVAudioPCMBuffer
 }
 
 final class LiveTranscriptionSession: NSObject, @unchecked Sendable {
@@ -55,6 +61,13 @@ final class LiveTranscriptionSession: NSObject, @unchecked Sendable {
     private struct CommittedEmission {
         let text: String
         let promotionSegmentID: UUID?
+        let audioWAVData: Data?
+
+        init(text: String, promotionSegmentID: UUID?, audioWAVData: Data? = nil) {
+            self.text = text
+            self.promotionSegmentID = promotionSegmentID
+            self.audioWAVData = audioWAVData
+        }
     }
 
     private struct ApplicationCaptureDescriptor: Sendable {
@@ -152,6 +165,8 @@ final class LiveTranscriptionSession: NSObject, @unchecked Sendable {
     private var audioConverterInputSignature: AudioFormatSignature?
     private var modernAudioConverter: AVAudioConverter?
     private var modernAudioConverterInputSignature: AudioFormatSignature?
+    private var correctionAudioCaptureEnabled = false
+    private var correctionAudioBuffer = SentenceAudioBuffer(sampleRate: 16_000, maximumDuration: 15)
     private var committedSegmentCount = 0
     private let committedBoundaryToleranceSec: TimeInterval = 0.08
     private var committedAudioBoundaryTime: TimeInterval?
@@ -255,25 +270,32 @@ final class LiveTranscriptionSession: NSObject, @unchecked Sendable {
             recentCommittedSentenceHistory.removeAll()
         }
 
-        try await requestRequiredPermissions(for: source)
-        if try await configureModernSpeechRecognizer(localeIdentifier: localeIdentifier) == false {
-            try await runOnCaptureQueue {
-                try self.configureSpeechRecognizer(localeIdentifier: localeIdentifier)
-            }
-        }
+        await resetCorrectionAudioBufferOnCaptureQueue()
 
-        switch source.category {
-        case .microphone:
-            try await runOnCaptureQueue {
-                try self.startMicrophoneCapture(deviceUniqueID: source.detail)
+        do {
+            try await requestRequiredPermissions(for: source)
+            if try await configureModernSpeechRecognizer(localeIdentifier: localeIdentifier) == false {
+                try await runOnCaptureQueue {
+                    try self.configureSpeechRecognizer(localeIdentifier: localeIdentifier)
+                }
             }
-        case .application:
-            let captureDescriptor = try await MainActor.run {
-                try self.makeApplicationCaptureDescriptor(for: source)
+
+            switch source.category {
+            case .microphone:
+                try await runOnCaptureQueue {
+                    try self.startMicrophoneCapture(deviceUniqueID: source.detail)
+                }
+            case .application:
+                let captureDescriptor = try await MainActor.run {
+                    try self.makeApplicationCaptureDescriptor(for: source)
+                }
+                try await runOnCaptureQueue {
+                    try self.startApplicationAudioCapture(descriptor: captureDescriptor)
+                }
             }
-            try await runOnCaptureQueue {
-                try self.startApplicationAudioCapture(descriptor: captureDescriptor)
-            }
+        } catch {
+            await resetCorrectionAudioBufferOnCaptureQueue()
+            throw error
         }
     }
 
@@ -308,7 +330,7 @@ final class LiveTranscriptionSession: NSObject, @unchecked Sendable {
 
         stopModernSpeechRecognizer()
         resetRecognitionFailureState()
-        recognitionGeneration &+= 1
+        resetRecognitionGeneration()
         recognitionRequest?.endAudio()
         recognitionTask?.cancel()
         recognitionTask = nil
@@ -327,6 +349,57 @@ final class LiveTranscriptionSession: NSObject, @unchecked Sendable {
         Task { @MainActor [weak self] in
             self?.recentCommittedSentenceHistory.removeAll()
         }
+    }
+
+    func setCorrectionAudioCaptureEnabled(_ enabled: Bool) {
+        captureQueue.async { [weak self] in
+            guard let self else { return }
+            correctionAudioCaptureEnabled = enabled
+            if enabled == false {
+                correctionAudioBuffer.reset()
+            }
+        }
+    }
+
+    func appendCorrectionAudioBufferForTesting(_ audioBuffer: AVAudioPCMBuffer) async {
+        let sendableAudioBuffer = UncheckedSendablePCMBuffer(value: audioBuffer)
+        await withCheckedContinuation { continuation in
+            captureQueue.async { [weak self] in
+                self?.appendCorrectionAudioBuffer(sendableAudioBuffer.value)
+                continuation.resume()
+            }
+        }
+    }
+
+    func correctionAudioFrameCountForTesting() async -> Int {
+        await withCheckedContinuation { continuation in
+            captureQueue.async { [weak self] in
+                continuation.resume(returning: self?.correctionAudioBuffer.frameCount ?? 0)
+            }
+        }
+    }
+
+    func resetRecognitionGenerationForTesting() async {
+        await withCheckedContinuation { continuation in
+            captureQueue.async { [weak self] in
+                self?.resetRecognitionGeneration()
+                continuation.resume()
+            }
+        }
+    }
+
+    private func resetCorrectionAudioBufferOnCaptureQueue() async {
+        await withCheckedContinuation { continuation in
+            captureQueue.async { [weak self] in
+                self?.correctionAudioBuffer.reset()
+                continuation.resume()
+            }
+        }
+    }
+
+    private func resetRecognitionGeneration() {
+        recognitionGeneration &+= 1
+        correctionAudioBuffer.reset()
     }
 
     private func requestRequiredPermissions(for source: InputSource) async throws {
@@ -838,6 +911,7 @@ final class LiveTranscriptionSession: NSObject, @unchecked Sendable {
 
         let audioLevels = cleanUpSpeechBuffer(processingBuffer)
         boostIfQuiet(buffer: processingBuffer, levels: audioLevels)
+        appendCorrectionAudioBuffer(processingBuffer)
 
         if let vadEngine {
             let vadResult = vadEngine.process(buffer: processingBuffer)
@@ -867,6 +941,16 @@ final class LiveTranscriptionSession: NSObject, @unchecked Sendable {
         // Always forward audio to the recognizer — VAD is used only
         // for silence-commit timing, not to gate the audio stream.
         recognitionRequest.append(recognizerBuffer)
+    }
+
+    private func appendCorrectionAudioBuffer(_ processingBuffer: AVAudioPCMBuffer) {
+        guard correctionAudioCaptureEnabled else { return }
+        correctionAudioBuffer.append(processingBuffer)
+    }
+
+    private func finishCorrectionAudio(through absoluteTime: TimeInterval? = nil) -> Data? {
+        guard correctionAudioCaptureEnabled else { return nil }
+        return correctionAudioBuffer.finish(through: absoluteTime)
     }
 
     private func appendToSpeechAnalyzer(_ processingBuffer: AVAudioPCMBuffer) {
@@ -1129,14 +1213,19 @@ final class LiveTranscriptionSession: NSObject, @unchecked Sendable {
     }
 
     @MainActor
-    private func emitRecognizedText(_ text: String, promotionSegmentID: UUID? = nil) {
+    private func emitRecognizedText(
+        _ text: String,
+        promotionSegmentID: UUID? = nil,
+        audioWAVData: Data? = nil
+    ) {
         let sentenceTexts = splitCommittedEmissionUnits(in: text)
 
         for (index, sentenceText) in sentenceTexts.enumerated() {
             emitRecognizedSentence(
                 RecognizedSentence(
                     text: sentenceText,
-                    promotionSegmentID: index == 0 ? promotionSegmentID : nil
+                    promotionSegmentID: index == 0 ? promotionSegmentID : nil,
+                    audioWAVData: audioWAVData
                 )
             )
         }
@@ -1161,7 +1250,8 @@ final class LiveTranscriptionSession: NSObject, @unchecked Sendable {
                 emitRecognizedSentence(
                     RecognizedSentence(
                         text: preparedSentence,
-                        promotionSegmentID: pendingPromotionID
+                        promotionSegmentID: pendingPromotionID,
+                        audioWAVData: emission.audioWAVData
                     )
                 )
                 rememberCommittedSentence(preparedSentence)
@@ -1633,10 +1723,14 @@ final class LiveTranscriptionSession: NSObject, @unchecked Sendable {
             let committedDraftID = currentDraftId
 
             if sentenceText.isEmpty == false {
+                let audioWAVData = finishCorrectionAudio(
+                    through: segmentEndTime(for: segments[commitEndIndex])
+                )
                 committedEmissions.append(
                     CommittedEmission(
                         text: sentenceText,
-                        promotionSegmentID: committedDraftID
+                        promotionSegmentID: committedDraftID,
+                        audioWAVData: audioWAVData
                     )
                 )
             }
@@ -1705,7 +1799,7 @@ final class LiveTranscriptionSession: NSObject, @unchecked Sendable {
 
         // Bump generation BEFORE creating the new handler so any late callbacks
         // dispatched by the cancelled task are silently ignored.
-        recognitionGeneration &+= 1
+        resetRecognitionGeneration()
 
         let request = makeRecognitionRequest(
             requiresOnDeviceRecognition: recognizer.supportsOnDeviceRecognition
@@ -1857,12 +1951,14 @@ final class LiveTranscriptionSession: NSObject, @unchecked Sendable {
             resetDraftState()
 
             if text.isEmpty == false {
+                let audioWAVData = finishCorrectionAudio()
                 Task {
                     await emitCommittedSequence(
                         [
                             CommittedEmission(
                                 text: text,
-                                promotionSegmentID: committedDraftID
+                                promotionSegmentID: committedDraftID,
+                                audioWAVData: audioWAVData
                             )
                         ],
                         clearDraftAfter: true
@@ -1901,12 +1997,14 @@ final class LiveTranscriptionSession: NSObject, @unchecked Sendable {
             latestModernText = split.remainingRawText
             let committedDraftID = currentDraftId
             resetDraftState()
+            let audioWAVData = finishCorrectionAudio()
             Task {
                 await emitCommittedSequence(
                     [
                         CommittedEmission(
                             text: committedText,
-                            promotionSegmentID: committedDraftID
+                            promotionSegmentID: committedDraftID,
+                            audioWAVData: audioWAVData
                         )
                     ],
                     clearDraftAfter: true
@@ -2236,12 +2334,14 @@ final class LiveTranscriptionSession: NSObject, @unchecked Sendable {
             latestModernText = remainingRawText
             let committedDraftID = currentDraftId
             resetDraftState()
+            let audioWAVData = finishCorrectionAudio()
             Task {
                 await emitCommittedSequence(
                     [
                         CommittedEmission(
                             text: text,
-                            promotionSegmentID: committedDraftID
+                            promotionSegmentID: committedDraftID,
+                            audioWAVData: audioWAVData
                         )
                     ],
                     clearDraftAfter: remainingRawText.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
@@ -2272,12 +2372,16 @@ final class LiveTranscriptionSession: NSObject, @unchecked Sendable {
         committedSegmentCount = segments.count
         resetDraftState()
         if sentenceText.isEmpty == false {
+            let audioWAVData = finishCorrectionAudio(
+                through: segmentEndTime(for: segments[lastIdx])
+            )
             Task {
                 await emitCommittedSequence(
                     [
                         CommittedEmission(
                             text: sentenceText,
-                            promotionSegmentID: committedDraftID
+                            promotionSegmentID: committedDraftID,
+                            audioWAVData: audioWAVData
                         )
                     ],
                     clearDraftAfter: true
