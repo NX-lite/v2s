@@ -205,9 +205,8 @@ final class LiveTranscriptionSession: NSObject, @unchecked Sendable {
     private let committedSequenceDeliveryGate = NSRecursiveLock()
     private let committedDeliveryTestingLock = NSLock()
     private var committedDeliveryPauseForTesting: CommittedDeliveryPauseForTesting?
-    private var deliveryMutationAttemptedForTesting = false
+    private var deliveryMutationAttemptSemaphoreForTesting: DispatchSemaphore?
     private var deliveryMutationWaitingForTesting = false
-    private var deliveryMutationAttemptContinuationForTesting: CheckedContinuation<Void, Never>?
     private var correctionAudioBuffer = SentenceAudioBuffer(sampleRate: 16_000, maximumDuration: 15)
     /// Legacy Speech timestamps can rebase with their segment array. Keep the audio
     /// cursor boundary independent so a replayed/regressed timestamp cannot consume data.
@@ -515,22 +514,15 @@ final class LiveTranscriptionSession: NSObject, @unchecked Sendable {
     func pauseNextCommittedDeliveryAfterAuthorizationForTesting() {
         committedDeliveryTestingLock.lock()
         committedDeliveryPauseForTesting = CommittedDeliveryPauseForTesting()
-        deliveryMutationAttemptedForTesting = false
+        deliveryMutationAttemptSemaphoreForTesting = DispatchSemaphore(value: 0)
         deliveryMutationWaitingForTesting = false
-        deliveryMutationAttemptContinuationForTesting = nil
         committedDeliveryTestingLock.unlock()
     }
 
-    func waitForCommittedDeliveryAuthorizationPauseForTesting() async {
+    func waitForCommittedDeliveryAuthorizationPauseForTesting() async -> Bool {
         let pause = committedDeliveryPauseForTestingSnapshot()
-        guard let pause else { return }
-
-        await withCheckedContinuation { continuation in
-            DispatchQueue.global(qos: .userInitiated).async {
-                pause.authorizationReached.wait()
-                continuation.resume()
-            }
-        }
+        guard let pause else { return false }
+        return await waitForTestingSemaphore(pause.authorizationReached)
     }
 
     func resumeCommittedDeliveryAfterAuthorizationForTesting() {
@@ -541,17 +533,10 @@ final class LiveTranscriptionSession: NSObject, @unchecked Sendable {
         pause?.resumeDelivery.signal()
     }
 
-    func waitForDeliveryMutationAttemptForTesting() async {
-        await withCheckedContinuation { continuation in
-            committedDeliveryTestingLock.lock()
-            if deliveryMutationAttemptedForTesting {
-                committedDeliveryTestingLock.unlock()
-                continuation.resume()
-            } else {
-                deliveryMutationAttemptContinuationForTesting = continuation
-                committedDeliveryTestingLock.unlock()
-            }
-        }
+    func waitForDeliveryMutationAttemptForTesting() async -> Bool {
+        let semaphore = deliveryMutationAttemptSemaphoreForTestingSnapshot()
+        guard let semaphore else { return false }
+        return await waitForTestingSemaphore(semaphore)
     }
 
     func isDeliveryMutationWaitingForTesting() -> Bool {
@@ -564,6 +549,22 @@ final class LiveTranscriptionSession: NSObject, @unchecked Sendable {
         committedDeliveryTestingLock.lock()
         defer { committedDeliveryTestingLock.unlock() }
         return committedDeliveryPauseForTesting
+    }
+
+    private func deliveryMutationAttemptSemaphoreForTestingSnapshot() -> DispatchSemaphore? {
+        committedDeliveryTestingLock.lock()
+        defer { committedDeliveryTestingLock.unlock() }
+        return deliveryMutationAttemptSemaphoreForTesting
+    }
+
+    private func waitForTestingSemaphore(_ semaphore: DispatchSemaphore) async -> Bool {
+        await withCheckedContinuation { continuation in
+            DispatchQueue.global(qos: .userInitiated).async {
+                continuation.resume(
+                    returning: semaphore.wait(timeout: .now() + .seconds(2)) == .success
+                )
+            }
+        }
     }
 
     func beginSpeechAnalyzerRecognitionForTesting() async -> Int {
@@ -584,6 +585,55 @@ final class LiveTranscriptionSession: NSObject, @unchecked Sendable {
             captureQueue.async { [weak self] in
                 self?.beginLegacyRecognitionAfterSpeechAnalyzerFallback()
                 continuation.resume()
+            }
+        }
+    }
+
+    func triggerModernTaskFailureForTesting(epoch: Int) async {
+        await withCheckedContinuation { continuation in
+            captureQueue.async { [weak self] in
+                guard let self, acceptsSpeechAnalyzerFallback(for: epoch) else {
+                    continuation.resume()
+                    return
+                }
+                beginLegacyRecognitionAfterSpeechAnalyzerFallback()
+                continuation.resume()
+            }
+        }
+    }
+
+    func isSpeechAnalyzerRecognitionCurrentForTesting(epoch: Int) async -> Bool {
+        await withCheckedContinuation { continuation in
+            captureQueue.async { [weak self] in
+                continuation.resume(returning: self?.acceptsModernResult(for: epoch) ?? false)
+            }
+        }
+    }
+
+    func scheduleModernVADSilenceTimerForTesting() async -> Int {
+        await withCheckedContinuation { continuation in
+            captureQueue.async { [weak self] in
+                guard let self, recognitionBackend == .speechAnalyzer else {
+                    continuation.resume(returning: -1)
+                    return
+                }
+                let epoch = recognitionEpoch
+                scheduleSilenceCommit(trigger: .vadOffset, afterMs: 60_000)
+                continuation.resume(returning: epoch)
+            }
+        }
+    }
+
+    func triggerModernVADSilenceTimerForTesting(epoch: Int) async -> Bool {
+        await withCheckedContinuation { continuation in
+            captureQueue.async { [weak self] in
+                guard let self,
+                      acceptsSilenceCommitTimer(for: epoch, backend: .speechAnalyzer) else {
+                    continuation.resume(returning: false)
+                    return
+                }
+                forceCommitOnSilence(trigger: .vadOffset)
+                continuation.resume(returning: true)
             }
         }
     }
@@ -627,7 +677,8 @@ final class LiveTranscriptionSession: NSObject, @unchecked Sendable {
     /// Holds an already-tokenized emission for deterministic lifecycle tests. This
     /// models the interval after WAV extraction but before the MainActor delivery task.
     func captureCommittedEmissionForDeferredDeliveryAfterAudioExtractionForTesting(
-        text: String
+        text: String,
+        through absoluteTime: TimeInterval? = nil
     ) async {
         await withCheckedContinuation { continuation in
             captureQueue.async { [weak self] in
@@ -635,7 +686,7 @@ final class LiveTranscriptionSession: NSObject, @unchecked Sendable {
                     continuation.resume()
                     return
                 }
-                let audioWAVData = finishCorrectionAudio()
+                let audioWAVData = finishCorrectionAudio(through: absoluteTime)
                 queuedCommittedEmissionForTesting = makeCommittedEmission(
                     text: text,
                     promotionSegmentID: nil,
@@ -671,6 +722,20 @@ final class LiveTranscriptionSession: NSObject, @unchecked Sendable {
         await withCheckedContinuation { continuation in
             captureQueue.async { [weak self] in
                 self?.resetLegacyTranscriptionState()
+                continuation.resume()
+            }
+        }
+    }
+
+    func rebaseLegacySegmentsForTesting() async {
+        await withCheckedContinuation { continuation in
+            captureQueue.async { [weak self] in
+                guard let self else {
+                    continuation.resume()
+                    return
+                }
+                committedSegmentCount = 1
+                alignCommittedSegmentCount(to: [])
                 continuation.resume()
             }
         }
@@ -729,12 +794,10 @@ final class LiveTranscriptionSession: NSObject, @unchecked Sendable {
 
     private func beginCommittedDeliveryStateMutation() {
         committedDeliveryTestingLock.lock()
-        deliveryMutationAttemptedForTesting = true
         deliveryMutationWaitingForTesting = true
-        let continuation = deliveryMutationAttemptContinuationForTesting
-        deliveryMutationAttemptContinuationForTesting = nil
+        let semaphore = deliveryMutationAttemptSemaphoreForTesting
         committedDeliveryTestingLock.unlock()
-        continuation?.resume()
+        semaphore?.signal()
 
         committedSequenceDeliveryGate.lock()
 
@@ -754,7 +817,7 @@ final class LiveTranscriptionSession: NSObject, @unchecked Sendable {
 
         guard let pause else { return }
         pause.authorizationReached.signal()
-        pause.resumeDelivery.wait()
+        _ = pause.resumeDelivery.wait(timeout: .now() + .seconds(2))
     }
 
     private func requestRequiredPermissions(for source: InputSource) async throws {
@@ -1004,7 +1067,7 @@ final class LiveTranscriptionSession: NSObject, @unchecked Sendable {
                     } catch is CancellationError {
                         return
                     } catch {
-                        self?.fallbackFromSpeechAnalyzer(error)
+                        self?.fallbackFromSpeechAnalyzer(error, epoch: modernEpoch)
                     }
                 }
 
@@ -1014,7 +1077,7 @@ final class LiveTranscriptionSession: NSObject, @unchecked Sendable {
                     } catch is CancellationError {
                         return
                     } catch {
-                        self?.fallbackFromSpeechAnalyzer(error)
+                        self?.fallbackFromSpeechAnalyzer(error, epoch: modernEpoch)
                     }
                 }
                 continuation.resume(returning: true)
@@ -1064,10 +1127,10 @@ final class LiveTranscriptionSession: NSObject, @unchecked Sendable {
         }
     }
 
-    private func fallbackFromSpeechAnalyzer(_ error: Error) {
+    private func fallbackFromSpeechAnalyzer(_ error: Error, epoch: Int) {
         captureQueue.async { [weak self] in
             guard let self,
-                  self.recognitionBackend == .speechAnalyzer,
+                  self.acceptsSpeechAnalyzerFallback(for: epoch),
                   let localeIdentifier = self.activeLocaleIdentifier else {
                 return
             }
@@ -1080,6 +1143,10 @@ final class LiveTranscriptionSession: NSObject, @unchecked Sendable {
                 self.stopRecognitionAndSurface(error)
             }
         }
+    }
+
+    private func acceptsSpeechAnalyzerFallback(for epoch: Int) -> Bool {
+        acceptsModernResult(for: epoch)
     }
 
     /// Builds a recognition request, keeping recognition on device wherever the
@@ -1142,7 +1209,7 @@ final class LiveTranscriptionSession: NSObject, @unchecked Sendable {
 
     private func resetLegacyTranscriptionState() {
         committedSegmentCount = 0
-        committedAudioBoundaryTime = nil
+        self.committedAudioBoundaryTime = nil
         latestSegments = []
         latestFormattedText = ""
     }
@@ -1439,6 +1506,8 @@ final class LiveTranscriptionSession: NSObject, @unchecked Sendable {
 
         // A fallback starts a legacy recognizer whose segment timestamps begin at zero.
         // Discard any modern timeline before the legacy task can receive callbacks.
+        cancelSilenceTimer()
+        cancelVADSilenceTimer()
         invalidateTranscriptDelivery()
         resetRecognitionEpoch()
         stopModernSpeechRecognizer()
@@ -2809,10 +2878,16 @@ final class LiveTranscriptionSession: NSObject, @unchecked Sendable {
 
     private func scheduleSilenceCommit(trigger: SilenceCommitTrigger, afterMs: Int) {
         cancelSilenceCommitTimer(for: trigger)
+        let timerEpoch = recognitionEpoch
+        let timerBackend = recognitionBackend
         let timer = DispatchSource.makeTimerSource(queue: captureQueue)
         timer.schedule(deadline: .now() + .milliseconds(afterMs))
         timer.setEventHandler { [weak self] in
-            self?.forceCommitOnSilence(trigger: trigger)
+            guard let self,
+                  self.acceptsSilenceCommitTimer(for: timerEpoch, backend: timerBackend) else {
+                return
+            }
+            self.forceCommitOnSilence(trigger: trigger)
         }
         timer.resume()
 
@@ -2822,6 +2897,13 @@ final class LiveTranscriptionSession: NSObject, @unchecked Sendable {
         case .vadOffset:
             vadSilenceCommitTimer = timer
         }
+    }
+
+    private func acceptsSilenceCommitTimer(
+        for epoch: Int,
+        backend: RecognitionBackend
+    ) -> Bool {
+        recognitionEpoch == epoch && recognitionBackend == backend
     }
 
     private func cancelSilenceCommitTimer(for trigger: SilenceCommitTrigger) {
@@ -2961,6 +3043,7 @@ final class LiveTranscriptionSession: NSObject, @unchecked Sendable {
     private func alignCommittedSegmentCount(to segments: [SFTranscriptionSegment]) {
         if segments.count < committedSegmentCount {
             resetLegacyTranscriptionState()
+            resetCorrectionAudioBuffer()
             resetDraftState()
             return
         }
@@ -2978,6 +3061,8 @@ final class LiveTranscriptionSession: NSObject, @unchecked Sendable {
         }
 
         committedSegmentCount = alignedCount
+        self.committedAudioBoundaryTime = nil
+        resetCorrectionAudioBuffer()
         resetDraftState()
     }
 

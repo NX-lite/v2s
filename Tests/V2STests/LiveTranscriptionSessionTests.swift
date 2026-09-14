@@ -237,10 +237,10 @@ import Testing
         let delivery = Task {
             await session.deliverQueuedCommittedEmissionForTesting()
         }
-        await session.waitForCommittedDeliveryAuthorizationPauseForTesting()
+        #expect(await session.waitForCommittedDeliveryAuthorizationPauseForTesting())
 
         session.setCorrectionAudioCaptureEnabled(false)
-        await session.waitForDeliveryMutationAttemptForTesting()
+        #expect(await session.waitForDeliveryMutationAttemptForTesting())
         #expect(session.isDeliveryMutationWaitingForTesting())
 
         session.resumeCommittedDeliveryAfterAuthorizationForTesting()
@@ -269,10 +269,10 @@ import Testing
         let delivery = Task {
             await session.deliverQueuedCommittedEmissionForTesting()
         }
-        await session.waitForCommittedDeliveryAuthorizationPauseForTesting()
+        #expect(await session.waitForCommittedDeliveryAuthorizationPauseForTesting())
 
         session.stop()
-        await session.waitForDeliveryMutationAttemptForTesting()
+        #expect(await session.waitForDeliveryMutationAttemptForTesting())
         #expect(session.isDeliveryMutationWaitingForTesting())
 
         session.resumeCommittedDeliveryAfterAuthorizationForTesting()
@@ -340,12 +340,12 @@ import Testing
         let delivery = Task {
             await session.deliverQueuedCommittedEmissionForTesting()
         }
-        await session.waitForCommittedDeliveryAuthorizationPauseForTesting()
+        #expect(await session.waitForCommittedDeliveryAuthorizationPauseForTesting())
 
         let beginSession = Task {
             await session.beginRecognitionSessionForTesting()
         }
-        await session.waitForDeliveryMutationAttemptForTesting()
+        #expect(await session.waitForDeliveryMutationAttemptForTesting())
         #expect(session.isDeliveryMutationWaitingForTesting())
 
         session.resumeCommittedDeliveryAfterAuthorizationForTesting()
@@ -356,6 +356,60 @@ import Testing
         #expect(sentences.map(\.text) == ["First sentence.", "Second sentence."])
         let expectedWAV = try #require(sentences.first?.audioWAVData)
         #expect(sentences.allSatisfy { $0.audioWAVData == expectedWAV })
+    }
+
+    @Test func staleModernTaskFailureCannotFallbackANewerModernSession() async throws {
+        let session = LiveTranscriptionSession()
+        let newSessionBuffer = try makeMono16KBuffer(samples: [0.5, -0.5])
+
+        session.setCorrectionAudioCaptureEnabled(true)
+        let epochA = await session.beginSpeechAnalyzerRecognitionForTesting()
+        await session.beginRecognitionSessionForTesting()
+        let epochB = await session.beginSpeechAnalyzerRecognitionForTesting()
+        await session.appendCorrectionAudioBufferForTesting(newSessionBuffer)
+
+        await session.triggerModernTaskFailureForTesting(epoch: epochA)
+
+        #expect(await session.isSpeechAnalyzerRecognitionCurrentForTesting(epoch: epochB))
+        #expect(await session.correctionAudioFrameCountForTesting() == 2)
+    }
+
+    @Test func staleModernVADTimerCannotCommitAfterLegacyFallback() async throws {
+        let session = LiveTranscriptionSession()
+        let modernEpoch = await session.beginSpeechAnalyzerRecognitionForTesting()
+
+        #expect(await session.scheduleModernVADSilenceTimerForTesting() == modernEpoch)
+        await session.fallbackSpeechAnalyzerToLegacyForTesting()
+        await session.appendCorrectionAudioBufferForTesting(
+            try makeMono16KBuffer(samples: [0.5, -0.5])
+        )
+
+        #expect(await session.triggerModernVADSilenceTimerForTesting(epoch: modernEpoch) == false)
+    }
+
+    @Test @MainActor func legacySegmentRebaseDropsPreRebaseCorrectionAudio() async throws {
+        let session = LiveTranscriptionSession()
+        let recorder = RecognizedSentenceRecorder()
+        session.setTranscriptHandlerForTesting { recorder.record($0) }
+
+        session.setCorrectionAudioCaptureEnabled(true)
+        await session.appendCorrectionAudioBufferForTesting(
+            try makeMono16KBuffer(samples: [0.125, -0.25])
+        )
+        await session.rebaseLegacySegmentsForTesting()
+        #expect(await session.correctionAudioFrameCountForTesting() == 0)
+
+        await session.appendCorrectionAudioBufferForTesting(
+            try makeMono16KBuffer(samples: [0.75, -0.5])
+        )
+        await session.captureCommittedEmissionForDeferredDeliveryAfterAudioExtractionForTesting(
+            text: "Post-rebase only.",
+            through: 0.000125
+        )
+        await session.deliverQueuedCommittedEmissionForTesting()
+
+        let wav = try #require(recorder.sentences.first?.audioWAVData)
+        #expect(pcm16Samples(from: wav) == [24_575, -16_384])
     }
 
     private func disposition(
@@ -391,15 +445,24 @@ import Testing
         }
         return buffer
     }
+
+    private func pcm16Samples(from wav: Data) -> [Int16] {
+        guard wav.count >= 44 else { return [] }
+        return stride(from: 44, to: wav.count - 1, by: 2).map { index in
+            Int16(bitPattern: UInt16(wav[index]) | UInt16(wav[index + 1]) << 8)
+        }
+    }
 }
 
 @MainActor private final class RecognizedSentenceRecorder {
     private(set) var texts: [String] = []
     private(set) var receivedAudio: [Bool] = []
+    private(set) var sentences: [RecognizedSentence] = []
 
     func record(_ sentence: RecognizedSentence) {
         texts.append(sentence.text)
         receivedAudio.append(sentence.audioWAVData != nil)
+        sentences.append(sentence)
     }
 }
 
