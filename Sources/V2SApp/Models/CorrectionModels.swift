@@ -60,6 +60,12 @@ struct CorrectionResult: Equatable, Sendable {
     let mode: CorrectionInputMode
 }
 
+struct CorrectionPrompt: Equatable, Sendable {
+    let instructions: String
+    let userContent: String
+    let mode: CorrectionInputMode
+}
+
 struct TranscriptEntry: Identifiable, Equatable {
     let id: UUID
     let sourceID: String
