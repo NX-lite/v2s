@@ -27,7 +27,7 @@ import Testing
         #expect(buffer.frameCount == 0)
     }
 
-    @Test func capacityKeepsNewestFifteenSeconds() throws {
+    @Test func capacityKeepsNewestTwoSeconds() throws {
         var buffer = SentenceAudioBuffer(sampleRate: 4, maximumDuration: 2)
         buffer.append(samples: [-1, -0.75, -0.5, -0.25, 0, 0.25, 0.5, 0.75, 1, 0.75, 0.5, 0.25])
 
@@ -124,6 +124,167 @@ import Testing
         #expect(wav.littleEndianUInt16(at: 44) == UInt16(bitPattern: Int16.min))
         #expect(wav.littleEndianUInt16(at: 46) == 0)
         #expect(wav.littleEndianUInt16(at: 48) == UInt16(bitPattern: Int16.max))
+    }
+
+    @Test func appendPCMBufferRejectsMismatchedRateAndStereoInput() throws {
+        let mismatchedRateFormat = try #require(AVAudioFormat(
+            commonFormat: .pcmFormatFloat32,
+            sampleRate: 8,
+            channels: 1,
+            interleaved: false
+        ))
+        let mismatchedRateBuffer = try #require(AVAudioPCMBuffer(
+            pcmFormat: mismatchedRateFormat,
+            frameCapacity: 1
+        ))
+        mismatchedRateBuffer.frameLength = 1
+        let mismatchedRateData = try #require(mismatchedRateBuffer.floatChannelData?[0])
+        mismatchedRateData[0] = 1
+
+        let stereoFormat = try #require(AVAudioFormat(
+            commonFormat: .pcmFormatFloat32,
+            sampleRate: 4,
+            channels: 2,
+            interleaved: false
+        ))
+        let stereoBuffer = try #require(AVAudioPCMBuffer(
+            pcmFormat: stereoFormat,
+            frameCapacity: 1
+        ))
+        stereoBuffer.frameLength = 1
+        let stereoData = try #require(stereoBuffer.floatChannelData?[0])
+        stereoData[0] = 1
+
+        var buffer = SentenceAudioBuffer(sampleRate: 4, maximumDuration: 15)
+        buffer.append(mismatchedRateBuffer)
+        buffer.append(stereoBuffer)
+
+        #expect(buffer.frameCount == 0)
+    }
+
+    @Test func appendPCMBufferAcceptsMatchingMonoInterleavedFrames() throws {
+        let format = try #require(AVAudioFormat(
+            commonFormat: .pcmFormatFloat32,
+            sampleRate: 4,
+            channels: 1,
+            interleaved: true
+        ))
+        let pcmBuffer = try #require(AVAudioPCMBuffer(
+            pcmFormat: format,
+            frameCapacity: 3
+        ))
+        pcmBuffer.frameLength = 3
+        let channel = try #require(pcmBuffer.floatChannelData?[0])
+        channel[0] = -1
+        channel[1] = 0
+        channel[2] = 1
+
+        var buffer = SentenceAudioBuffer(sampleRate: 4, maximumDuration: 15)
+        buffer.append(pcmBuffer)
+
+        let finished = buffer.finish()
+        let wav = try #require(finished)
+
+        #expect(wav.littleEndianInt16(at: 44) == .min)
+        #expect(wav.littleEndianInt16(at: 46) == 0)
+        #expect(wav.littleEndianInt16(at: 48) == .max)
+    }
+
+    @Test func appendPCMBufferPreservesInt16EndpointsAndRepresentativeSamples() throws {
+        let format = try #require(AVAudioFormat(
+            commonFormat: .pcmFormatInt16,
+            sampleRate: 4,
+            channels: 1,
+            interleaved: false
+        ))
+        let pcmBuffer = try #require(AVAudioPCMBuffer(
+            pcmFormat: format,
+            frameCapacity: 5
+        ))
+        pcmBuffer.frameLength = 5
+        let channel = try #require(pcmBuffer.int16ChannelData?[0])
+        channel[0] = .min
+        channel[1] = -8_192
+        channel[2] = 0
+        channel[3] = 8_192
+        channel[4] = .max
+
+        var buffer = SentenceAudioBuffer(sampleRate: 4, maximumDuration: 15)
+        buffer.append(pcmBuffer)
+
+        let finished = buffer.finish()
+        let wav = try #require(finished)
+
+        #expect(wav.littleEndianInt16(at: 44) == .min)
+        #expect(wav.littleEndianInt16(at: 46) == -8_192)
+        #expect(wav.littleEndianInt16(at: 48) == 0)
+        #expect(wav.littleEndianInt16(at: 50) == 8_192)
+        #expect(wav.littleEndianInt16(at: 52) == .max)
+    }
+
+    @Test func repeatedSmallFinishesAndEvictionsKeepActiveStorageBounded() throws {
+        var buffer = SentenceAudioBuffer(sampleRate: 4, maximumDuration: 1)
+        let frames: [Float] = [0, 0.25, 0.5, 0.75, 1, -1]
+
+        for cycle in 0..<64 {
+            buffer.append(samples: frames)
+
+            let absoluteTime = Double((cycle + 1) * frames.count - 2) / 4
+            let finished = buffer.finish(through: absoluteTime)
+            let wav = try #require(finished)
+
+            #expect(wav.littleEndianInt16(at: 44) == 16_384)
+            #expect(wav.littleEndianInt16(at: 46) == 24_575)
+            #expect(buffer.frameCount == 2)
+        }
+
+        #expect(buffer.samples.count <= 8)
+
+        let completedTail = buffer.finish()
+        let tail = try #require(completedTail)
+
+        #expect(tail.littleEndianInt16(at: 44) == .max)
+        #expect(tail.littleEndianInt16(at: 46) == .min)
+    }
+
+    @Test func invalidConfigurationDropsFramesWithoutEncoding() throws {
+        let configurations: [(Int, TimeInterval)] = [
+            (0, 1),
+            (-1, 1),
+            (4, -1),
+            (4, .infinity),
+            (4, .nan),
+            (Int(UInt32.max / 2) + 1, 1),
+        ]
+
+        for (sampleRate, maximumDuration) in configurations {
+            var buffer = SentenceAudioBuffer(
+                sampleRate: sampleRate,
+                maximumDuration: maximumDuration
+            )
+            buffer.append(samples: [0])
+
+            try #require(buffer.frameCount == 0)
+            let finished = buffer.finish()
+            #expect(finished == nil)
+        }
+    }
+
+    @Test func backwardAndNonfiniteFinishTimesKeepRemainingFrames() throws {
+        var buffer = SentenceAudioBuffer(sampleRate: 4, maximumDuration: 15)
+        buffer.append(samples: [0, 0.25, 0.5, 0.75])
+
+        let initial = buffer.finish(through: 0.5)
+        _ = try #require(initial)
+
+        let backward = buffer.finish(through: 0.25)
+        let notANumber = buffer.finish(through: .nan)
+        let infinity = buffer.finish(through: .infinity)
+
+        #expect(backward == nil)
+        #expect(notANumber == nil)
+        #expect(infinity == nil)
+        #expect(buffer.frameCount == 2)
     }
 }
 
