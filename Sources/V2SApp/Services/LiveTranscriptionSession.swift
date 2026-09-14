@@ -62,12 +62,31 @@ final class LiveTranscriptionSession: NSObject, @unchecked Sendable {
         let text: String
         let promotionSegmentID: UUID?
         let audioWAVData: Data?
+        let deliveryToken: CommittedEmissionDeliveryToken
 
-        init(text: String, promotionSegmentID: UUID?, audioWAVData: Data? = nil) {
+        init(
+            text: String,
+            promotionSegmentID: UUID?,
+            audioWAVData: Data? = nil,
+            deliveryToken: CommittedEmissionDeliveryToken
+        ) {
             self.text = text
             self.promotionSegmentID = promotionSegmentID
             self.audioWAVData = audioWAVData
+            self.deliveryToken = deliveryToken
         }
+    }
+
+    private struct CommittedEmissionDeliveryToken: Sendable {
+        let sessionEpoch: Int
+        let audioCaptureEpoch: Int?
+        let modernRecognitionEpoch: Int?
+    }
+
+    private enum CommittedEmissionDeliveryPermission: Equatable {
+        case suppress
+        case textOnly
+        case textAndAudio
     }
 
     private struct ApplicationCaptureDescriptor: Sendable {
@@ -144,9 +163,11 @@ final class LiveTranscriptionSession: NSObject, @unchecked Sendable {
     private var speechRecognizer: SFSpeechRecognizer?
     private var recognitionRequest: SFSpeechAudioBufferRecognitionRequest?
     private var recognitionTask: SFSpeechRecognitionTask?
-    /// Incremented on every restart. Handlers capture their generation at creation time
-    /// and discard callbacks that arrive after a newer generation has started.
-    private var recognitionGeneration: Int = 0
+    /// Advances whenever a recognizer/backend receives a fresh audio timeline. Both
+    /// legacy handlers and modern result tasks capture this epoch before dispatching.
+    private var recognitionEpoch: Int = 0
+    /// Invalidates all queued transcript deliveries when a session is torn down.
+    private var transcriptDeliveryEpoch: Int = 0
     /// Consecutive recognition-task failures since the last delivered result. Restarting
     /// immediately recovers from a one-off fault, but a persistent one — an evicted
     /// on-device asset, an unreachable backend — would otherwise spin the task in a hot
@@ -166,7 +187,16 @@ final class LiveTranscriptionSession: NSObject, @unchecked Sendable {
     private var modernAudioConverter: AVAudioConverter?
     private var modernAudioConverterInputSignature: AudioFormatSignature?
     private var correctionAudioCaptureEnabled = false
+    /// Invalidates copied WAV payloads on every capture opt-in transition.
+    private var correctionAudioCaptureEpoch: Int = 0
+    /// Serializes the final delivery decision with stop/opt-out so a copied WAV cannot
+    /// cross the MainActor boundary after either action has taken effect.
+    private let transcriptDeliveryLock = NSLock()
     private var correctionAudioBuffer = SentenceAudioBuffer(sampleRate: 16_000, maximumDuration: 15)
+    /// Legacy Speech timestamps can rebase with their segment array. Keep the audio
+    /// cursor boundary independent so a replayed/regressed timestamp cannot consume data.
+    private var lastCorrectionAudioBoundaryTime: TimeInterval?
+    private var queuedCommittedEmissionForTesting: CommittedEmission?
     private var committedSegmentCount = 0
     private let committedBoundaryToleranceSec: TimeInterval = 0.08
     private var committedAudioBoundaryTime: TimeInterval?
@@ -270,7 +300,7 @@ final class LiveTranscriptionSession: NSObject, @unchecked Sendable {
             recentCommittedSentenceHistory.removeAll()
         }
 
-        await resetCorrectionAudioBufferOnCaptureQueue()
+        await beginRecognitionSessionOnCaptureQueue()
 
         do {
             try await requestRequiredPermissions(for: source)
@@ -330,7 +360,8 @@ final class LiveTranscriptionSession: NSObject, @unchecked Sendable {
 
         stopModernSpeechRecognizer()
         resetRecognitionFailureState()
-        resetRecognitionGeneration()
+        invalidateTranscriptDelivery()
+        resetRecognitionEpoch()
         recognitionRequest?.endAudio()
         recognitionTask?.cancel()
         recognitionTask = nil
@@ -354,11 +385,21 @@ final class LiveTranscriptionSession: NSObject, @unchecked Sendable {
     func setCorrectionAudioCaptureEnabled(_ enabled: Bool) {
         captureQueue.async { [weak self] in
             guard let self else { return }
+            transcriptDeliveryLock.lock()
+            correctionAudioCaptureEpoch &+= 1
             correctionAudioCaptureEnabled = enabled
+            transcriptDeliveryLock.unlock()
             if enabled == false {
-                correctionAudioBuffer.reset()
+                resetCorrectionAudioBuffer()
             }
         }
+    }
+
+    @MainActor
+    func setTranscriptHandlerForTesting(
+        _ handler: @escaping @MainActor (RecognizedSentence) -> Void
+    ) {
+        transcriptHandler = handler
     }
 
     func appendCorrectionAudioBufferForTesting(_ audioBuffer: AVAudioPCMBuffer) async {
@@ -382,7 +423,95 @@ final class LiveTranscriptionSession: NSObject, @unchecked Sendable {
     func resetRecognitionGenerationForTesting() async {
         await withCheckedContinuation { continuation in
             captureQueue.async { [weak self] in
-                self?.resetRecognitionGeneration()
+                self?.resetRecognitionEpoch()
+                continuation.resume()
+            }
+        }
+    }
+
+    func beginSpeechAnalyzerRecognitionForTesting() async -> Int {
+        await withCheckedContinuation { continuation in
+            captureQueue.async { [weak self] in
+                guard let self else {
+                    continuation.resume(returning: -1)
+                    return
+                }
+                recognitionBackend = .speechAnalyzer
+                continuation.resume(returning: recognitionEpoch)
+            }
+        }
+    }
+
+    func fallbackSpeechAnalyzerToLegacyForTesting() async {
+        await withCheckedContinuation { continuation in
+            captureQueue.async { [weak self] in
+                self?.beginLegacyRecognitionAfterSpeechAnalyzerFallback()
+                continuation.resume()
+            }
+        }
+    }
+
+    func enqueueModernCommittedEmissionForTesting(text: String, epoch: Int) async -> Bool {
+        await withCheckedContinuation { continuation in
+            captureQueue.async { [weak self] in
+                guard let self, acceptsModernResult(for: epoch) else {
+                    continuation.resume(returning: false)
+                    return
+                }
+                let audioWAVData = finishCorrectionAudio()
+                queuedCommittedEmissionForTesting = makeCommittedEmission(
+                    text: text,
+                    promotionSegmentID: nil,
+                    audioWAVData: audioWAVData,
+                    modernRecognitionEpoch: epoch
+                )
+                continuation.resume(returning: true)
+            }
+        }
+    }
+
+    func queueCommittedEmissionForTesting(text: String) async {
+        await withCheckedContinuation { continuation in
+            captureQueue.async { [weak self] in
+                guard let self else {
+                    continuation.resume()
+                    return
+                }
+                queuedCommittedEmissionForTesting = makeCommittedEmission(
+                    text: text,
+                    promotionSegmentID: nil,
+                    audioWAVData: finishCorrectionAudio()
+                )
+                continuation.resume()
+            }
+        }
+    }
+
+    func deliverQueuedCommittedEmissionForTesting() async {
+        let emission = await withCheckedContinuation { continuation in
+            captureQueue.async { [weak self] in
+                let emission = self?.queuedCommittedEmissionForTesting
+                self?.queuedCommittedEmissionForTesting = nil
+                continuation.resume(returning: emission)
+            }
+        }
+        guard let emission else { return }
+        await emitCommittedSequence([emission])
+    }
+
+    func finishCorrectionAudioThroughForTesting(_ time: TimeInterval) async {
+        await withCheckedContinuation { continuation in
+            captureQueue.async { [weak self] in
+                _ = self?.finishCorrectionAudio(through: time)
+                continuation.resume()
+            }
+        }
+    }
+
+    func resetLegacyTranscriptionStateForTesting() async {
+        await withCheckedContinuation { continuation in
+            captureQueue.async { [weak self] in
+                self?.resetLegacyTranscriptionState()
                 continuation.resume()
             }
         }
@@ -391,15 +520,40 @@ final class LiveTranscriptionSession: NSObject, @unchecked Sendable {
     private func resetCorrectionAudioBufferOnCaptureQueue() async {
         await withCheckedContinuation { continuation in
             captureQueue.async { [weak self] in
-                self?.correctionAudioBuffer.reset()
+                self?.resetCorrectionAudioBuffer()
                 continuation.resume()
             }
         }
     }
 
-    private func resetRecognitionGeneration() {
-        recognitionGeneration &+= 1
+    private func beginRecognitionSessionOnCaptureQueue() async {
+        await withCheckedContinuation { continuation in
+            captureQueue.async { [weak self] in
+                guard let self else {
+                    continuation.resume()
+                    return
+                }
+                invalidateTranscriptDelivery()
+                resetRecognitionEpoch()
+                continuation.resume()
+            }
+        }
+    }
+
+    private func resetCorrectionAudioBuffer() {
         correctionAudioBuffer.reset()
+        lastCorrectionAudioBoundaryTime = nil
+    }
+
+    private func resetRecognitionEpoch() {
+        recognitionEpoch &+= 1
+        resetCorrectionAudioBuffer()
+    }
+
+    private func invalidateTranscriptDelivery() {
+        transcriptDeliveryLock.lock()
+        transcriptDeliveryEpoch &+= 1
+        transcriptDeliveryLock.unlock()
     }
 
     private func requestRequiredPermissions(for source: InputSource) async throws {
@@ -551,12 +705,15 @@ final class LiveTranscriptionSession: NSObject, @unchecked Sendable {
             self.analyzerInputContinuationState = continuation
         }
 
+        let modernEpoch = recognitionEpoch
+        recognitionBackend = .speechAnalyzer
         modernResultsTask?.cancel()
         modernResultsTask = Task { [weak self] in
             do {
                 for try await result in transcriber.results {
                     self?.captureQueue.async { [weak self] in
-                        self?.processModernRecognitionResult(result)
+                        guard let self, self.acceptsModernResult(for: modernEpoch) else { return }
+                        self.processModernRecognitionResult(result, epoch: modernEpoch)
                     }
                 }
             } catch is CancellationError {
@@ -580,7 +737,6 @@ final class LiveTranscriptionSession: NSObject, @unchecked Sendable {
         speechAnalyzerState = analyzer
         speechTranscriberState = transcriber
         analyzerInputFormat = preferredFormat
-        recognitionBackend = .speechAnalyzer
         recognitionRequest = nil
         recognitionTask = nil
         speechRecognizer = nil
@@ -653,7 +809,7 @@ final class LiveTranscriptionSession: NSObject, @unchecked Sendable {
                 return
             }
 
-            self.stopModernSpeechRecognizer()
+            self.beginLegacyRecognitionAfterSpeechAnalyzerFallback()
 
             do {
                 try self.configureSpeechRecognizer(localeIdentifier: localeIdentifier)
@@ -872,6 +1028,8 @@ final class LiveTranscriptionSession: NSObject, @unchecked Sendable {
         if let pcmBuffer = pcmBuffer(from: sampleBuffer) {
             append(audioBuffer: pcmBuffer)
         } else if recognitionBackend == .legacy {
+            // Keep legacy recognition alive without inventing a second normalization path.
+            // No processed 16 kHz buffer means the committed audio attachment stays nil.
             recognitionRequest?.appendAudioSampleBuffer(sampleBuffer)
         }
     }
@@ -950,7 +1108,92 @@ final class LiveTranscriptionSession: NSObject, @unchecked Sendable {
 
     private func finishCorrectionAudio(through absoluteTime: TimeInterval? = nil) -> Data? {
         guard correctionAudioCaptureEnabled else { return nil }
+
+        if let absoluteTime {
+            guard absoluteTime.isFinite,
+                  lastCorrectionAudioBoundaryTime.map({ absoluteTime > $0 }) ?? true else {
+                return nil
+            }
+            lastCorrectionAudioBoundaryTime = absoluteTime
+        }
+
         return correctionAudioBuffer.finish(through: absoluteTime)
+    }
+
+    private func makeCommittedEmission(
+        text: String,
+        promotionSegmentID: UUID?,
+        audioWAVData: Data?,
+        modernRecognitionEpoch: Int? = nil
+    ) -> CommittedEmission {
+        transcriptDeliveryLock.lock()
+        let deliveryToken = CommittedEmissionDeliveryToken(
+            sessionEpoch: transcriptDeliveryEpoch,
+            audioCaptureEpoch: audioWAVData == nil ? nil : correctionAudioCaptureEpoch,
+            modernRecognitionEpoch: modernRecognitionEpoch
+        )
+        transcriptDeliveryLock.unlock()
+
+        return CommittedEmission(
+            text: text,
+            promotionSegmentID: promotionSegmentID,
+            audioWAVData: audioWAVData,
+            deliveryToken: deliveryToken
+        )
+    }
+
+    private func committedEmissionDeliveryPermission(
+        for token: CommittedEmissionDeliveryToken
+    ) async -> CommittedEmissionDeliveryPermission {
+        await withCheckedContinuation { continuation in
+            captureQueue.async { [weak self] in
+                guard let self else {
+                    continuation.resume(returning: .suppress)
+                    return
+                }
+
+                transcriptDeliveryLock.lock()
+                let deliveryMatches = transcriptDeliveryEpoch == token.sessionEpoch
+                let audioMatches: Bool
+                if let audioCaptureEpoch = token.audioCaptureEpoch {
+                    audioMatches = correctionAudioCaptureEnabled
+                        && correctionAudioCaptureEpoch == audioCaptureEpoch
+                } else {
+                    audioMatches = true
+                }
+                transcriptDeliveryLock.unlock()
+
+                guard deliveryMatches else {
+                    continuation.resume(returning: .suppress)
+                    return
+                }
+
+                if let modernRecognitionEpoch = token.modernRecognitionEpoch,
+                   acceptsModernResult(for: modernRecognitionEpoch) == false {
+                    continuation.resume(returning: .suppress)
+                    return
+                }
+
+                if audioMatches == false {
+                    continuation.resume(returning: .textOnly)
+                    return
+                }
+
+                continuation.resume(returning: .textAndAudio)
+            }
+        }
+    }
+
+    private func acceptsModernResult(for epoch: Int) -> Bool {
+        recognitionEpoch == epoch && recognitionBackend == .speechAnalyzer
+    }
+
+    private func beginLegacyRecognitionAfterSpeechAnalyzerFallback() {
+        // A fallback starts a legacy recognizer whose segment timestamps begin at zero.
+        // Discard any modern timeline before the legacy task can receive callbacks.
+        invalidateTranscriptDelivery()
+        resetRecognitionEpoch()
+        stopModernSpeechRecognizer()
     }
 
     private func appendToSpeechAnalyzer(_ processingBuffer: AVAudioPCMBuffer) {
@@ -1213,6 +1456,37 @@ final class LiveTranscriptionSession: NSObject, @unchecked Sendable {
     }
 
     @MainActor
+    private func emitCommittedSentence(
+        text: String,
+        promotionSegmentID: UUID?,
+        emission: CommittedEmission
+    ) {
+        transcriptDeliveryLock.lock()
+        defer { transcriptDeliveryLock.unlock() }
+
+        guard transcriptDeliveryEpoch == emission.deliveryToken.sessionEpoch else {
+            return
+        }
+
+        let audioWAVData: Data?
+        if let audioCaptureEpoch = emission.deliveryToken.audioCaptureEpoch,
+           correctionAudioCaptureEnabled,
+           correctionAudioCaptureEpoch == audioCaptureEpoch {
+            audioWAVData = emission.audioWAVData
+        } else {
+            audioWAVData = nil
+        }
+
+        transcriptHandler?(
+            RecognizedSentence(
+                text: text,
+                promotionSegmentID: promotionSegmentID,
+                audioWAVData: audioWAVData
+            )
+        )
+    }
+
+    @MainActor
     private func emitRecognizedText(
         _ text: String,
         promotionSegmentID: UUID? = nil,
@@ -1235,10 +1509,14 @@ final class LiveTranscriptionSession: NSObject, @unchecked Sendable {
     private func emitCommittedSequence(
         _ emissions: [CommittedEmission],
         clearDraftAfter: Bool = false
-    ) {
+    ) async {
         pruneRecentCommittedSentenceHistory()
 
         for emission in emissions {
+            let deliveryPermission = await committedEmissionDeliveryPermission(for: emission.deliveryToken)
+            guard deliveryPermission != .suppress else {
+                continue
+            }
             let sentenceTexts = splitCommittedEmissionUnits(in: emission.text)
             var pendingPromotionID = emission.promotionSegmentID
 
@@ -1247,12 +1525,10 @@ final class LiveTranscriptionSession: NSObject, @unchecked Sendable {
                     continue
                 }
 
-                emitRecognizedSentence(
-                    RecognizedSentence(
-                        text: preparedSentence,
-                        promotionSegmentID: pendingPromotionID,
-                        audioWAVData: emission.audioWAVData
-                    )
+                emitCommittedSentence(
+                    text: preparedSentence,
+                    promotionSegmentID: pendingPromotionID,
+                    emission: emission
                 )
                 rememberCommittedSentence(preparedSentence)
                 pendingPromotionID = nil
@@ -1727,7 +2003,7 @@ final class LiveTranscriptionSession: NSObject, @unchecked Sendable {
                     through: segmentEndTime(for: segments[commitEndIndex])
                 )
                 committedEmissions.append(
-                    CommittedEmission(
+                    makeCommittedEmission(
                         text: sentenceText,
                         promotionSegmentID: committedDraftID,
                         audioWAVData: audioWAVData
@@ -1797,9 +2073,9 @@ final class LiveTranscriptionSession: NSObject, @unchecked Sendable {
         cancelVADSilenceTimer()
         vadEngine?.reset()
 
-        // Bump generation BEFORE creating the new handler so any late callbacks
+        // Bump the epoch BEFORE creating the new handler so any late callbacks
         // dispatched by the cancelled task are silently ignored.
-        resetRecognitionGeneration()
+        resetRecognitionEpoch()
 
         let request = makeRecognitionRequest(
             requiresOnDeviceRecognition: recognizer.supportsOnDeviceRecognition
@@ -1886,10 +2162,10 @@ final class LiveTranscriptionSession: NSObject, @unchecked Sendable {
     /// `handleRecognitionFailure`. Fatal configuration errors (permission denied,
     /// unsupported locale) propagate to the UI so the user knows why things stopped.
     private func makeRecognitionHandler() -> (SFSpeechRecognitionResult?, Error?) -> Void {
-        // Capture the generation at handler-creation time. Any callback arriving
-        // after a restart (which bumps recognitionGeneration) will be discarded,
+        // Capture the epoch at handler-creation time. Any callback arriving
+        // after a restart (which advances recognitionEpoch) will be discarded,
         // preventing stale isFinal results from replaying committed sentences.
-        let generation = recognitionGeneration
+        let epoch = recognitionEpoch
         return { [weak self] result, error in
             if let error {
                 let nsError = error as NSError
@@ -1904,7 +2180,7 @@ final class LiveTranscriptionSession: NSObject, @unchecked Sendable {
 
                 self?.captureQueue.async { [weak self] in
                     guard let self, self.speechRecognizer != nil,
-                          self.recognitionGeneration == generation else { return }
+                          self.recognitionEpoch == epoch else { return }
 
                     switch disposition {
                     case .ignore:
@@ -1925,14 +2201,15 @@ final class LiveTranscriptionSession: NSObject, @unchecked Sendable {
 
             guard let result else { return }
             self?.captureQueue.async { [weak self] in
-                guard let self, self.recognitionGeneration == generation else { return }
+                guard let self, self.recognitionEpoch == epoch else { return }
                 self.processRecognitionResult(result)
             }
         }
     }
 
     @available(macOS 26.0, *)
-    private func processModernRecognitionResult(_ result: SpeechTranscriber.Result) {
+    private func processModernRecognitionResult(_ result: SpeechTranscriber.Result, epoch: Int) {
+        guard acceptsModernResult(for: epoch) else { return }
         let now = Date()
         lastRecognitionResultTime = now
         let fullText = normalizedTranscriberText(result.text)
@@ -1955,10 +2232,11 @@ final class LiveTranscriptionSession: NSObject, @unchecked Sendable {
                 Task {
                     await emitCommittedSequence(
                         [
-                            CommittedEmission(
+                            makeCommittedEmission(
                                 text: text,
                                 promotionSegmentID: committedDraftID,
-                                audioWAVData: audioWAVData
+                                audioWAVData: audioWAVData,
+                                modernRecognitionEpoch: epoch
                             )
                         ],
                         clearDraftAfter: true
@@ -2001,10 +2279,11 @@ final class LiveTranscriptionSession: NSObject, @unchecked Sendable {
             Task {
                 await emitCommittedSequence(
                     [
-                        CommittedEmission(
+                        makeCommittedEmission(
                             text: committedText,
                             promotionSegmentID: committedDraftID,
-                            audioWAVData: audioWAVData
+                            audioWAVData: audioWAVData,
+                            modernRecognitionEpoch: epoch
                         )
                     ],
                     clearDraftAfter: true
@@ -2338,10 +2617,11 @@ final class LiveTranscriptionSession: NSObject, @unchecked Sendable {
             Task {
                 await emitCommittedSequence(
                     [
-                        CommittedEmission(
+                        makeCommittedEmission(
                             text: text,
                             promotionSegmentID: committedDraftID,
-                            audioWAVData: audioWAVData
+                            audioWAVData: audioWAVData,
+                            modernRecognitionEpoch: recognitionEpoch
                         )
                     ],
                     clearDraftAfter: remainingRawText.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
@@ -2378,7 +2658,7 @@ final class LiveTranscriptionSession: NSObject, @unchecked Sendable {
             Task {
                 await emitCommittedSequence(
                     [
-                        CommittedEmission(
+                        makeCommittedEmission(
                             text: sentenceText,
                             promotionSegmentID: committedDraftID,
                             audioWAVData: audioWAVData

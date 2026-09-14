@@ -104,6 +104,95 @@ import Testing
         #expect(await session.correctionAudioFrameCountForTesting() == 0)
     }
 
+    @Test @MainActor func staleModernEpochAfterFallbackCannotConsumeLegacyAudioOrEmit() async throws {
+        let session = LiveTranscriptionSession()
+        let recorder = RecognizedSentenceRecorder()
+        session.setTranscriptHandlerForTesting { recorder.record($0) }
+        let oldBuffer = try makeMono16KBuffer(samples: [0.25, -0.25, 0.5])
+        let legacyBuffer = try makeMono16KBuffer(samples: [0.5, -0.5])
+
+        session.setCorrectionAudioCaptureEnabled(true)
+        let modernEpoch = await session.beginSpeechAnalyzerRecognitionForTesting()
+        await session.appendCorrectionAudioBufferForTesting(oldBuffer)
+        #expect(await session.correctionAudioFrameCountForTesting() == 3)
+        #expect(
+            await session.enqueueModernCommittedEmissionForTesting(
+                text: "Queued modern result.",
+                epoch: modernEpoch
+            )
+        )
+        await session.appendCorrectionAudioBufferForTesting(oldBuffer)
+        #expect(await session.correctionAudioFrameCountForTesting() == 3)
+
+        await session.fallbackSpeechAnalyzerToLegacyForTesting()
+        #expect(await session.correctionAudioFrameCountForTesting() == 0)
+
+        await session.appendCorrectionAudioBufferForTesting(legacyBuffer)
+        #expect(await session.correctionAudioFrameCountForTesting() == 2)
+        #expect(
+            await session.enqueueModernCommittedEmissionForTesting(
+                text: "Stale modern result.",
+                epoch: modernEpoch
+            ) == false
+        )
+        #expect(await session.correctionAudioFrameCountForTesting() == 2)
+        await session.deliverQueuedCommittedEmissionForTesting()
+        #expect(recorder.texts.isEmpty)
+    }
+
+    @Test @MainActor func disablingCaptureStripsAudioFromQueuedEmissionButRetainsText() async throws {
+        let session = LiveTranscriptionSession()
+        let recorder = RecognizedSentenceRecorder()
+        session.setTranscriptHandlerForTesting { recorder.record($0) }
+        let buffer = try makeMono16KBuffer(samples: [0.25, -0.25, 0.5])
+
+        session.setCorrectionAudioCaptureEnabled(true)
+        await session.appendCorrectionAudioBufferForTesting(buffer)
+        await session.queueCommittedEmissionForTesting(text: "Keep text after opt-out.")
+
+        session.setCorrectionAudioCaptureEnabled(false)
+        await session.deliverQueuedCommittedEmissionForTesting()
+
+        #expect(recorder.texts == ["Keep text after opt-out."])
+        #expect(recorder.receivedAudio == [false])
+    }
+
+    @Test @MainActor func stoppingSuppressesQueuedEmissionWithCapturedAudio() async throws {
+        let session = LiveTranscriptionSession()
+        let recorder = RecognizedSentenceRecorder()
+        session.setTranscriptHandlerForTesting { recorder.record($0) }
+        let buffer = try makeMono16KBuffer(samples: [0.25, -0.25, 0.5])
+
+        session.setCorrectionAudioCaptureEnabled(true)
+        await session.appendCorrectionAudioBufferForTesting(buffer)
+        await session.queueCommittedEmissionForTesting(text: "Do not deliver after stop.")
+
+        await session.stopAndWait()
+        await session.deliverQueuedCommittedEmissionForTesting()
+
+        #expect(recorder.texts.isEmpty)
+        #expect(recorder.receivedAudio.isEmpty)
+    }
+
+    @Test func regressedLegacyAudioBoundaryDoesNotConsumeLaterFrames() async throws {
+        let session = LiveTranscriptionSession()
+        let firstBuffer = try makeMono16KBuffer(samples: Array(repeating: 0.25, count: 8))
+        let laterBuffer = try makeMono16KBuffer(samples: Array(repeating: 0.5, count: 4))
+
+        session.setCorrectionAudioCaptureEnabled(true)
+        await session.appendCorrectionAudioBufferForTesting(firstBuffer)
+        await session.finishCorrectionAudioThroughForTesting(0.00025)
+        #expect(await session.correctionAudioFrameCountForTesting() == 4)
+
+        await session.resetLegacyTranscriptionStateForTesting()
+        await session.finishCorrectionAudioThroughForTesting(0.000125)
+        #expect(await session.correctionAudioFrameCountForTesting() == 4)
+
+        await session.appendCorrectionAudioBufferForTesting(laterBuffer)
+        await session.finishCorrectionAudioThroughForTesting(0.0005)
+        #expect(await session.correctionAudioFrameCountForTesting() == 4)
+    }
+
     private func disposition(
         code: Int,
         message: String = ""
@@ -136,5 +225,15 @@ import Testing
             channel[index] = sample
         }
         return buffer
+    }
+}
+
+@MainActor private final class RecognizedSentenceRecorder {
+    private(set) var texts: [String] = []
+    private(set) var receivedAudio: [Bool] = []
+
+    func record(_ sentence: RecognizedSentence) {
+        texts.append(sentence.text)
+        receivedAudio.append(sentence.audioWAVData != nil)
     }
 }
