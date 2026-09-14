@@ -1,5 +1,65 @@
 import Foundation
 
+enum CorrectionInputMode: Equatable, Sendable {
+    case audio
+    case textOnly
+}
+
+enum CorrectionStatus: Equatable, Sendable {
+    case disabled
+    case ready
+    case audio
+    case textOnly
+    case warning(String)
+}
+
+enum CorrectionModelFetchState: Equatable, Sendable {
+    case idle
+    case fetching
+    case fetched([String])
+    case failed(String?)
+}
+
+enum CorrectionAPITestState: Equatable, Sendable {
+    case idle
+    case testing
+    case passed(String)
+    case failed(String?)
+}
+
+struct CorrectionContextEntry: Equatable, Sendable {
+    let captionID: UUID
+    let capturedAt: Date
+    let sourceID: String
+    let sourceName: String
+    let sourceLanguageID: String
+    let targetLanguageID: String
+    let original: String
+    let translation: String
+}
+
+struct CorrectionJob: Equatable, Sendable {
+    let captionID: UUID
+    let sessionGeneration: Int
+    let capturedAt: Date
+    let sourceID: String
+    let sourceName: String
+    let sourceLanguageID: String
+    let targetLanguageID: String
+    let localOriginal: String
+    let localTranslation: String
+    let audioWAVData: Data?
+}
+
+struct CorrectionResult: Equatable, Sendable {
+    let captionID: UUID
+    let sessionGeneration: Int
+    let sourceID: String
+    let correctedOriginal: String?
+    let correctedTranslation: String
+    let mode: CorrectionInputMode
+}
+
 struct TranscriptEntry: Identifiable, Equatable {
     let id: UUID
     let sourceID: String

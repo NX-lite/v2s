@@ -60,8 +60,7 @@ struct AssistantPromptBuilder {
         """
         - time: \(timestamp(entry.timestamp))
           source name: \(displayText(entry.sourceName))
-          source language ID: \(displayText(entry.sourceLanguageID))
-          target language ID: \(displayText(entry.targetLanguageID))
+          languages: \(displayText(entry.sourceLanguageName)) (\(displayText(entry.sourceLanguageID))) -> \(displayText(entry.targetLanguageName)) (\(displayText(entry.targetLanguageID)))
           original: \(displayText(entry.sourceText))
           translation: \(displayText(entry.translatedText))
         """

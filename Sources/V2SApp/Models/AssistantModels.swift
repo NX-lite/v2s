@@ -45,7 +45,9 @@ struct AssistantTranscriptEntry: Equatable, Sendable {
     let timestamp: Date
     let sourceName: String
     let sourceLanguageID: String
+    let sourceLanguageName: String
     let targetLanguageID: String
+    let targetLanguageName: String
     let sourceText: String
     let translatedText: String
 
@@ -53,14 +55,18 @@ struct AssistantTranscriptEntry: Equatable, Sendable {
         timestamp: Date,
         sourceName: String,
         sourceLanguageID: String,
+        sourceLanguageName: String,
         targetLanguageID: String,
+        targetLanguageName: String,
         sourceText: String,
         translatedText: String
     ) {
         self.timestamp = timestamp
         self.sourceName = sourceName
         self.sourceLanguageID = sourceLanguageID
+        self.sourceLanguageName = sourceLanguageName
         self.targetLanguageID = targetLanguageID
+        self.targetLanguageName = targetLanguageName
         self.sourceText = sourceText
         self.translatedText = translatedText
     }
@@ -70,7 +76,9 @@ struct AssistantTranscriptEntry: Equatable, Sendable {
             timestamp: timestamp,
             sourceName: "Unknown Source",
             sourceLanguageID: "unknown",
+            sourceLanguageName: "Unknown Language",
             targetLanguageID: "unknown",
+            targetLanguageName: "Unknown Language",
             sourceText: sourceText,
             translatedText: translatedText
         )

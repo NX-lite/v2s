@@ -2177,7 +2177,9 @@ final class AppModel: ObservableObject {
                     timestamp: $0.timestamp,
                     sourceName: $0.sourceName,
                     sourceLanguageID: $0.sourceLanguageID,
+                    sourceLanguageName: languageName(for: $0.sourceLanguageID),
                     targetLanguageID: $0.targetLanguageID,
+                    targetLanguageName: languageName(for: $0.targetLanguageID),
                     sourceText: $0.sourceText,
                     translatedText: $0.translatedText
                 )

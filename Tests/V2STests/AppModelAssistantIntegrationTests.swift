@@ -4,6 +4,76 @@ import Testing
 
 @MainActor
 @Suite struct AppModelAssistantIntegrationTests {
+    @Test func correctionInputAndStatusStatesAreEquatable() {
+        #expect(CorrectionInputMode.audio == .audio)
+        #expect(CorrectionInputMode.textOnly == .textOnly)
+        #expect(CorrectionStatus.disabled == .disabled)
+        #expect(CorrectionStatus.ready == .ready)
+        #expect(CorrectionStatus.audio == .audio)
+        #expect(CorrectionStatus.textOnly == .textOnly)
+        #expect(CorrectionStatus.warning("Audio unavailable") == .warning("Audio unavailable"))
+    }
+
+    @Test func correctionModelFetchStatesAreEquatable() {
+        #expect(CorrectionModelFetchState.idle == .idle)
+        #expect(CorrectionModelFetchState.fetching == .fetching)
+        #expect(CorrectionModelFetchState.fetched(["model-a"]) == .fetched(["model-a"]))
+        #expect(CorrectionModelFetchState.failed(nil) == .failed(nil))
+    }
+
+    @Test func correctionAPITestStatesAreEquatable() {
+        #expect(CorrectionAPITestState.idle == .idle)
+        #expect(CorrectionAPITestState.testing == .testing)
+        #expect(CorrectionAPITestState.passed("Connected") == .passed("Connected"))
+        #expect(CorrectionAPITestState.failed("Unauthorized") == .failed("Unauthorized"))
+    }
+
+    @Test func correctionValueModelsRetainCaptionIdentityAndPayload() {
+        let captionID = UUID(uuidString: "00000000-0000-0000-0000-000000000010")!
+        let capturedAt = Date(timeIntervalSince1970: 10)
+        let context = CorrectionContextEntry(
+            captionID: captionID,
+            capturedAt: capturedAt,
+            sourceID: "mic-1",
+            sourceName: "Desk Mic",
+            sourceLanguageID: "en",
+            targetLanguageID: "zh-Hans",
+            original: "Local source",
+            translation: "本地翻译"
+        )
+        let job = CorrectionJob(
+            captionID: captionID,
+            sessionGeneration: 3,
+            capturedAt: capturedAt,
+            sourceID: "mic-1",
+            sourceName: "Desk Mic",
+            sourceLanguageID: "en",
+            targetLanguageID: "zh-Hans",
+            localOriginal: "Local source",
+            localTranslation: "本地翻译",
+            audioWAVData: Data([0x52, 0x49, 0x46, 0x46])
+        )
+        let result = CorrectionResult(
+            captionID: captionID,
+            sessionGeneration: 3,
+            sourceID: "mic-1",
+            correctedOriginal: "Corrected source",
+            correctedTranslation: "纠正翻译",
+            mode: .audio
+        )
+
+        #expect(context.captionID == captionID)
+        #expect(context.capturedAt == capturedAt)
+        #expect(context.sourceName == "Desk Mic")
+        #expect(context.original == "Local source")
+        #expect(context.translation == "本地翻译")
+        #expect(job.sessionGeneration == 3)
+        #expect(job.audioWAVData == Data([0x52, 0x49, 0x46, 0x46]))
+        #expect(result.correctedOriginal == "Corrected source")
+        #expect(result.correctedTranslation == "纠正翻译")
+        #expect(result.mode == .audio)
+    }
+
     @Test func transcriptEntryPrefersCorrectionsButRetainsLocalValues() {
         var entry = TranscriptEntry(
             id: UUID(),
@@ -101,8 +171,8 @@ import Testing
         #expect(snapshot.outputLanguageID == model.outputLanguageID)
         #expect(snapshot.outputLanguageName == model.languageName(for: model.outputLanguageID))
         #expect(snapshot.entries == [
-            .init(timestamp: first.timestamp, sourceName: "Desk Mic", sourceLanguageID: "en", targetLanguageID: "zh-Hans", sourceText: "First source", translatedText: "First translation"),
-            .init(timestamp: second.timestamp, sourceName: "Remote Mic", sourceLanguageID: "ja", targetLanguageID: "en", sourceText: "Second source", translatedText: "Second translation"),
+            .init(timestamp: first.timestamp, sourceName: "Desk Mic", sourceLanguageID: "en", sourceLanguageName: model.languageName(for: "en"), targetLanguageID: "zh-Hans", targetLanguageName: model.languageName(for: "zh-Hans"), sourceText: "First source", translatedText: "First translation"),
+            .init(timestamp: second.timestamp, sourceName: "Remote Mic", sourceLanguageID: "ja", sourceLanguageName: model.languageName(for: "ja"), targetLanguageID: "en", targetLanguageName: model.languageName(for: "en"), sourceText: "Second source", translatedText: "Second translation"),
         ])
     }
 

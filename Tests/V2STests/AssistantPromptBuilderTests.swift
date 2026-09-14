@@ -16,17 +16,16 @@ import Testing
         #expect(prompt.userContent.contains("""
         - time: 1970-01-01T00:00:01Z
           source name: Desk Mic
-          source language ID: en
-          target language ID: zh-Hans
+          languages: English (en) -> Simplified Chinese (zh-Hans)
           original: First source
           translation: 第一条翻译
         - time: 1970-01-01T00:00:02Z
           source name: Remote Mic
-          source language ID: ja
-          target language ID: en
+          languages: Japanese (ja) -> English (en)
           original: Second source
           translation: Second translation
         """))
+        #expect(!prompt.userContent.contains("languages: French (fr) -> German (de)"))
     }
 
     @Test func askPromptIsDeterministicAndIncludesAllContext() throws {
@@ -39,8 +38,8 @@ import Testing
             outputLanguageID: "zh-Hans",
             outputLanguageName: "Simplified Chinese",
             entries: [
-                AssistantTranscriptEntry(timestamp: Date(timeIntervalSince1970: 60), sourceName: "Team Standup", sourceLanguageID: "en", targetLanguageID: "zh-Hans", sourceText: " Hello ", translatedText: " 你好 "),
-                AssistantTranscriptEntry(timestamp: Date(timeIntervalSince1970: 0), sourceName: "Team Standup", sourceLanguageID: "en", targetLanguageID: "zh-Hans", sourceText: "Next step?", translatedText: "下一步？"),
+                AssistantTranscriptEntry(timestamp: Date(timeIntervalSince1970: 60), sourceName: "Team Standup", sourceLanguageID: "en", sourceLanguageName: "English", targetLanguageID: "zh-Hans", targetLanguageName: "Simplified Chinese", sourceText: " Hello ", translatedText: " 你好 "),
+                AssistantTranscriptEntry(timestamp: Date(timeIntervalSince1970: 0), sourceName: "Team Standup", sourceLanguageID: "en", sourceLanguageName: "English", targetLanguageID: "zh-Hans", targetLanguageName: "Simplified Chinese", sourceText: "Next step?", translatedText: "下一步？"),
             ]
         )
         let currentTime = Date(timeIntervalSince1970: 120)
@@ -81,14 +80,12 @@ import Testing
         #expect(transcript == """
         - time: 1970-01-01T00:01:00Z
           source name: Team Standup
-          source language ID: en
-          target language ID: zh-Hans
+          languages: English (en) -> Simplified Chinese (zh-Hans)
           original: Hello
           translation: 你好
         - time: 1970-01-01T00:00:00Z
           source name: Team Standup
-          source language ID: en
-          target language ID: zh-Hans
+          languages: English (en) -> Simplified Chinese (zh-Hans)
           original: Next step?
           translation: 下一步？
         """)
@@ -137,8 +134,8 @@ import Testing
             outputLanguageID: "zh-Hans",
             outputLanguageName: "Simplified Chinese",
             entries: [
-                AssistantTranscriptEntry(timestamp: .distantPast, sourceName: "Silent Source", sourceLanguageID: "en", targetLanguageID: "zh-Hans", sourceText: " ", translatedText: "\n"),
-                AssistantTranscriptEntry(timestamp: .distantFuture, sourceName: "Silent Source", sourceLanguageID: "en", targetLanguageID: "zh-Hans", sourceText: "\t", translatedText: " "),
+                AssistantTranscriptEntry(timestamp: .distantPast, sourceName: "Silent Source", sourceLanguageID: "en", sourceLanguageName: "English", targetLanguageID: "zh-Hans", targetLanguageName: "Simplified Chinese", sourceText: " ", translatedText: "\n"),
+                AssistantTranscriptEntry(timestamp: .distantFuture, sourceName: "Silent Source", sourceLanguageID: "en", sourceLanguageName: "English", targetLanguageID: "zh-Hans", targetLanguageName: "Simplified Chinese", sourceText: "\t", translatedText: " "),
             ]
         )
         let emptyEntriesSnapshot = AssistantTranscriptSnapshot(
@@ -184,7 +181,7 @@ import Testing
             inputLanguageName: "English",
             outputLanguageID: "zh-Hans",
             outputLanguageName: "Simplified Chinese",
-            entries: [AssistantTranscriptEntry(timestamp: Date(timeIntervalSince1970: 0), sourceName: "Team Standup", sourceLanguageID: "en", targetLanguageID: "zh-Hans", sourceText: "Only source", translatedText: " ")]
+            entries: [AssistantTranscriptEntry(timestamp: Date(timeIntervalSince1970: 0), sourceName: "Team Standup", sourceLanguageID: "en", sourceLanguageName: "English", targetLanguageID: "zh-Hans", targetLanguageName: "Simplified Chinese", sourceText: "Only source", translatedText: " ")]
         )
         let builder = AssistantPromptBuilder()
         let detected = builder.build(action: .ask, snapshot: snapshot, settings: settings(skills: "", autoDetect: true), currentTime: Date(timeIntervalSince1970: 120), hasScreenshot: false, ocrText: nil)
@@ -202,23 +199,25 @@ import Testing
             inputLanguageName: "English",
             outputLanguageID: "zh-Hans",
             outputLanguageName: "Simplified Chinese",
-            entries: [AssistantTranscriptEntry(timestamp: Date(timeIntervalSince1970: 0), sourceName: "Team Standup", sourceLanguageID: "en", targetLanguageID: "zh-Hans", sourceText: "Hello", translatedText: "你好")]
+            entries: [AssistantTranscriptEntry(timestamp: Date(timeIntervalSince1970: 0), sourceName: "Team Standup", sourceLanguageID: "en", sourceLanguageName: "English", targetLanguageID: "zh-Hans", targetLanguageName: "Simplified Chinese", sourceText: "Hello", translatedText: "你好")]
         )
     }
 
     private func multiSourceSnapshot() -> AssistantTranscriptSnapshot {
         AssistantTranscriptSnapshot(
             sourceName: "Combined Sources",
-            inputLanguageID: "en",
-            inputLanguageName: "English",
-            outputLanguageID: "zh-Hans",
-            outputLanguageName: "Simplified Chinese",
+            inputLanguageID: "fr",
+            inputLanguageName: "French",
+            outputLanguageID: "de",
+            outputLanguageName: "German",
             entries: [
                 AssistantTranscriptEntry(
                     timestamp: Date(timeIntervalSince1970: 1),
                     sourceName: "Desk Mic",
                     sourceLanguageID: "en",
+                    sourceLanguageName: "English",
                     targetLanguageID: "zh-Hans",
+                    targetLanguageName: "Simplified Chinese",
                     sourceText: "First source",
                     translatedText: "第一条翻译"
                 ),
@@ -226,7 +225,9 @@ import Testing
                     timestamp: Date(timeIntervalSince1970: 2),
                     sourceName: "Remote Mic",
                     sourceLanguageID: "ja",
+                    sourceLanguageName: "Japanese",
                     targetLanguageID: "en",
+                    targetLanguageName: "English",
                     sourceText: "Second source",
                     translatedText: "Second translation"
                 ),
