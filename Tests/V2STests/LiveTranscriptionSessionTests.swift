@@ -221,6 +221,70 @@ import Testing
         #expect(recorder.texts == ["Deliver once."])
     }
 
+    @Test func disablingCaptureWaitsForAnAuthorizedSplitDeliveryTransaction() async throws {
+        let session = LiveTranscriptionSession()
+        let recorder = ThreadSafeRecognizedSentenceRecorder()
+        await MainActor.run {
+            session.setTranscriptHandlerForTesting { recorder.record($0) }
+        }
+        let buffer = try makeMono16KBuffer(samples: [0.25, -0.25, 0.5])
+
+        session.setCorrectionAudioCaptureEnabled(true)
+        await session.appendCorrectionAudioBufferForTesting(buffer)
+        await session.queueCommittedEmissionForTesting(text: "First sentence. Second sentence.")
+        session.pauseNextCommittedDeliveryAfterAuthorizationForTesting()
+
+        let delivery = Task {
+            await session.deliverQueuedCommittedEmissionForTesting()
+        }
+        await session.waitForCommittedDeliveryAuthorizationPauseForTesting()
+
+        session.setCorrectionAudioCaptureEnabled(false)
+        await session.waitForDeliveryMutationAttemptForTesting()
+        #expect(session.isDeliveryMutationWaitingForTesting())
+
+        session.resumeCommittedDeliveryAfterAuthorizationForTesting()
+        await delivery.value
+        #expect(await session.correctionAudioFrameCountForTesting() == 0)
+
+        let sentences = recorder.snapshot()
+        #expect(sentences.map(\.text) == ["First sentence.", "Second sentence."])
+        let expectedWAV = try #require(sentences.first?.audioWAVData)
+        #expect(sentences.allSatisfy { $0.audioWAVData == expectedWAV })
+    }
+
+    @Test func stoppingDuringAuthorizedSplitDeliveryCompletesTheWholeTransactionBeforeStop() async throws {
+        let session = LiveTranscriptionSession()
+        let recorder = ThreadSafeRecognizedSentenceRecorder()
+        await MainActor.run {
+            session.setTranscriptHandlerForTesting { recorder.record($0) }
+        }
+        let buffer = try makeMono16KBuffer(samples: [0.25, -0.25, 0.5])
+
+        session.setCorrectionAudioCaptureEnabled(true)
+        await session.appendCorrectionAudioBufferForTesting(buffer)
+        await session.queueCommittedEmissionForTesting(text: "First sentence. Second sentence.")
+        session.pauseNextCommittedDeliveryAfterAuthorizationForTesting()
+
+        let delivery = Task {
+            await session.deliverQueuedCommittedEmissionForTesting()
+        }
+        await session.waitForCommittedDeliveryAuthorizationPauseForTesting()
+
+        session.stop()
+        await session.waitForDeliveryMutationAttemptForTesting()
+        #expect(session.isDeliveryMutationWaitingForTesting())
+
+        session.resumeCommittedDeliveryAfterAuthorizationForTesting()
+        await delivery.value
+        await session.stopAndWait()
+
+        let sentences = recorder.snapshot()
+        #expect(sentences.map(\.text) == ["First sentence.", "Second sentence."])
+        let expectedWAV = try #require(sentences.first?.audioWAVData)
+        #expect(sentences.allSatisfy { $0.audioWAVData == expectedWAV })
+    }
+
     private func disposition(
         code: Int,
         message: String = ""
@@ -263,5 +327,22 @@ import Testing
     func record(_ sentence: RecognizedSentence) {
         texts.append(sentence.text)
         receivedAudio.append(sentence.audioWAVData != nil)
+    }
+}
+
+private final class ThreadSafeRecognizedSentenceRecorder: @unchecked Sendable {
+    private let lock = NSLock()
+    private var sentences: [RecognizedSentence] = []
+
+    func record(_ sentence: RecognizedSentence) {
+        lock.lock()
+        sentences.append(sentence)
+        lock.unlock()
+    }
+
+    func snapshot() -> [RecognizedSentence] {
+        lock.lock()
+        defer { lock.unlock() }
+        return sentences
     }
 }

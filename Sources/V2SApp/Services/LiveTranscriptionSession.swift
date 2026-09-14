@@ -21,6 +21,11 @@ private struct UncheckedSendablePCMBuffer: @unchecked Sendable {
     let value: AVAudioPCMBuffer
 }
 
+private final class CommittedDeliveryPauseForTesting: @unchecked Sendable {
+    let authorizationReached = DispatchSemaphore(value: 0)
+    let resumeDelivery = DispatchSemaphore(value: 0)
+}
+
 final class LiveTranscriptionSession: NSObject, @unchecked Sendable {
     enum LegacyRecognitionErrorDisposition: Equatable {
         case ignore
@@ -195,6 +200,14 @@ final class LiveTranscriptionSession: NSObject, @unchecked Sendable {
     /// Serializes the final delivery decision with stop/opt-out so a copied WAV cannot
     /// cross the MainActor boundary after either action has taken effect.
     private let transcriptDeliveryLock = NSLock()
+    /// Serializes a complete outer emission with privacy state changes. A transaction
+    /// holds this gate across every split unit, including its MainActor callback.
+    private let committedSequenceDeliveryGate = NSRecursiveLock()
+    private let committedDeliveryTestingLock = NSLock()
+    private var committedDeliveryPauseForTesting: CommittedDeliveryPauseForTesting?
+    private var deliveryMutationAttemptedForTesting = false
+    private var deliveryMutationWaitingForTesting = false
+    private var deliveryMutationAttemptContinuationForTesting: CheckedContinuation<Void, Never>?
     private var correctionAudioBuffer = SentenceAudioBuffer(sampleRate: 16_000, maximumDuration: 15)
     /// Legacy Speech timestamps can rebase with their segment array. Keep the audio
     /// cursor boundary independent so a replayed/regressed timestamp cannot consume data.
@@ -372,6 +385,9 @@ final class LiveTranscriptionSession: NSObject, @unchecked Sendable {
     }
 
     private func stopOnCaptureQueue() {
+        beginCommittedDeliveryStateMutation()
+        defer { endCommittedDeliveryStateMutation() }
+
         cancelSilenceTimer()
         cancelVADSilenceTimer()
 
@@ -408,6 +424,8 @@ final class LiveTranscriptionSession: NSObject, @unchecked Sendable {
     func setCorrectionAudioCaptureEnabled(_ enabled: Bool) {
         captureQueue.async { [weak self] in
             guard let self else { return }
+            beginCommittedDeliveryStateMutation()
+            defer { endCommittedDeliveryStateMutation() }
             transcriptDeliveryLock.lock()
             correctionAudioCaptureEpoch &+= 1
             correctionAudioCaptureEnabled = enabled
@@ -492,6 +510,60 @@ final class LiveTranscriptionSession: NSObject, @unchecked Sendable {
     @MainActor
     func invalidateNextCommittedDeliveryAfterAuthorizationForTesting() {
         shouldInvalidateCommittedDeliveryAfterAuthorizationForTesting = true
+    }
+
+    func pauseNextCommittedDeliveryAfterAuthorizationForTesting() {
+        committedDeliveryTestingLock.lock()
+        committedDeliveryPauseForTesting = CommittedDeliveryPauseForTesting()
+        deliveryMutationAttemptedForTesting = false
+        deliveryMutationWaitingForTesting = false
+        deliveryMutationAttemptContinuationForTesting = nil
+        committedDeliveryTestingLock.unlock()
+    }
+
+    func waitForCommittedDeliveryAuthorizationPauseForTesting() async {
+        let pause = committedDeliveryPauseForTestingSnapshot()
+        guard let pause else { return }
+
+        await withCheckedContinuation { continuation in
+            DispatchQueue.global(qos: .userInitiated).async {
+                pause.authorizationReached.wait()
+                continuation.resume()
+            }
+        }
+    }
+
+    func resumeCommittedDeliveryAfterAuthorizationForTesting() {
+        committedDeliveryTestingLock.lock()
+        let pause = committedDeliveryPauseForTesting
+        committedDeliveryPauseForTesting = nil
+        committedDeliveryTestingLock.unlock()
+        pause?.resumeDelivery.signal()
+    }
+
+    func waitForDeliveryMutationAttemptForTesting() async {
+        await withCheckedContinuation { continuation in
+            committedDeliveryTestingLock.lock()
+            if deliveryMutationAttemptedForTesting {
+                committedDeliveryTestingLock.unlock()
+                continuation.resume()
+            } else {
+                deliveryMutationAttemptContinuationForTesting = continuation
+                committedDeliveryTestingLock.unlock()
+            }
+        }
+    }
+
+    func isDeliveryMutationWaitingForTesting() -> Bool {
+        committedDeliveryTestingLock.lock()
+        defer { committedDeliveryTestingLock.unlock() }
+        return deliveryMutationWaitingForTesting
+    }
+
+    private func committedDeliveryPauseForTestingSnapshot() -> CommittedDeliveryPauseForTesting? {
+        committedDeliveryTestingLock.lock()
+        defer { committedDeliveryTestingLock.unlock() }
+        return committedDeliveryPauseForTesting
     }
 
     func beginSpeechAnalyzerRecognitionForTesting() async -> Int {
@@ -629,6 +701,36 @@ final class LiveTranscriptionSession: NSObject, @unchecked Sendable {
         transcriptDeliveryLock.lock()
         transcriptDeliveryEpoch &+= 1
         transcriptDeliveryLock.unlock()
+    }
+
+    private func beginCommittedDeliveryStateMutation() {
+        committedDeliveryTestingLock.lock()
+        deliveryMutationAttemptedForTesting = true
+        deliveryMutationWaitingForTesting = true
+        let continuation = deliveryMutationAttemptContinuationForTesting
+        deliveryMutationAttemptContinuationForTesting = nil
+        committedDeliveryTestingLock.unlock()
+        continuation?.resume()
+
+        committedSequenceDeliveryGate.lock()
+
+        committedDeliveryTestingLock.lock()
+        deliveryMutationWaitingForTesting = false
+        committedDeliveryTestingLock.unlock()
+    }
+
+    private func endCommittedDeliveryStateMutation() {
+        committedSequenceDeliveryGate.unlock()
+    }
+
+    private func pauseCommittedDeliveryAfterAuthorizationForTestingIfNeeded() {
+        committedDeliveryTestingLock.lock()
+        let pause = committedDeliveryPauseForTesting
+        committedDeliveryTestingLock.unlock()
+
+        guard let pause else { return }
+        pause.authorizationReached.signal()
+        pause.resumeDelivery.wait()
     }
 
     private func requestRequiredPermissions(for source: InputSource) async throws {
@@ -1308,6 +1410,9 @@ final class LiveTranscriptionSession: NSObject, @unchecked Sendable {
     }
 
     private func beginLegacyRecognitionAfterSpeechAnalyzerFallback() {
+        committedSequenceDeliveryGate.lock()
+        defer { committedSequenceDeliveryGate.unlock() }
+
         // A fallback starts a legacy recognizer whose segment timestamps begin at zero.
         // Discard any modern timeline before the legacy task can receive callbacks.
         invalidateTranscriptDelivery()
@@ -1578,33 +1683,9 @@ final class LiveTranscriptionSession: NSObject, @unchecked Sendable {
     private func emitCommittedSentence(
         text: String,
         promotionSegmentID: UUID?,
-        emission: CommittedEmission
+        audioWAVData: Data?
     ) -> Bool {
-        transcriptDeliveryLock.lock()
-        guard transcriptDeliveryEpoch == emission.deliveryToken.sessionEpoch else {
-            transcriptDeliveryLock.unlock()
-            return false
-        }
-
-        if let modernRecognitionEpoch = emission.deliveryToken.modernRecognitionEpoch,
-           (deliveryRecognitionEpoch != modernRecognitionEpoch
-               || deliveryRecognitionBackend != .speechAnalyzer) {
-            transcriptDeliveryLock.unlock()
-            return false
-        }
-
-        let audioWAVData: Data?
-        if let audioCaptureEpoch = emission.deliveryToken.audioCaptureEpoch,
-           correctionAudioCaptureEnabled,
-           correctionAudioCaptureEpoch == audioCaptureEpoch {
-            audioWAVData = emission.audioWAVData
-        } else {
-            audioWAVData = nil
-        }
-
         let handler = transcriptHandler
-        transcriptDeliveryLock.unlock()
-
         guard let handler else {
             return false
         }
@@ -1646,39 +1727,52 @@ final class LiveTranscriptionSession: NSObject, @unchecked Sendable {
         pruneRecentCommittedSentenceHistory()
 
         for emission in emissions {
-            // This lock-backed snapshot is deliberately synchronous: once the MainActor
-            // begins a committed sequence, no per-emission actor hop can interleave it.
-            let deliveryPermission = committedEmissionDeliveryPermission(for: emission.deliveryToken)
-            guard deliveryPermission != .suppress else {
-                continue
-            }
-
-            if shouldInvalidateCommittedDeliveryAfterAuthorizationForTesting {
-                shouldInvalidateCommittedDeliveryAfterAuthorizationForTesting = false
-                invalidateTranscriptDelivery()
-            }
-
-            let sentenceTexts = splitCommittedEmissionUnits(in: emission.text)
-            var pendingPromotionID = emission.promotionSegmentID
-
-            for sentenceText in sentenceTexts {
-                guard let preparedSentence = prepareCommittedSentenceForEmission(sentenceText) else {
-                    continue
-                }
-
-                if emitCommittedSentence(
-                    text: preparedSentence,
-                    promotionSegmentID: pendingPromotionID,
-                    emission: emission
-                ) {
-                    rememberCommittedSentence(preparedSentence)
-                }
-                pendingPromotionID = nil
-            }
+            emitCommittedEmissionTransaction(emission)
         }
 
         if clearDraftAfter {
             emitPartialDraft(nil)
+        }
+    }
+
+    /// Delivers all units produced by one outer emission as one transaction. Capture
+    /// opt-out, stop, and modern fallback take this same gate before mutating their
+    /// delivery state, so the audio decision cannot change between split units.
+    @MainActor
+    private func emitCommittedEmissionTransaction(_ emission: CommittedEmission) {
+        committedSequenceDeliveryGate.lock()
+        defer { committedSequenceDeliveryGate.unlock() }
+
+        let deliveryPermission = committedEmissionDeliveryPermission(for: emission.deliveryToken)
+        guard deliveryPermission != .suppress else {
+            return
+        }
+
+        if shouldInvalidateCommittedDeliveryAfterAuthorizationForTesting {
+            shouldInvalidateCommittedDeliveryAfterAuthorizationForTesting = false
+            invalidateTranscriptDelivery()
+            return
+        }
+
+        let audioWAVData = deliveryPermission == .textAndAudio ? emission.audioWAVData : nil
+        pauseCommittedDeliveryAfterAuthorizationForTestingIfNeeded()
+
+        let sentenceTexts = splitCommittedEmissionUnits(in: emission.text)
+        var pendingPromotionID = emission.promotionSegmentID
+
+        for sentenceText in sentenceTexts {
+            guard let preparedSentence = prepareCommittedSentenceForEmission(sentenceText) else {
+                continue
+            }
+
+            if emitCommittedSentence(
+                text: preparedSentence,
+                promotionSegmentID: pendingPromotionID,
+                audioWAVData: audioWAVData
+            ) {
+                rememberCommittedSentence(preparedSentence)
+            }
+            pendingPromotionID = nil
         }
     }
 
