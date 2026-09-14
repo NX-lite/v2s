@@ -285,6 +285,79 @@ import Testing
         #expect(sentences.allSatisfy { $0.audioWAVData == expectedWAV })
     }
 
+    @Test @MainActor func snapshottedAudioEmissionCannotDeliverAfterStopDuringDeferredDelivery() async throws {
+        let session = LiveTranscriptionSession()
+        let recorder = RecognizedSentenceRecorder()
+        session.setTranscriptHandlerForTesting { recorder.record($0) }
+        let buffer = try makeMono16KBuffer(samples: [0.25, -0.25, 0.5])
+
+        session.setCorrectionAudioCaptureEnabled(true)
+        await session.appendCorrectionAudioBufferForTesting(buffer)
+        await session.captureCommittedEmissionForDeferredDeliveryAfterAudioExtractionForTesting(
+            text: "Do not revive after stop."
+        )
+
+        await session.stopAndWait()
+        await session.deliverQueuedCommittedEmissionForTesting()
+
+        #expect(recorder.texts.isEmpty)
+        #expect(recorder.receivedAudio.isEmpty)
+    }
+
+    @Test @MainActor func snapshottedAudioEmissionCannotAcquireReenabledCaptureEpoch() async throws {
+        let session = LiveTranscriptionSession()
+        let recorder = RecognizedSentenceRecorder()
+        session.setTranscriptHandlerForTesting { recorder.record($0) }
+        let buffer = try makeMono16KBuffer(samples: [0.25, -0.25, 0.5])
+
+        session.setCorrectionAudioCaptureEnabled(true)
+        await session.appendCorrectionAudioBufferForTesting(buffer)
+        await session.captureCommittedEmissionForDeferredDeliveryAfterAudioExtractionForTesting(
+            text: "Keep only text after re-enable."
+        )
+
+        session.setCorrectionAudioCaptureEnabled(false)
+        session.setCorrectionAudioCaptureEnabled(true)
+        await session.deliverQueuedCommittedEmissionForTesting()
+
+        #expect(recorder.texts == ["Keep only text after re-enable."])
+        #expect(recorder.receivedAudio == [false])
+    }
+
+    @Test func beginningRecognitionWaitsForAnAuthorizedSplitDeliveryTransaction() async throws {
+        let session = LiveTranscriptionSession()
+        let recorder = ThreadSafeRecognizedSentenceRecorder()
+        await MainActor.run {
+            session.setTranscriptHandlerForTesting { recorder.record($0) }
+        }
+        let buffer = try makeMono16KBuffer(samples: [0.25, -0.25, 0.5])
+
+        session.setCorrectionAudioCaptureEnabled(true)
+        await session.appendCorrectionAudioBufferForTesting(buffer)
+        await session.queueCommittedEmissionForTesting(text: "First sentence. Second sentence.")
+        session.pauseNextCommittedDeliveryAfterAuthorizationForTesting()
+
+        let delivery = Task {
+            await session.deliverQueuedCommittedEmissionForTesting()
+        }
+        await session.waitForCommittedDeliveryAuthorizationPauseForTesting()
+
+        let beginSession = Task {
+            await session.beginRecognitionSessionForTesting()
+        }
+        await session.waitForDeliveryMutationAttemptForTesting()
+        #expect(session.isDeliveryMutationWaitingForTesting())
+
+        session.resumeCommittedDeliveryAfterAuthorizationForTesting()
+        await delivery.value
+        await beginSession.value
+
+        let sentences = recorder.snapshot()
+        #expect(sentences.map(\.text) == ["First sentence.", "Second sentence."])
+        let expectedWAV = try #require(sentences.first?.audioWAVData)
+        #expect(sentences.allSatisfy { $0.audioWAVData == expectedWAV })
+    }
+
     private func disposition(
         code: Int,
         message: String = ""

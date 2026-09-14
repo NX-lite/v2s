@@ -624,6 +624,28 @@ final class LiveTranscriptionSession: NSObject, @unchecked Sendable {
         }
     }
 
+    /// Holds an already-tokenized emission for deterministic lifecycle tests. This
+    /// models the interval after WAV extraction but before the MainActor delivery task.
+    func captureCommittedEmissionForDeferredDeliveryAfterAudioExtractionForTesting(
+        text: String
+    ) async {
+        await withCheckedContinuation { continuation in
+            captureQueue.async { [weak self] in
+                guard let self else {
+                    continuation.resume()
+                    return
+                }
+                let audioWAVData = finishCorrectionAudio()
+                queuedCommittedEmissionForTesting = makeCommittedEmission(
+                    text: text,
+                    promotionSegmentID: nil,
+                    audioWAVData: audioWAVData
+                )
+                continuation.resume()
+            }
+        }
+    }
+
     func deliverQueuedCommittedEmissionForTesting() async {
         let emission = await withCheckedContinuation { continuation in
             captureQueue.async { [weak self] in
@@ -670,6 +692,8 @@ final class LiveTranscriptionSession: NSObject, @unchecked Sendable {
                     continuation.resume(returning: -1)
                     return
                 }
+                beginCommittedDeliveryStateMutation()
+                defer { endCommittedDeliveryStateMutation() }
                 invalidateTranscriptDelivery()
                 resetRecognitionEpoch()
                 continuation.resume(returning: recognitionEpoch)
@@ -2297,6 +2321,8 @@ final class LiveTranscriptionSession: NSObject, @unchecked Sendable {
     /// indefinitely. Called on captureQueue whenever isFinal is received or on error recovery.
     private func restartRecognitionTask() {
         guard let recognizer = speechRecognizer else { return }
+        beginCommittedDeliveryStateMutation()
+        defer { endCommittedDeliveryStateMutation() }
 
         // A restart from any source supersedes a retry still waiting on its backoff.
         pendingRecognitionRestart?.cancel()
@@ -2465,16 +2491,15 @@ final class LiveTranscriptionSession: NSObject, @unchecked Sendable {
 
             if text.isEmpty == false {
                 let audioWAVData = finishCorrectionAudio()
-                Task {
+                let committedEmission = makeCommittedEmission(
+                    text: text,
+                    promotionSegmentID: committedDraftID,
+                    audioWAVData: audioWAVData,
+                    modernRecognitionEpoch: epoch
+                )
+                Task { [committedEmission] in
                     await emitCommittedSequence(
-                        [
-                            makeCommittedEmission(
-                                text: text,
-                                promotionSegmentID: committedDraftID,
-                                audioWAVData: audioWAVData,
-                                modernRecognitionEpoch: epoch
-                            )
-                        ],
+                        [committedEmission],
                         clearDraftAfter: true
                     )
                 }
@@ -2512,16 +2537,15 @@ final class LiveTranscriptionSession: NSObject, @unchecked Sendable {
             let committedDraftID = currentDraftId
             resetDraftState()
             let audioWAVData = finishCorrectionAudio()
-            Task {
+            let committedEmission = makeCommittedEmission(
+                text: committedText,
+                promotionSegmentID: committedDraftID,
+                audioWAVData: audioWAVData,
+                modernRecognitionEpoch: epoch
+            )
+            Task { [committedEmission] in
                 await emitCommittedSequence(
-                    [
-                        makeCommittedEmission(
-                            text: committedText,
-                            promotionSegmentID: committedDraftID,
-                            audioWAVData: audioWAVData,
-                            modernRecognitionEpoch: epoch
-                        )
-                    ],
+                    [committedEmission],
                     clearDraftAfter: true
                 )
             }
@@ -2850,16 +2874,15 @@ final class LiveTranscriptionSession: NSObject, @unchecked Sendable {
             let committedDraftID = currentDraftId
             resetDraftState()
             let audioWAVData = finishCorrectionAudio()
-            Task {
+            let committedEmission = makeCommittedEmission(
+                text: text,
+                promotionSegmentID: committedDraftID,
+                audioWAVData: audioWAVData,
+                modernRecognitionEpoch: recognitionEpoch
+            )
+            Task { [committedEmission] in
                 await emitCommittedSequence(
-                    [
-                        makeCommittedEmission(
-                            text: text,
-                            promotionSegmentID: committedDraftID,
-                            audioWAVData: audioWAVData,
-                            modernRecognitionEpoch: recognitionEpoch
-                        )
-                    ],
+                    [committedEmission],
                     clearDraftAfter: remainingRawText.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
                 )
             }
@@ -2891,15 +2914,14 @@ final class LiveTranscriptionSession: NSObject, @unchecked Sendable {
             let audioWAVData = finishCorrectionAudio(
                 through: segmentEndTime(for: segments[lastIdx])
             )
-            Task {
+            let committedEmission = makeCommittedEmission(
+                text: sentenceText,
+                promotionSegmentID: committedDraftID,
+                audioWAVData: audioWAVData
+            )
+            Task { [committedEmission] in
                 await emitCommittedSequence(
-                    [
-                        makeCommittedEmission(
-                            text: sentenceText,
-                            promotionSegmentID: committedDraftID,
-                            audioWAVData: audioWAVData
-                        )
-                    ],
+                    [committedEmission],
                     clearDraftAfter: true
                 )
             }
