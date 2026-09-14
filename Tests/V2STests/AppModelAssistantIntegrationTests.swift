@@ -4,6 +4,28 @@ import Testing
 
 @MainActor
 @Suite struct AppModelAssistantIntegrationTests {
+    @Test func transcriptEntryLegacyInitializerUsesUnknownMetadataAndRetainsLocalValues() {
+        let timestamp = Date(timeIntervalSince1970: 42)
+        let entry = TranscriptEntry(
+            id: UUID(uuidString: "00000000-0000-0000-0000-000000000011")!,
+            sourceText: "Legacy source",
+            translatedText: "旧翻译",
+            timestamp: timestamp
+        )
+
+        #expect(entry.sourceID == "unknown")
+        #expect(entry.sourceName == "Unknown Source")
+        #expect(entry.sourceLanguageID == "unknown")
+        #expect(entry.targetLanguageID == "unknown")
+        #expect(entry.localSourceText == "Legacy source")
+        #expect(entry.localTranslatedText == "旧翻译")
+        #expect(entry.correctedSourceText == nil)
+        #expect(entry.correctedTranslatedText == nil)
+        #expect(entry.sourceText == "Legacy source")
+        #expect(entry.translatedText == "旧翻译")
+        #expect(entry.timestamp == timestamp)
+    }
+
     @Test func correctionInputAndStatusStatesAreEquatable() {
         #expect(CorrectionInputMode.audio == .audio)
         #expect(CorrectionInputMode.textOnly == .textOnly)

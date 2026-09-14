@@ -104,6 +104,24 @@ struct TranscriptEntry: Identifiable, Equatable {
         self.timestamp = timestamp
     }
 
+    init(
+        id: UUID,
+        sourceText: String,
+        translatedText: String,
+        timestamp: Date = Date()
+    ) {
+        self.init(
+            id: id,
+            sourceID: "unknown",
+            sourceName: "Unknown Source",
+            sourceLanguageID: "unknown",
+            targetLanguageID: "unknown",
+            localSourceText: sourceText,
+            localTranslatedText: translatedText,
+            timestamp: timestamp
+        )
+    }
+
     private func effectiveText(_ correction: String?, fallingBackTo localText: String) -> String {
         guard let correction,
               correction.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty == false else {
