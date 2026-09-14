@@ -193,6 +193,34 @@ import Testing
         #expect(await session.correctionAudioFrameCountForTesting() == 4)
     }
 
+    @Test func staleModernSetupCannotInstallAfterSessionStops() async {
+        let session = LiveTranscriptionSession()
+        let startupEpoch = await session.beginModernSetupForTesting()
+
+        await session.stopAndWait()
+
+        #expect(await session.finalizeModernSetupForTesting(startupEpoch) == false)
+        #expect(await session.isModernRecognizerInstalledForTesting() == false)
+    }
+
+    @Test @MainActor func invalidationAfterSequenceAuthorizationDoesNotPoisonDuplicateHistory() async {
+        let session = LiveTranscriptionSession()
+        let recorder = RecognizedSentenceRecorder()
+        session.setTranscriptHandlerForTesting { recorder.record($0) }
+
+        await session.queueCommittedEmissionForTesting(text: "Deliver once.")
+        session.invalidateNextCommittedDeliveryAfterAuthorizationForTesting()
+        await session.deliverQueuedCommittedEmissionForTesting()
+
+        #expect(recorder.texts.isEmpty)
+
+        await session.beginRecognitionSessionForTesting()
+        await session.queueCommittedEmissionForTesting(text: "Deliver once.")
+        await session.deliverQueuedCommittedEmissionForTesting()
+
+        #expect(recorder.texts == ["Deliver once."])
+    }
+
     private func disposition(
         code: Int,
         message: String = ""

@@ -108,7 +108,7 @@ final class LiveTranscriptionSession: NSObject, @unchecked Sendable {
         let rms: Float
     }
 
-    private enum RecognitionBackend {
+    private enum RecognitionBackend: Equatable {
         case legacy
         case speechAnalyzer
     }
@@ -166,6 +166,9 @@ final class LiveTranscriptionSession: NSObject, @unchecked Sendable {
     /// Advances whenever a recognizer/backend receives a fresh audio timeline. Both
     /// legacy handlers and modern result tasks capture this epoch before dispatching.
     private var recognitionEpoch: Int = 0
+    /// Lock-protected mirror used only when MainActor delivery validates a token.
+    private var deliveryRecognitionEpoch: Int = 0
+    private var deliveryRecognitionBackend: RecognitionBackend = .legacy
     /// Invalidates all queued transcript deliveries when a session is torn down.
     private var transcriptDeliveryEpoch: Int = 0
     /// Consecutive recognition-task failures since the last delivered result. Restarting
@@ -224,6 +227,7 @@ final class LiveTranscriptionSession: NSObject, @unchecked Sendable {
     /// The owner uses this separate callback to stop sibling sessions as well.
     private var fatalErrorHandler: (@MainActor (String) -> Void)?
     @MainActor private var recentCommittedSentenceHistory: [RecentCommittedSentence] = []
+    @MainActor private var shouldInvalidateCommittedDeliveryAfterAuthorizationForTesting = false
 
     private func localized(_ key: AppTextKey, _ arguments: CVarArg...) -> String {
         AppLocalization.formattedString(key, languageID: interfaceLanguageID, arguments: arguments)
@@ -300,28 +304,47 @@ final class LiveTranscriptionSession: NSObject, @unchecked Sendable {
             recentCommittedSentenceHistory.removeAll()
         }
 
-        await beginRecognitionSessionOnCaptureQueue()
+        let startupEpoch = await beginRecognitionSessionOnCaptureQueue()
 
         do {
             try await requestRequiredPermissions(for: source)
-            if try await configureModernSpeechRecognizer(localeIdentifier: localeIdentifier) == false {
-                try await runOnCaptureQueue {
-                    try self.configureSpeechRecognizer(localeIdentifier: localeIdentifier)
-                }
+            let recognizerConfigured: Bool
+            if try await configureModernSpeechRecognizer(
+                localeIdentifier: localeIdentifier,
+                expectedEpoch: startupEpoch
+            ) {
+                recognizerConfigured = true
+            } else {
+                recognizerConfigured = try await configureLegacySpeechRecognizer(
+                    localeIdentifier: localeIdentifier,
+                    expectedEpoch: startupEpoch
+                )
+            }
+
+            // The session may have stopped while permissions or modern asset setup
+            // suspended. Do not revive a recognizer or capture source from that stale start.
+            guard recognizerConfigured else {
+                return
             }
 
             switch source.category {
             case .microphone:
-                try await runOnCaptureQueue {
+                let captureStarted: Bool = try await runOnCaptureQueue {
+                    guard self.recognitionEpoch == startupEpoch else { return false }
                     try self.startMicrophoneCapture(deviceUniqueID: source.detail)
+                    return true
                 }
+                guard captureStarted else { return }
             case .application:
                 let captureDescriptor = try await MainActor.run {
                     try self.makeApplicationCaptureDescriptor(for: source)
                 }
-                try await runOnCaptureQueue {
+                let captureStarted: Bool = try await runOnCaptureQueue {
+                    guard self.recognitionEpoch == startupEpoch else { return false }
                     try self.startApplicationAudioCapture(descriptor: captureDescriptor)
+                    return true
                 }
+                guard captureStarted else { return }
             }
         } catch {
             await resetCorrectionAudioBufferOnCaptureQueue()
@@ -429,6 +452,48 @@ final class LiveTranscriptionSession: NSObject, @unchecked Sendable {
         }
     }
 
+    func beginModernSetupForTesting() async -> Int {
+        await beginRecognitionSessionOnCaptureQueue()
+    }
+
+    func finalizeModernSetupForTesting(_ expectedEpoch: Int) async -> Bool {
+        await withCheckedContinuation { continuation in
+            captureQueue.async { [weak self] in
+                guard let self, recognitionEpoch == expectedEpoch else {
+                    continuation.resume(returning: false)
+                    return
+                }
+                setRecognitionBackend(.speechAnalyzer)
+                continuation.resume(returning: true)
+            }
+        }
+    }
+
+    func isModernRecognizerInstalledForTesting() async -> Bool {
+        await withCheckedContinuation { continuation in
+            captureQueue.async { [weak self] in
+                guard let self else {
+                    continuation.resume(returning: false)
+                    return
+                }
+                continuation.resume(
+                    returning: recognitionBackend == .speechAnalyzer
+                        || modernResultsTask != nil
+                        || modernAnalyzerTask != nil
+                )
+            }
+        }
+    }
+
+    func beginRecognitionSessionForTesting() async {
+        _ = await beginRecognitionSessionOnCaptureQueue()
+    }
+
+    @MainActor
+    func invalidateNextCommittedDeliveryAfterAuthorizationForTesting() {
+        shouldInvalidateCommittedDeliveryAfterAuthorizationForTesting = true
+    }
+
     func beginSpeechAnalyzerRecognitionForTesting() async -> Int {
         await withCheckedContinuation { continuation in
             captureQueue.async { [weak self] in
@@ -436,7 +501,7 @@ final class LiveTranscriptionSession: NSObject, @unchecked Sendable {
                     continuation.resume(returning: -1)
                     return
                 }
-                recognitionBackend = .speechAnalyzer
+                setRecognitionBackend(.speechAnalyzer)
                 continuation.resume(returning: recognitionEpoch)
             }
         }
@@ -526,16 +591,16 @@ final class LiveTranscriptionSession: NSObject, @unchecked Sendable {
         }
     }
 
-    private func beginRecognitionSessionOnCaptureQueue() async {
+    private func beginRecognitionSessionOnCaptureQueue() async -> Int {
         await withCheckedContinuation { continuation in
             captureQueue.async { [weak self] in
                 guard let self else {
-                    continuation.resume()
+                    continuation.resume(returning: -1)
                     return
                 }
                 invalidateTranscriptDelivery()
                 resetRecognitionEpoch()
-                continuation.resume()
+                continuation.resume(returning: recognitionEpoch)
             }
         }
     }
@@ -547,7 +612,17 @@ final class LiveTranscriptionSession: NSObject, @unchecked Sendable {
 
     private func resetRecognitionEpoch() {
         recognitionEpoch &+= 1
+        transcriptDeliveryLock.lock()
+        deliveryRecognitionEpoch = recognitionEpoch
+        transcriptDeliveryLock.unlock()
         resetCorrectionAudioBuffer()
+    }
+
+    private func setRecognitionBackend(_ backend: RecognitionBackend) {
+        recognitionBackend = backend
+        transcriptDeliveryLock.lock()
+        deliveryRecognitionBackend = backend
+        transcriptDeliveryLock.unlock()
     }
 
     private func invalidateTranscriptDelivery() {
@@ -615,7 +690,7 @@ final class LiveTranscriptionSession: NSObject, @unchecked Sendable {
         speechRecognizer = recognizer
         recognitionRequest = request
         recognitionTask = task
-        recognitionBackend = .legacy
+        setRecognitionBackend(.legacy)
         resetRecognitionFailureState()
         resetAudioProcessingState()
         resetLegacyTranscriptionState()
@@ -640,6 +715,19 @@ final class LiveTranscriptionSession: NSObject, @unchecked Sendable {
         }
     }
 
+    private func configureLegacySpeechRecognizer(
+        localeIdentifier: String,
+        expectedEpoch: Int
+    ) async throws -> Bool {
+        try await runOnCaptureQueue {
+            guard self.recognitionEpoch == expectedEpoch else {
+                return false
+            }
+            try self.configureSpeechRecognizer(localeIdentifier: localeIdentifier)
+            return true
+        }
+    }
+
     /// Resolves `requestedLocale` to a locale the modern Speech stack actually carries.
     ///
     /// `SpeechTranscriber.supportedLocale(equivalentTo:)` answers with an equivalent
@@ -658,21 +746,29 @@ final class LiveTranscriptionSession: NSObject, @unchecked Sendable {
         return supportedIdentifiers.contains(resolved.identifier) ? resolved : nil
     }
 
-    private func configureModernSpeechRecognizer(localeIdentifier: String) async throws -> Bool {
+    private func configureModernSpeechRecognizer(
+        localeIdentifier: String,
+        expectedEpoch: Int
+    ) async throws -> Bool {
         guard #available(macOS 26.0, *), SpeechTranscriber.isAvailable else {
             return false
         }
 
         do {
-            return try await configureSpeechAnalyzerRecognizer(localeIdentifier: localeIdentifier)
+            return try await configureSpeechAnalyzerRecognizer(
+                localeIdentifier: localeIdentifier,
+                expectedEpoch: expectedEpoch
+            )
         } catch {
-            stopModernSpeechRecognizer()
             return false
         }
     }
 
     @available(macOS 26.0, *)
-    private func configureSpeechAnalyzerRecognizer(localeIdentifier: String) async throws -> Bool {
+    private func configureSpeechAnalyzerRecognizer(
+        localeIdentifier: String,
+        expectedEpoch: Int
+    ) async throws -> Bool {
         let requestedLocale = Locale(identifier: localeIdentifier)
         guard let resolvedLocale = await Self.modernSpeechLocale(equivalentTo: requestedLocale) else {
             return false
@@ -701,62 +797,103 @@ final class LiveTranscriptionSession: NSObject, @unchecked Sendable {
         ) ?? processingFormat
         try await analyzer.prepareToAnalyze(in: preferredFormat)
 
+        var inputContinuation: AsyncStream<AnalyzerInput>.Continuation?
         let inputStream = AsyncStream<AnalyzerInput>(bufferingPolicy: .bufferingNewest(12)) { continuation in
-            self.analyzerInputContinuationState = continuation
+            inputContinuation = continuation
         }
 
-        let modernEpoch = recognitionEpoch
-        recognitionBackend = .speechAnalyzer
-        modernResultsTask?.cancel()
-        modernResultsTask = Task { [weak self] in
-            do {
-                for try await result in transcriber.results {
-                    self?.captureQueue.async { [weak self] in
-                        guard let self, self.acceptsModernResult(for: modernEpoch) else { return }
-                        self.processModernRecognitionResult(result, epoch: modernEpoch)
+        guard let inputContinuation else {
+            return false
+        }
+
+        let installed = await installSpeechAnalyzerRecognizer(
+            analyzer: analyzer,
+            transcriber: transcriber,
+            preferredFormat: preferredFormat,
+            inputStream: inputStream,
+            inputContinuation: inputContinuation,
+            expectedEpoch: expectedEpoch
+        )
+        guard installed else {
+            inputContinuation.finish()
+            await analyzer.cancelAndFinishNow()
+            return false
+        }
+        return true
+    }
+
+    /// Installs all modern-recognition state only after confirming this start still owns
+    /// the capture queue. Asset setup above can suspend while stop or fallback advances
+    /// the epoch; a stale setup must never resurrect the modern backend.
+    @available(macOS 26.0, *)
+    private func installSpeechAnalyzerRecognizer(
+        analyzer: SpeechAnalyzer,
+        transcriber: SpeechTranscriber,
+        preferredFormat: AVAudioFormat,
+        inputStream: AsyncStream<AnalyzerInput>,
+        inputContinuation: AsyncStream<AnalyzerInput>.Continuation,
+        expectedEpoch: Int
+    ) async -> Bool {
+        await withCheckedContinuation { continuation in
+            captureQueue.async { [weak self] in
+                guard let self, self.recognitionEpoch == expectedEpoch else {
+                    continuation.resume(returning: false)
+                    return
+                }
+
+                self.stopModernSpeechRecognizer()
+                self.speechAnalyzerState = analyzer
+                self.speechTranscriberState = transcriber
+                self.analyzerInputContinuationState = inputContinuation
+                self.analyzerInputFormat = preferredFormat
+                self.recognitionRequest = nil
+                self.recognitionTask = nil
+                self.speechRecognizer = nil
+                self.audioConverter = nil
+                self.audioConverterInputSignature = nil
+                self.resetLegacyTranscriptionState()
+                self.resetModernTranscriptionState()
+                self.cancelSilenceTimer()
+                self.cancelVADSilenceTimer()
+                self.resetDraftState()
+                self.lastModernCommittedResultIdentity = nil
+                self.setRecognitionBackend(.speechAnalyzer)
+
+                // Initialize Silero VAD engine for draft confidence / silence scoring only.
+                do {
+                    self.vadEngine = try SileroVADEngine()
+                } catch {
+                    self.vadEngine = nil
+                }
+
+                let modernEpoch = expectedEpoch
+                self.modernResultsTask = Task { [weak self] in
+                    do {
+                        for try await result in transcriber.results {
+                            self?.captureQueue.async { [weak self] in
+                                guard let self, self.acceptsModernResult(for: modernEpoch) else { return }
+                                self.processModernRecognitionResult(result, epoch: modernEpoch)
+                            }
+                        }
+                    } catch is CancellationError {
+                        return
+                    } catch {
+                        self?.fallbackFromSpeechAnalyzer(error)
                     }
                 }
-            } catch is CancellationError {
-                return
-            } catch {
-                self?.fallbackFromSpeechAnalyzer(error)
+
+                self.modernAnalyzerTask = Task { [weak self] in
+                    do {
+                        try await analyzer.start(inputSequence: inputStream)
+                    } catch is CancellationError {
+                        return
+                    } catch {
+                        self?.fallbackFromSpeechAnalyzer(error)
+                    }
+                }
+                continuation.resume(returning: true)
             }
         }
-
-        modernAnalyzerTask?.cancel()
-        modernAnalyzerTask = Task { [weak self] in
-            do {
-                try await analyzer.start(inputSequence: inputStream)
-            } catch is CancellationError {
-                return
-            } catch {
-                self?.fallbackFromSpeechAnalyzer(error)
-            }
-        }
-
-        speechAnalyzerState = analyzer
-        speechTranscriberState = transcriber
-        analyzerInputFormat = preferredFormat
-        recognitionRequest = nil
-        recognitionTask = nil
-        speechRecognizer = nil
-        audioConverter = nil
-        audioConverterInputSignature = nil
-        resetLegacyTranscriptionState()
-        resetModernTranscriptionState()
-        cancelSilenceTimer()
-        cancelVADSilenceTimer()
-        resetDraftState()
-        lastModernCommittedResultIdentity = nil
-
-        // Initialize Silero VAD engine for draft confidence / silence scoring only.
-        do {
-            vadEngine = try SileroVADEngine()
-        } catch {
-            vadEngine = nil
-        }
-
-        return true
     }
 
     @available(macOS 26.0, *)
@@ -780,7 +917,7 @@ final class LiveTranscriptionSession: NSObject, @unchecked Sendable {
         modernResultsTask?.cancel()
         modernResultsTask = nil
         lastModernCommittedResultIdentity = nil
-        recognitionBackend = .legacy
+        setRecognitionBackend(.legacy)
         modernAudioConverter = nil
         modernAudioConverterInputSignature = nil
         resetModernTranscriptionState()
@@ -1144,44 +1281,26 @@ final class LiveTranscriptionSession: NSObject, @unchecked Sendable {
 
     private func committedEmissionDeliveryPermission(
         for token: CommittedEmissionDeliveryToken
-    ) async -> CommittedEmissionDeliveryPermission {
-        await withCheckedContinuation { continuation in
-            captureQueue.async { [weak self] in
-                guard let self else {
-                    continuation.resume(returning: .suppress)
-                    return
-                }
+    ) -> CommittedEmissionDeliveryPermission {
+        transcriptDeliveryLock.lock()
+        defer { transcriptDeliveryLock.unlock() }
 
-                transcriptDeliveryLock.lock()
-                let deliveryMatches = transcriptDeliveryEpoch == token.sessionEpoch
-                let audioMatches: Bool
-                if let audioCaptureEpoch = token.audioCaptureEpoch {
-                    audioMatches = correctionAudioCaptureEnabled
-                        && correctionAudioCaptureEpoch == audioCaptureEpoch
-                } else {
-                    audioMatches = true
-                }
-                transcriptDeliveryLock.unlock()
-
-                guard deliveryMatches else {
-                    continuation.resume(returning: .suppress)
-                    return
-                }
-
-                if let modernRecognitionEpoch = token.modernRecognitionEpoch,
-                   acceptsModernResult(for: modernRecognitionEpoch) == false {
-                    continuation.resume(returning: .suppress)
-                    return
-                }
-
-                if audioMatches == false {
-                    continuation.resume(returning: .textOnly)
-                    return
-                }
-
-                continuation.resume(returning: .textAndAudio)
-            }
+        guard transcriptDeliveryEpoch == token.sessionEpoch else {
+            return .suppress
         }
+
+        if let modernRecognitionEpoch = token.modernRecognitionEpoch,
+           (deliveryRecognitionEpoch != modernRecognitionEpoch
+               || deliveryRecognitionBackend != .speechAnalyzer) {
+            return .suppress
+        }
+
+        if let audioCaptureEpoch = token.audioCaptureEpoch,
+           (correctionAudioCaptureEnabled == false || correctionAudioCaptureEpoch != audioCaptureEpoch) {
+            return .textOnly
+        }
+
+        return .textAndAudio
     }
 
     private func acceptsModernResult(for epoch: Int) -> Bool {
@@ -1460,12 +1579,18 @@ final class LiveTranscriptionSession: NSObject, @unchecked Sendable {
         text: String,
         promotionSegmentID: UUID?,
         emission: CommittedEmission
-    ) {
+    ) -> Bool {
         transcriptDeliveryLock.lock()
-        defer { transcriptDeliveryLock.unlock() }
-
         guard transcriptDeliveryEpoch == emission.deliveryToken.sessionEpoch else {
-            return
+            transcriptDeliveryLock.unlock()
+            return false
+        }
+
+        if let modernRecognitionEpoch = emission.deliveryToken.modernRecognitionEpoch,
+           (deliveryRecognitionEpoch != modernRecognitionEpoch
+               || deliveryRecognitionBackend != .speechAnalyzer) {
+            transcriptDeliveryLock.unlock()
+            return false
         }
 
         let audioWAVData: Data?
@@ -1477,13 +1602,21 @@ final class LiveTranscriptionSession: NSObject, @unchecked Sendable {
             audioWAVData = nil
         }
 
-        transcriptHandler?(
+        let handler = transcriptHandler
+        transcriptDeliveryLock.unlock()
+
+        guard let handler else {
+            return false
+        }
+
+        handler(
             RecognizedSentence(
                 text: text,
                 promotionSegmentID: promotionSegmentID,
                 audioWAVData: audioWAVData
             )
         )
+        return true
     }
 
     @MainActor
@@ -1509,14 +1642,22 @@ final class LiveTranscriptionSession: NSObject, @unchecked Sendable {
     private func emitCommittedSequence(
         _ emissions: [CommittedEmission],
         clearDraftAfter: Bool = false
-    ) async {
+    ) {
         pruneRecentCommittedSentenceHistory()
 
         for emission in emissions {
-            let deliveryPermission = await committedEmissionDeliveryPermission(for: emission.deliveryToken)
+            // This lock-backed snapshot is deliberately synchronous: once the MainActor
+            // begins a committed sequence, no per-emission actor hop can interleave it.
+            let deliveryPermission = committedEmissionDeliveryPermission(for: emission.deliveryToken)
             guard deliveryPermission != .suppress else {
                 continue
             }
+
+            if shouldInvalidateCommittedDeliveryAfterAuthorizationForTesting {
+                shouldInvalidateCommittedDeliveryAfterAuthorizationForTesting = false
+                invalidateTranscriptDelivery()
+            }
+
             let sentenceTexts = splitCommittedEmissionUnits(in: emission.text)
             var pendingPromotionID = emission.promotionSegmentID
 
@@ -1525,12 +1666,13 @@ final class LiveTranscriptionSession: NSObject, @unchecked Sendable {
                     continue
                 }
 
-                emitCommittedSentence(
+                if emitCommittedSentence(
                     text: preparedSentence,
                     promotionSegmentID: pendingPromotionID,
                     emission: emission
-                )
-                rememberCommittedSentence(preparedSentence)
+                ) {
+                    rememberCommittedSentence(preparedSentence)
+                }
                 pendingPromotionID = nil
             }
         }
