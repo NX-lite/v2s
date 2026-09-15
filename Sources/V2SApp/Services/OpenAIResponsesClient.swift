@@ -1,5 +1,10 @@
 import Foundation
 
+struct CorrectionProviderOutput: Equatable, Sendable {
+    let correctedOriginal: String?
+    let correctedTranslation: String
+}
+
 struct OpenAIResponsesClient: Sendable {
     enum ClientError: Error, Equatable, LocalizedError {
         case missingAPIKey
@@ -7,6 +12,7 @@ struct OpenAIResponsesClient: Sendable {
         case invalidResponse
         case http(status: Int, message: String)
         case imageUnsupported(message: String)
+        case audioUnsupported(message: String)
 
         var errorDescription: String? {
             switch self {
@@ -20,6 +26,8 @@ struct OpenAIResponsesClient: Sendable {
                 return "HTTP \(status): \(message)"
             case .imageUnsupported(let message):
                 return "Image input is not supported by this provider: \(message)"
+            case .audioUnsupported(let message):
+                return "Audio input is not supported by this provider: \(message)"
             }
         }
     }
@@ -89,6 +97,35 @@ struct OpenAIResponsesClient: Sendable {
         }
     }
 
+    func correct(prompt: CorrectionPrompt, audioWAVData: Data?) async throws -> CorrectionProviderOutput {
+        guard prompt.mode != .audio || audioWAVData != nil else { throw ClientError.invalidRequest }
+
+        let configuration = try validatedRequestConfiguration()
+        let response: Response
+        switch configuration.endpoint {
+        case .gemini(let url):
+            response = try await respondGemini(
+                url: url,
+                apiKey: configuration.apiKey,
+                instructions: prompt.instructions,
+                prompt: prompt.userContent,
+                screenshotPNGData: nil,
+                audioWAVData: audioWAVData
+            )
+        case .openAI(let endpoint):
+            response = try await respondOpenAI(
+                endpoint: endpoint,
+                apiKey: configuration.apiKey,
+                model: configuration.model,
+                instructions: prompt.instructions,
+                prompt: prompt.userContent,
+                screenshotPNGData: nil,
+                audioWAVData: audioWAVData
+            )
+        }
+        return try Self.decodeCorrectionOutput(response.text, mode: prompt.mode)
+    }
+
     private var isGeminiProvider: Bool {
         guard let host = Self.baseComponents(from: baseURLString)?.host else { return false }
         return host.caseInsensitiveCompare("generativelanguage.googleapis.com") == .orderedSame
@@ -115,21 +152,35 @@ struct OpenAIResponsesClient: Sendable {
         model: String,
         instructions: String,
         prompt: String,
-        screenshotPNGData: Data?
+        screenshotPNGData: Data?,
+        audioWAVData: Data? = nil
     ) async throws -> Response {
         let request: URLRequest
         switch endpoint {
         case .chat(let url):
             request = try openAIChatRequest(
-                url: url, apiKey: apiKey, model: model, instructions: instructions, prompt: prompt, screenshotPNGData: screenshotPNGData
+                url: url,
+                apiKey: apiKey,
+                model: model,
+                instructions: instructions,
+                prompt: prompt,
+                screenshotPNGData: screenshotPNGData,
+                audioWAVData: audioWAVData
             )
         case .responses(let url):
             request = try openAIResponsesRequest(
-                url: url, apiKey: apiKey, model: model, instructions: instructions, prompt: prompt, screenshotPNGData: screenshotPNGData
+                url: url,
+                apiKey: apiKey,
+                model: model,
+                instructions: instructions,
+                prompt: prompt,
+                screenshotPNGData: screenshotPNGData,
+                audioWAVData: audioWAVData
             )
         }
 
-        let data = try await successfulData(for: request, apiKey: apiKey, imageWasSent: screenshotPNGData != nil)
+        let sentMedia: SentMediaKind = audioWAVData == nil ? (screenshotPNGData == nil ? .none : .image) : .audio
+        let data = try await successfulData(for: request, apiKey: apiKey, sentMedia: sentMedia)
         let text: String
         switch endpoint {
         case .chat:
@@ -146,16 +197,20 @@ struct OpenAIResponsesClient: Sendable {
         apiKey: String,
         instructions: String,
         prompt: String,
-        screenshotPNGData: Data?
+        screenshotPNGData: Data?,
+        audioWAVData: Data? = nil
     ) async throws -> Response {
-        let parts = [GeminiPart(text: prompt)] + (screenshotPNGData.map { [GeminiPart(inlineData: .init(mimeType: "image/png", data: $0.base64EncodedString()))] } ?? [])
+        let parts = [GeminiPart(text: prompt)]
+            + (screenshotPNGData.map { [GeminiPart(inlineData: .init(mimeType: "image/png", data: $0.base64EncodedString()))] } ?? [])
+            + (audioWAVData.map { [GeminiPart(inlineData: .init(mimeType: "audio/wav", data: $0.base64EncodedString()))] } ?? [])
         let body = GeminiGenerateContentRequest(
             systemInstruction: .init(parts: [.init(text: instructions)]),
             contents: [.init(role: "user", parts: parts)],
             generationConfig: .init(maxOutputTokens: 900)
         )
         let request = try jsonRequest(url: url, method: "POST", body: body)
-        let data = try await successfulData(for: request, apiKey: apiKey, imageWasSent: screenshotPNGData != nil)
+        let sentMedia: SentMediaKind = audioWAVData == nil ? (screenshotPNGData == nil ? .none : .image) : .audio
+        let data = try await successfulData(for: request, apiKey: apiKey, sentMedia: sentMedia)
         let text = try Self.decode(GeminiGenerateContentPayload.self, from: data).outputText
         guard !text.isEmpty else { throw ClientError.invalidResponse }
         return Response(text: text, imageWasSent: screenshotPNGData != nil)
@@ -184,14 +239,24 @@ struct OpenAIResponsesClient: Sendable {
     }
 
     private func openAIChatRequest(
-        url: URL, apiKey: String, model: String, instructions: String, prompt: String, screenshotPNGData: Data?
+        url: URL,
+        apiKey: String,
+        model: String,
+        instructions: String,
+        prompt: String,
+        screenshotPNGData: Data?,
+        audioWAVData: Data? = nil
     ) throws -> URLRequest {
         let content: ChatContent
-        if let screenshotPNGData {
-            content = .parts([
-                .init(type: "text", text: prompt),
-                .init(type: "image_url", imageURL: .init(url: "data:image/png;base64,\(screenshotPNGData.base64EncodedString())", detail: "low")),
-            ])
+        if screenshotPNGData != nil || audioWAVData != nil {
+            var parts = [ChatContentPart(type: "text", text: prompt)]
+            if let screenshotPNGData {
+                parts.append(.init(type: "image_url", imageURL: .init(url: "data:image/png;base64,\(screenshotPNGData.base64EncodedString())", detail: "low")))
+            }
+            if let audioWAVData {
+                parts.append(.init(type: "input_audio", inputAudio: .init(data: audioWAVData.base64EncodedString(), format: "wav")))
+            }
+            content = .parts(parts)
         } else {
             content = .text(prompt)
         }
@@ -204,11 +269,20 @@ struct OpenAIResponsesClient: Sendable {
     }
 
     private func openAIResponsesRequest(
-        url: URL, apiKey: String, model: String, instructions: String, prompt: String, screenshotPNGData: Data?
+        url: URL,
+        apiKey: String,
+        model: String,
+        instructions: String,
+        prompt: String,
+        screenshotPNGData: Data?,
+        audioWAVData: Data? = nil
     ) throws -> URLRequest {
         var content = [ResponsesInputPart(type: "input_text", text: prompt)]
         if let screenshotPNGData {
             content.append(.init(type: "input_image", imageURL: "data:image/png;base64,\(screenshotPNGData.base64EncodedString())"))
+        }
+        if let audioWAVData {
+            content.append(.init(type: "input_audio", inputAudio: .init(data: audioWAVData.base64EncodedString(), format: "wav")))
         }
         let body = ResponsesRequest(
             model: model,
@@ -236,7 +310,7 @@ struct OpenAIResponsesClient: Sendable {
         return request
     }
 
-    private func successfulData(for request: URLRequest, apiKey: String, imageWasSent: Bool = false) async throws -> Data {
+    private func successfulData(for request: URLRequest, apiKey: String, sentMedia: SentMediaKind = .none) async throws -> Data {
         let data: Data
         let response: HTTPURLResponse
         do {
@@ -246,8 +320,11 @@ struct OpenAIResponsesClient: Sendable {
         }
         guard (200..<300).contains(response.statusCode) else {
             let message = Self.sanitizedErrorMessage(from: data, apiKey: apiKey) ?? "HTTP \(response.statusCode)"
-            if imageWasSent && Self.isImageCapabilityRejection(status: response.statusCode, message: message) {
+            if sentMedia == .image && Self.isImageCapabilityRejection(status: response.statusCode, message: message) {
                 throw ClientError.imageUnsupported(message: message)
+            }
+            if sentMedia == .audio && Self.isAudioCapabilityRejection(status: response.statusCode, message: message) {
+                throw ClientError.audioUnsupported(message: message)
             }
             throw ClientError.http(status: response.statusCode, message: message)
         }
@@ -257,6 +334,12 @@ struct OpenAIResponsesClient: Sendable {
     private enum RequestEndpoint {
         case openAI(OpenAIEndpoint)
         case gemini(URL)
+    }
+
+    private enum SentMediaKind {
+        case none
+        case image
+        case audio
     }
 
     private enum OpenAIEndpoint {
@@ -410,6 +493,23 @@ struct OpenAIResponsesClient: Sendable {
         }
     }
 
+    private static func decodeCorrectionOutput(_ text: String, mode: CorrectionInputMode) throws -> CorrectionProviderOutput {
+        let output = try decode(CorrectionOutputPayload.self, from: Data(text.utf8))
+        let translation = output.correctedTranslation.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !translation.isEmpty else { throw ClientError.invalidResponse }
+
+        switch mode {
+        case .audio:
+            guard let correctedOriginal = output.correctedOriginal?.trimmingCharacters(in: .whitespacesAndNewlines),
+                  !correctedOriginal.isEmpty else {
+                throw ClientError.invalidResponse
+            }
+            return CorrectionProviderOutput(correctedOriginal: correctedOriginal, correctedTranslation: translation)
+        case .textOnly:
+            return CorrectionProviderOutput(correctedOriginal: nil, correctedTranslation: translation)
+        }
+    }
+
     private static func sanitizedErrorMessage(from data: Data, apiKey: String) -> String? {
         guard let payload = try? JSONDecoder().decode(ProviderErrorPayload.self, from: data) else { return nil }
         let raw = payload.error.message ?? payload.error.status
@@ -421,6 +521,16 @@ struct OpenAIResponsesClient: Sendable {
         var sanitized = message.trimmingCharacters(in: .whitespacesAndNewlines)
         sanitized = sanitized.replacingOccurrences(of: apiKey, with: "[redacted]")
         sanitized = sanitized.replacingOccurrences(of: "authorization", with: "[redacted-header]", options: .caseInsensitive)
+        sanitized = sanitized.replacingOccurrences(
+            of: "(?i)data:[^\\s\\\"']*;base64,[A-Za-z0-9+/]+={0,2}",
+            with: "[redacted-media]",
+            options: .regularExpression
+        )
+        sanitized = sanitized.replacingOccurrences(
+            of: "(?<![A-Za-z0-9+/])[A-Za-z0-9+/]{2,}={1,2}(?![A-Za-z0-9+/=])",
+            with: "[redacted-media]",
+            options: .regularExpression
+        )
         return String(sanitized.prefix(1_000))
     }
 
@@ -433,6 +543,17 @@ struct OpenAIResponsesClient: Sendable {
 
     private static func isImageCapabilityRejection(status: Int, message: String) -> Bool {
         status != 401 && status != 403 && status != 429 && !(500..<600).contains(status) && isImageUnsupportedError(message)
+    }
+
+    private static func isAudioCapabilityRejection(status: Int, message: String) -> Bool {
+        status == 400 && isAudioUnsupportedError(message)
+    }
+
+    private static func isAudioUnsupportedError(_ message: String) -> Bool {
+        let lowercased = message.lowercased()
+        return ["audio", "speech", "voice", "input_audio", "inline_data", "multimodal", "multi-modal"].contains {
+            lowercased.contains($0)
+        }
     }
 }
 
@@ -468,17 +589,28 @@ private struct ChatContentPart: Encodable {
         let detail: String
     }
 
+    struct InputAudio: Encodable {
+        let data: String
+        let format: String
+    }
+
     let type: String
     let text: String?
     let imageURL: ImageURL?
+    let inputAudio: InputAudio?
 
-    init(type: String, text: String? = nil, imageURL: ImageURL? = nil) {
+    init(type: String, text: String? = nil, imageURL: ImageURL? = nil, inputAudio: InputAudio? = nil) {
         self.type = type
         self.text = text
         self.imageURL = imageURL
+        self.inputAudio = inputAudio
     }
 
-    enum CodingKeys: String, CodingKey { case type, text; case imageURL = "image_url" }
+    enum CodingKeys: String, CodingKey {
+        case type, text
+        case imageURL = "image_url"
+        case inputAudio = "input_audio"
+    }
 }
 
 private struct ResponsesRequest: Encodable {
@@ -496,17 +628,28 @@ private struct ResponsesInput: Encodable {
 }
 
 private struct ResponsesInputPart: Encodable {
+    struct InputAudio: Encodable {
+        let data: String
+        let format: String
+    }
+
     let type: String
     let text: String?
     let imageURL: String?
+    let inputAudio: InputAudio?
 
-    init(type: String, text: String? = nil, imageURL: String? = nil) {
+    init(type: String, text: String? = nil, imageURL: String? = nil, inputAudio: InputAudio? = nil) {
         self.type = type
         self.text = text
         self.imageURL = imageURL
+        self.inputAudio = inputAudio
     }
 
-    enum CodingKeys: String, CodingKey { case type, text; case imageURL = "image_url" }
+    enum CodingKeys: String, CodingKey {
+        case type, text
+        case imageURL = "image_url"
+        case inputAudio = "input_audio"
+    }
 }
 
 private struct GeminiGenerateContentRequest: Encodable {
@@ -574,6 +717,11 @@ private struct GeminiGenerateContentPayload: Decodable {
         candidates.first?.content.parts.compactMap(\.text).joined(separator: "\n")
             .trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
     }
+}
+
+private struct CorrectionOutputPayload: Decodable {
+    let correctedOriginal: String?
+    let correctedTranslation: String
 }
 
 private struct OpenAIModelsPayload: Decodable {
