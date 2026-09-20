@@ -43,6 +43,7 @@
 - Multi-source audio selection for microphones and running macOS apps, with per-source input and output languages.
 - Speech transcription powered by Apple's Speech frameworks, preferring on-device recognition and discovering the languages available on the current Mac.
 - On-device translation powered by Apple Translation.
+- Optional real-time provider correction after the Apple subtitle appears, with per-source controls and bounded request queues.
 - Transcript summarization powered by Apple Intelligence, falling back to an on-device extractive summary when Apple Intelligence is unavailable.
 - Core ML Silero VAD, without an ONNX Runtime dependency.
 - Single-instance launch handling and overlay styling controls so the subtitle bar stays readable on top of real work.
@@ -63,11 +64,24 @@ v2s asks Apple's Speech and Translation frameworks which languages the current M
 - Speech recognition prefers Apple's on-device models, and v2s picks a language variant that has a local model whenever one exists.
 - Some languages have no on-device model on a given Mac — this is common on Intel Macs, and for languages outside the modern Speech stack. Those run through Apple's server-based recognition, which needs a network connection, is subject to Apple's service quotas, and sends captured speech to Apple under Apple's privacy terms.
 - Voice activity detection runs the [Silero VAD](THIRD_PARTY_NOTICES.md) model through Apple's system Core ML framework; v2s bundles no third-party inference runtime, and the [conversion is reproducible](scripts/convert_silero_vad_coreml.py).
+- Real-time correction is off by default and uses its own API key, base URL, and model settings, independently of the optional Ask/Follow Up assistant. When enabled, the Apple Speech/Translation subtitle is always displayed before any provider correction arrives.
+- An audio correction request can send the completed sentence WAV, local original and translation text, source ID and name, source and target language metadata, and up to the latest six successfully corrected context entries. A valid audio response may update both subtitle lines.
+- If the configured provider explicitly rejects audio, v2s retries without audio and keeps correction in translation-only text mode for the rest of that session. Text-only correction does not rewrite the original line.
+- Continuous correction never captures or sends a screenshot. Current-screen capture belongs only to the optional assistant and happens only after an explicit Follow Up or Ask.
 - The assistant is optional. It sends no assistant request, transcript, screen image, or OCR data until you choose an explicit **Follow Up** or **Ask** action.
 - Only after an explicit Follow Up or Ask, v2s may send the configured transcript (including timestamps and source/language context), skills prompt, current-screen image, and OCR text to your configured provider. What that provider retains or processes is governed by its own terms.
 - If the provider rejects image input, v2s makes one text-only fallback request without the image while retaining available OCR text. Missing screen permission also degrades to text-only context; it does not block the request.
 - Model discovery and the connection test contact the configured provider. They are configuration tools, not a claim that any particular provider, account, or model has been tested by this project.
 - The API key is stored only in local settings on this Mac. Model discovery and API test use it to contact your configured provider; transcript, current-screen image, and OCR text are sent only after an explicit Follow Up or Ask.
+- Any correction or assistant data sent to a configured third-party provider is processed and retained according to that provider's terms and settings.
+
+## Optional real-time correction
+
+Real-time correction is disabled by default. Enable it in Settings and configure its separate API key, base URL, and model. For each input source, you can disable correction or isolate its context. An isolated source uses only its own successful corrections; otherwise a request may use successful corrected entries from other sources in the same session.
+
+The Apple Speech/Translation subtitle is always displayed first, so provider latency does not delay the local caption pipeline. This ordering does not guarantee on-device speech recognition: if the selected language has no on-device model on this Mac, Apple Speech uses its server-based path as described above.
+
+When an eligible completed-sentence WAV is available, correction sends that audio together with the local subtitle and bounded metadata/context described in Privacy. If the provider explicitly rejects audio, the current request is retried without audio and the session switches to translation-only text correction. Across all sources, v2s runs at most two correction requests at once. Each source keeps at most three waiting jobs; on overflow, v2s skips the oldest waiting job and retains the active request.
 
 ## Optional assistant
 
