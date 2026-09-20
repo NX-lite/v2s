@@ -3,6 +3,24 @@ import Testing
 @testable import v2s
 
 @Suite @MainActor struct StatusBarPopoverViewTests {
+    @Test func correctionPresentationMapsModesAndWarningToLocalizedCompactText() {
+        #expect(
+            CorrectionStatusPresentation.text(for: .audio, languageID: "en")
+                == "Audio correction"
+        )
+        #expect(
+            CorrectionStatusPresentation.text(for: .textOnly, languageID: "zh-Hans")
+                == "文本翻译纠错"
+        )
+        #expect(
+            CorrectionStatusPresentation.text(
+                for: .warning("Correction request failed."),
+                languageID: "fr"
+            ) == "La correction en temps réel a échoué."
+        )
+        #expect(CorrectionStatusPresentation.text(for: .disabled, languageID: "en") == nil)
+    }
+
     @Test func assistantActionDispatchesThroughModelAndClosesForAnEmptyTranscript() {
         let settingsURL = FileManager.default.temporaryDirectory
             .appendingPathComponent("v2s-status-popover-assistant-\(UUID().uuidString).json")

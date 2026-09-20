@@ -181,6 +181,12 @@ struct SettingsView: View {
                     LanguageResourcesFooter(model: model)
                 }
                 settingsCard {
+                    CorrectionSettingsSection(
+                        correction: model.correction,
+                        interfaceLanguageID: model.resolvedInterfaceLanguageID
+                    )
+                }
+                settingsCard {
                     AssistantSettingsSection(
                         assistant: model.assistant,
                         interfaceLanguageID: model.resolvedInterfaceLanguageID
@@ -533,6 +539,12 @@ struct SettingsView: View {
                         )
                         .disabled(model.isLanguagePairLocked)
                     }
+                    SourceCorrectionPolicyRows(
+                        model: model,
+                        correction: model.correction,
+                        source: source,
+                        interfaceLanguageID: model.resolvedInterfaceLanguageID
+                    )
                 }
             }
         }
@@ -566,6 +578,50 @@ struct SettingsView: View {
                 }
             }
         )
+    }
+}
+
+private struct SourceCorrectionPolicyRows: View {
+    let model: AppModel
+    @ObservedObject var correction: RealtimeCorrectionCoordinator
+    let source: InputSource
+    let interfaceLanguageID: String
+
+    var body: some View {
+        SettingsControlRow(label: localized(.enableCorrectionForSource)) {
+            Toggle("", isOn: correctionEnabledBinding)
+                .toggleStyle(.switch)
+                .labelsHidden()
+        }
+        .disabled(correction.settings.isEnabled == false)
+
+        SettingsControlRow(label: localized(.isolatedCorrectionContext)) {
+            Toggle("", isOn: isolatedContextBinding)
+                .toggleStyle(.switch)
+                .labelsHidden()
+        }
+        .disabled(
+            correction.settings.isEnabled == false
+                || model.isCorrectionEnabled(for: source) == false
+        )
+    }
+
+    private var correctionEnabledBinding: Binding<Bool> {
+        Binding(
+            get: { model.isCorrectionEnabled(for: source) },
+            set: { model.setCorrectionEnabled($0, for: source) }
+        )
+    }
+
+    private var isolatedContextBinding: Binding<Bool> {
+        Binding(
+            get: { model.isCorrectionContextIsolated(for: source) },
+            set: { model.setCorrectionContextIsolated($0, for: source) }
+        )
+    }
+
+    private func localized(_ key: AppTextKey) -> String {
+        AppLocalization.string(key, languageID: interfaceLanguageID)
     }
 }
 

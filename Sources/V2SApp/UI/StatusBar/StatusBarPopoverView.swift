@@ -11,6 +11,21 @@ enum OverlayPopoverActions {
     }
 }
 
+enum CorrectionStatusPresentation {
+    static func text(for status: CorrectionStatus, languageID: String) -> String? {
+        switch status {
+        case .disabled:
+            nil
+        case .ready, .audio:
+            AppLocalization.string(.audioCorrection, languageID: languageID)
+        case .textOnly:
+            AppLocalization.string(.textTranslationCorrection, languageID: languageID)
+        case .warning(let detail):
+            AppLocalization.correctionWarningText(detail, languageID: languageID)
+        }
+    }
+}
+
 struct StatusBarPopoverView: View {
     @ObservedObject var model: AppModel
     let closePopover: () -> Void
@@ -26,6 +41,10 @@ struct StatusBarPopoverView: View {
                 VStack(alignment: .leading, spacing: 20) {
                     sourceSection
                     languageSection
+                    CorrectionStatusRow(
+                        correction: model.correction,
+                        interfaceLanguageID: model.resolvedInterfaceLanguageID
+                    )
                     overlaySection
                     assistantSection
                 }
@@ -316,6 +335,33 @@ struct StatusBarPopoverView: View {
             get: { model.overlayStyle.sourceFontSize },
             set: { v in model.updateOverlayStyle { $0.sourceFontSize = v } }
         )
+    }
+}
+
+private struct CorrectionStatusRow: View {
+    @ObservedObject var correction: RealtimeCorrectionCoordinator
+    let interfaceLanguageID: String
+
+    var body: some View {
+        if correction.settings.isEnabled,
+           let text = CorrectionStatusPresentation.text(
+               for: correction.status,
+               languageID: interfaceLanguageID
+           ) {
+            Label(text, systemImage: statusIsWarning ? "exclamationmark.triangle" : "waveform.badge.plus")
+                .font(.caption)
+                .foregroundStyle(statusIsWarning ? .orange : .secondary)
+                .lineLimit(2)
+                .fixedSize(horizontal: false, vertical: true)
+                .frame(maxWidth: .infinity, alignment: .leading)
+        }
+    }
+
+    private var statusIsWarning: Bool {
+        if case .warning = correction.status {
+            return true
+        }
+        return false
     }
 }
 

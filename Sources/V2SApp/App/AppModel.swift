@@ -409,6 +409,38 @@ final class AppModel: ObservableObject {
         setOutputLanguageID(languageID, for: source)
     }
 
+    func isCorrectionEnabled(for source: InputSource) -> Bool {
+        correction.settings.isEnabled(for: source.id)
+    }
+
+    func setCorrectionEnabled(_ isEnabled: Bool, for source: InputSource) {
+        var settings = correction.settings
+        var disabledSourceIDs = Set(settings.disabledSourceIDs)
+        if isEnabled {
+            disabledSourceIDs.remove(source.id)
+        } else {
+            disabledSourceIDs.insert(source.id)
+        }
+        settings.disabledSourceIDs = Array(disabledSourceIDs)
+        correction.settings = settings
+    }
+
+    func isCorrectionContextIsolated(for source: InputSource) -> Bool {
+        correction.settings.usesIsolatedContext(for: source.id)
+    }
+
+    func setCorrectionContextIsolated(_ isIsolated: Bool, for source: InputSource) {
+        var settings = correction.settings
+        var isolatedSourceIDs = Set(settings.isolatedContextSourceIDs)
+        if isIsolated {
+            isolatedSourceIDs.insert(source.id)
+        } else {
+            isolatedSourceIDs.remove(source.id)
+        }
+        settings.isolatedContextSourceIDs = Array(isolatedSourceIDs)
+        correction.settings = settings
+    }
+
     var sessionButtonTitle: String {
         if sessionState == .running {
             return localized(.stop)

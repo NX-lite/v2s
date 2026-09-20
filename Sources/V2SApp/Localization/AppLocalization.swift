@@ -170,6 +170,17 @@ enum AppTextKey: String {
     case checkForUpdatesAutomatically
     case checkForUpdates
     case assistant
+    case realtimeCorrection
+    case enableCorrection
+    case audioCorrection
+    case textTranslationCorrection
+    case enableCorrectionForSource
+    case isolatedCorrectionContext
+    case correctionQueueSkipped
+    case invalidCorrectionConfiguration
+    case correctionProviderFailure
+    case correctionAudioFallback
+    case correctionPrivacyDisclosure
     case followUp
     case askAssistant
     case apiKey
@@ -205,6 +216,20 @@ enum AppTextKey: String {
 }
 
 enum AppLocalization {
+    static let correctionTextKeys: [AppTextKey] = [
+        .realtimeCorrection,
+        .enableCorrection,
+        .audioCorrection,
+        .textTranslationCorrection,
+        .enableCorrectionForSource,
+        .isolatedCorrectionContext,
+        .correctionQueueSkipped,
+        .invalidCorrectionConfiguration,
+        .correctionProviderFailure,
+        .correctionAudioFallback,
+        .correctionPrivacyDisclosure,
+    ]
+
     static let assistantTextKeys: [AppTextKey] = [
         .assistant,
         .scrollToLatestAssistantReply,
@@ -349,6 +374,21 @@ enum AppLocalization {
                 return string(.assistantRequestFailed, languageID: languageID)
             }
             return string(.assistantRequestFailedFormat, languageID: languageID, detail)
+        }
+    }
+
+    static func correctionWarningText(_ detail: String, languageID: String) -> String {
+        switch detail {
+        case "Correction queue skipped.":
+            string(.correctionQueueSkipped, languageID: languageID)
+        case "Correction settings are invalid.":
+            string(.invalidCorrectionConfiguration, languageID: languageID)
+        case "Correction request failed.":
+            string(.correctionProviderFailure, languageID: languageID)
+        case "Audio correction is unavailable; using text-only correction.":
+            string(.correctionAudioFallback, languageID: languageID)
+        default:
+            detail
         }
     }
 
@@ -593,6 +633,17 @@ enum AppLocalization {
             "checkForUpdatesAutomatically": "Check for Updates Automatically",
             "checkForUpdates": "Check for Updates",
             "assistant": "Assistant",
+            "realtimeCorrection": "Real-time Correction",
+            "enableCorrection": "Enable Correction",
+            "audioCorrection": "Audio correction",
+            "textTranslationCorrection": "Text translation correction",
+            "enableCorrectionForSource": "Enable Correction for This Source",
+            "isolatedCorrectionContext": "Isolated Context",
+            "correctionQueueSkipped": "A correction was skipped because the queue is full.",
+            "invalidCorrectionConfiguration": "Real-time correction settings are invalid.",
+            "correctionProviderFailure": "Real-time correction failed.",
+            "correctionAudioFallback": "Audio correction is unavailable; using text translation correction.",
+            "correctionPrivacyDisclosure": "While enabled, completed sentence audio and text are continuously sent to your configured provider for correction. Screenshots are never included. The API key stays in local settings.",
             "followUp": "Follow Up",
             "askAssistant": "Ask",
             "apiKey": "API Key",
@@ -791,6 +842,17 @@ enum AppLocalization {
             "checkForUpdatesAutomatically": "自动检查更新",
             "checkForUpdates": "检查更新",
             "assistant": "助手",
+            "realtimeCorrection": "实时纠错",
+            "enableCorrection": "启用纠错",
+            "audioCorrection": "音频纠错",
+            "textTranslationCorrection": "文本翻译纠错",
+            "enableCorrectionForSource": "为此来源启用纠错",
+            "isolatedCorrectionContext": "独立上下文",
+            "correctionQueueSkipped": "纠错队列已满，已跳过一次纠错。",
+            "invalidCorrectionConfiguration": "实时纠错配置无效。",
+            "correctionProviderFailure": "实时纠错失败。",
+            "correctionAudioFallback": "音频纠错不可用，已改用文本翻译纠错。",
+            "correctionPrivacyDisclosure": "启用后，已完成句子的音频和文本会持续发送给你配置的提供商进行纠错。绝不会包含屏幕截图。API 密钥仅保存在本地设置中。",
             "followUp": "追问",
             "askAssistant": "提问",
             "apiKey": "API 密钥",
@@ -989,6 +1051,17 @@ enum AppLocalization {
             "checkForUpdatesAutomatically": "Buscar actualizaciones automáticamente",
             "checkForUpdates": "Buscar actualizaciones",
             "assistant": "Asistente",
+            "realtimeCorrection": "Corrección en tiempo real",
+            "enableCorrection": "Activar corrección",
+            "audioCorrection": "Corrección de audio",
+            "textTranslationCorrection": "Corrección de traducción de texto",
+            "enableCorrectionForSource": "Activar corrección para esta fuente",
+            "isolatedCorrectionContext": "Contexto aislado",
+            "correctionQueueSkipped": "Se omitió una corrección porque la cola está llena.",
+            "invalidCorrectionConfiguration": "La configuración de corrección en tiempo real no es válida.",
+            "correctionProviderFailure": "La corrección en tiempo real ha fallado.",
+            "correctionAudioFallback": "La corrección de audio no está disponible; se usará la corrección de traducción de texto.",
+            "correctionPrivacyDisclosure": "Mientras está activada, el audio y el texto de las frases completadas se envían continuamente al proveedor configurado para su corrección. Nunca se incluyen capturas de pantalla. La clave de API permanece en los ajustes locales.",
             "followUp": "Seguimiento",
             "askAssistant": "Preguntar",
             "apiKey": "Clave de API",
@@ -1187,6 +1260,17 @@ enum AppLocalization {
             "checkForUpdatesAutomatically": "Automatisch nach Updates suchen",
             "checkForUpdates": "Nach Updates suchen",
             "assistant": "Assistent",
+            "realtimeCorrection": "Echtzeitkorrektur",
+            "enableCorrection": "Korrektur aktivieren",
+            "audioCorrection": "Audiokorrektur",
+            "textTranslationCorrection": "Textübersetzungskorrektur",
+            "enableCorrectionForSource": "Korrektur für diese Quelle aktivieren",
+            "isolatedCorrectionContext": "Isolierter Kontext",
+            "correctionQueueSkipped": "Eine Korrektur wurde übersprungen, weil die Warteschlange voll ist.",
+            "invalidCorrectionConfiguration": "Die Einstellungen für die Echtzeitkorrektur sind ungültig.",
+            "correctionProviderFailure": "Die Echtzeitkorrektur ist fehlgeschlagen.",
+            "correctionAudioFallback": "Audiokorrektur ist nicht verfügbar; stattdessen wird die Textübersetzung korrigiert.",
+            "correctionPrivacyDisclosure": "Wenn aktiviert, werden Audio und Text abgeschlossener Sätze fortlaufend zur Korrektur an den konfigurierten Anbieter gesendet. Screenshots werden niemals einbezogen. Der API-Schlüssel bleibt in den lokalen Einstellungen.",
             "followUp": "Nachfrage",
             "askAssistant": "Fragen",
             "apiKey": "API-Schlüssel",
@@ -1385,6 +1469,17 @@ enum AppLocalization {
             "checkForUpdatesAutomatically": "アップデートを自動的に確認",
             "checkForUpdates": "アップデートを確認",
             "assistant": "アシスタント",
+            "realtimeCorrection": "リアルタイム補正",
+            "enableCorrection": "補正を有効にする",
+            "audioCorrection": "音声補正",
+            "textTranslationCorrection": "テキスト翻訳補正",
+            "enableCorrectionForSource": "このソースの補正を有効にする",
+            "isolatedCorrectionContext": "独立したコンテキスト",
+            "correctionQueueSkipped": "キューがいっぱいのため、補正を1件スキップしました。",
+            "invalidCorrectionConfiguration": "リアルタイム補正の設定が無効です。",
+            "correctionProviderFailure": "リアルタイム補正に失敗しました。",
+            "correctionAudioFallback": "音声補正を利用できないため、テキスト翻訳補正を使用します。",
+            "correctionPrivacyDisclosure": "有効にすると、完了した文の音声とテキストが補正のため設定済みプロバイダーへ継続的に送信されます。スクリーンショットは一切含まれません。API キーはローカル設定に保存されます。",
             "followUp": "追加質問",
             "askAssistant": "質問",
             "apiKey": "API キー",
@@ -1583,6 +1678,17 @@ enum AppLocalization {
             "checkForUpdatesAutomatically": "Rechercher les mises à jour automatiquement",
             "checkForUpdates": "Rechercher les mises à jour",
             "assistant": "Assistant",
+            "realtimeCorrection": "Correction en temps réel",
+            "enableCorrection": "Activer la correction",
+            "audioCorrection": "Correction audio",
+            "textTranslationCorrection": "Correction de la traduction du texte",
+            "enableCorrectionForSource": "Activer la correction pour cette source",
+            "isolatedCorrectionContext": "Contexte isolé",
+            "correctionQueueSkipped": "Une correction a été ignorée car la file d’attente est pleine.",
+            "invalidCorrectionConfiguration": "Les réglages de correction en temps réel ne sont pas valides.",
+            "correctionProviderFailure": "La correction en temps réel a échoué.",
+            "correctionAudioFallback": "La correction audio est indisponible ; la correction de la traduction du texte sera utilisée.",
+            "correctionPrivacyDisclosure": "Lorsqu’elle est activée, l’audio et le texte des phrases terminées sont envoyés en continu au fournisseur configuré pour correction. Les captures d’écran ne sont jamais incluses. La clé API reste dans les réglages locaux.",
             "followUp": "Suivi",
             "askAssistant": "Demander",
             "apiKey": "Clé API",
@@ -1781,6 +1887,17 @@ enum AppLocalization {
             "checkForUpdatesAutomatically": "자동으로 업데이트 확인",
             "checkForUpdates": "업데이트 확인",
             "assistant": "어시스턴트",
+            "realtimeCorrection": "실시간 교정",
+            "enableCorrection": "교정 활성화",
+            "audioCorrection": "오디오 교정",
+            "textTranslationCorrection": "텍스트 번역 교정",
+            "enableCorrectionForSource": "이 소스에 교정 활성화",
+            "isolatedCorrectionContext": "격리된 컨텍스트",
+            "correctionQueueSkipped": "대기열이 가득 차 교정 하나를 건너뛰었습니다.",
+            "invalidCorrectionConfiguration": "실시간 교정 설정이 올바르지 않습니다.",
+            "correctionProviderFailure": "실시간 교정에 실패했습니다.",
+            "correctionAudioFallback": "오디오 교정을 사용할 수 없어 텍스트 번역 교정을 사용합니다.",
+            "correctionPrivacyDisclosure": "활성화하면 완료된 문장의 오디오와 텍스트가 교정을 위해 설정된 제공업체로 계속 전송됩니다. 스크린샷은 절대 포함되지 않습니다. API 키는 로컬 설정에 보관됩니다.",
             "followUp": "추가 질문",
             "askAssistant": "질문",
             "apiKey": "API 키",
@@ -1979,6 +2096,17 @@ enum AppLocalization {
             "checkForUpdatesAutomatically": "التحقق من التحديثات تلقائيًا",
             "checkForUpdates": "التحقق من التحديثات",
             "assistant": "المساعد",
+            "realtimeCorrection": "التصحيح في الوقت الفعلي",
+            "enableCorrection": "تمكين التصحيح",
+            "audioCorrection": "تصحيح الصوت",
+            "textTranslationCorrection": "تصحيح ترجمة النص",
+            "enableCorrectionForSource": "تمكين التصحيح لهذا المصدر",
+            "isolatedCorrectionContext": "سياق معزول",
+            "correctionQueueSkipped": "تم تخطي تصحيح لأن قائمة الانتظار ممتلئة.",
+            "invalidCorrectionConfiguration": "إعدادات التصحيح في الوقت الفعلي غير صالحة.",
+            "correctionProviderFailure": "فشل التصحيح في الوقت الفعلي.",
+            "correctionAudioFallback": "تصحيح الصوت غير متاح؛ سيُستخدم تصحيح ترجمة النص.",
+            "correctionPrivacyDisclosure": "عند التمكين، يُرسل صوت الجمل المكتملة ونصها باستمرار إلى الموفّر الذي أعددته للتصحيح. لا تُضمّن لقطات الشاشة مطلقًا. يبقى مفتاح API في الإعدادات المحلية.",
             "followUp": "متابعة",
             "askAssistant": "اسأل",
             "apiKey": "مفتاح API",
@@ -2177,6 +2305,17 @@ enum AppLocalization {
             "checkForUpdatesAutomatically": "Verificar atualizações automaticamente",
             "checkForUpdates": "Verificar atualizações",
             "assistant": "Assistente",
+            "realtimeCorrection": "Correção em tempo real",
+            "enableCorrection": "Ativar correção",
+            "audioCorrection": "Correção de áudio",
+            "textTranslationCorrection": "Correção da tradução de texto",
+            "enableCorrectionForSource": "Ativar correção para esta fonte",
+            "isolatedCorrectionContext": "Contexto isolado",
+            "correctionQueueSkipped": "Uma correção foi ignorada porque a fila está cheia.",
+            "invalidCorrectionConfiguration": "As configurações de correção em tempo real são inválidas.",
+            "correctionProviderFailure": "A correção em tempo real falhou.",
+            "correctionAudioFallback": "A correção de áudio não está disponível; será usada a correção da tradução de texto.",
+            "correctionPrivacyDisclosure": "Quando ativada, o áudio e o texto das frases concluídas são enviados continuamente ao provedor configurado para correção. Capturas de tela nunca são incluídas. A chave de API permanece nas configurações locais.",
             "followUp": "Acompanhar",
             "askAssistant": "Perguntar",
             "apiKey": "Chave de API",
@@ -2375,6 +2514,17 @@ enum AppLocalization {
             "checkForUpdatesAutomatically": "Автоматически проверять обновления",
             "checkForUpdates": "Проверить обновления",
             "assistant": "Ассистент",
+            "realtimeCorrection": "Исправление в реальном времени",
+            "enableCorrection": "Включить исправление",
+            "audioCorrection": "Исправление по аудио",
+            "textTranslationCorrection": "Исправление перевода текста",
+            "enableCorrectionForSource": "Включить исправление для этого источника",
+            "isolatedCorrectionContext": "Изолированный контекст",
+            "correctionQueueSkipped": "Одно исправление пропущено, потому что очередь заполнена.",
+            "invalidCorrectionConfiguration": "Параметры исправления в реальном времени недействительны.",
+            "correctionProviderFailure": "Не удалось выполнить исправление в реальном времени.",
+            "correctionAudioFallback": "Исправление по аудио недоступно; используется исправление перевода текста.",
+            "correctionPrivacyDisclosure": "Когда функция включена, аудио и текст завершённых предложений непрерывно отправляются настроенному поставщику для исправления. Снимки экрана никогда не включаются. Ключ API остаётся в локальных настройках.",
             "followUp": "Уточнить",
             "askAssistant": "Спросить",
             "apiKey": "Ключ API",

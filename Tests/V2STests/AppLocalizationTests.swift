@@ -13,6 +13,38 @@ import Testing
         }
     }
 
+    @Test func everyInterfaceLanguageDefinesEveryCorrectionStringDirectly() {
+        for language in LanguageCatalog.interface {
+            for key in AppLocalization.correctionTextKeys {
+                #expect(
+                    AppLocalization.hasLocalizedString(key, languageID: language.id),
+                    "\(language.id) is missing \(key.rawValue)"
+                )
+            }
+        }
+    }
+
+    @Test func correctionSemanticWarningsAreLocalizedWithoutReplacingSanitizedProviderDetail() {
+        #expect(
+            AppLocalization.correctionWarningText(
+                "Correction settings are invalid.",
+                languageID: "zh-Hans"
+            ) == "实时纠错配置无效。"
+        )
+        #expect(
+            AppLocalization.correctionWarningText(
+                "Correction request failed.",
+                languageID: "de"
+            ) == "Die Echtzeitkorrektur ist fehlgeschlagen."
+        )
+        #expect(
+            AppLocalization.correctionWarningText(
+                "Sanitized provider detail",
+                languageID: "zh-Hans"
+            ) == "Sanitized provider detail"
+        )
+    }
+
     @Test func assistantSemanticTextUsesLocalizedLabelsAndPreservesProviderDetail() {
         #expect(AppLocalization.assistantActionTitle(.followUp, languageID: "en") == "Follow Up")
         #expect(AppLocalization.assistantActionTitle(.ask, languageID: "zh-Hans") == "提问")

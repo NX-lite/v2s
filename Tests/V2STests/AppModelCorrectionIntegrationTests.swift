@@ -266,7 +266,7 @@ import Testing
         try await waitUntil { await fixture.responder.callCount() == 2 }
         try await fixture.responder.associateNextCall(with: activeCaptionID)
         fixture.model.clearTranscript()
-        fixture.model.correction.settings.disabledSourceIDs = [fixture.microphone.id]
+        fixture.model.setCorrectionEnabled(false, for: fixture.microphone)
 
         for index in 0 ..< fixture.model.overlayHistoryLimitForTesting {
             fixture.model.commitLocalCaptionForTesting(
@@ -831,7 +831,7 @@ import Testing
         try await fixture.responder.associateNextCall(with: microphoneCaptionID)
         try await fixture.responder.associateNextCall(with: applicationCaptionID)
 
-        fixture.model.correction.settings.disabledSourceIDs = [fixture.microphone.id]
+        fixture.model.setCorrectionEnabled(false, for: fixture.microphone)
         try await waitUntil {
             let microphoneEnabled = await microphoneSession.correctionAudioCaptureEnabledForTesting()
             let applicationEnabled = await applicationSession.correctionAudioCaptureEnabledForTesting()
