@@ -24,7 +24,13 @@ import Testing
         }
     }
 
-    @Test func correctionSemanticWarningsAreLocalizedWithoutReplacingSanitizedProviderDetail() {
+    @Test func correctionSemanticWarningsMapKnownCasesToLocalizedText() {
+        #expect(
+            AppLocalization.correctionWarningText(
+                "Correction queue skipped.",
+                languageID: "en"
+            ) == "A correction was skipped because the queue is full."
+        )
         #expect(
             AppLocalization.correctionWarningText(
                 "Correction settings are invalid.",
@@ -39,9 +45,23 @@ import Testing
         )
         #expect(
             AppLocalization.correctionWarningText(
-                "Sanitized provider detail",
+                "Audio correction is unavailable; using text-only correction.",
+                languageID: "en"
+            ) == "Audio correction is unavailable; using text translation correction."
+        )
+    }
+
+    @Test(arguments: [
+        "Sanitized provider detail",
+        "Provider rejected transcript: private meeting text",
+        "Audio failure at /Users/alice/Secret/session.wav",
+    ])
+    func unknownCorrectionWarningsUseLocalizedProviderFailure(_ detail: String) {
+        #expect(
+            AppLocalization.correctionWarningText(
+                detail,
                 languageID: "zh-Hans"
-            ) == "Sanitized provider detail"
+            ) == "实时纠错失败。"
         )
     }
 

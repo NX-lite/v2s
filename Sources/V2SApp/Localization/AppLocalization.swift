@@ -388,7 +388,7 @@ enum AppLocalization {
         case "Audio correction is unavailable; using text-only correction.":
             string(.correctionAudioFallback, languageID: languageID)
         default:
-            detail
+            string(.correctionProviderFailure, languageID: languageID)
         }
     }
 
