@@ -24,6 +24,43 @@ import Testing
         }
     }
 
+    @Test func correctionPrivacyDisclosureNamesEveryTransmittedDataClassAndExcludesScreenshots() {
+        let englishDisclosure = AppLocalization.string(
+            .correctionPrivacyDisclosure,
+            languageID: "en"
+        )
+        for phrase in [
+            "completed sentence audio",
+            "local subtitle text",
+            "language metadata",
+            "source labels",
+            "corrected context",
+            "Screenshots are never included",
+            "API key stays in local settings",
+        ] {
+            #expect(englishDisclosure.contains(phrase), "English disclosure is missing: \(phrase)")
+        }
+
+        let simplifiedChineseDisclosure = AppLocalization.string(
+            .correctionPrivacyDisclosure,
+            languageID: "zh-Hans"
+        )
+        for phrase in [
+            "已完成句子的音频",
+            "本地字幕文本",
+            "语言元数据",
+            "来源标签",
+            "纠正后的上下文",
+            "绝不会包含屏幕截图",
+            "API 密钥仅保存在本地设置中",
+        ] {
+            #expect(
+                simplifiedChineseDisclosure.contains(phrase),
+                "Simplified Chinese disclosure is missing: \(phrase)"
+            )
+        }
+    }
+
     @Test func correctionSemanticWarningsMapKnownCasesToLocalizedText() {
         #expect(
             AppLocalization.correctionWarningText(
