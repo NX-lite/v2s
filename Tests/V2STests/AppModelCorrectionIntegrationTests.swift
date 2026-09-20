@@ -129,6 +129,43 @@ import Testing
         #expect(fixture.model.transcriptEntries.first?.translatedText == "old translation")
     }
 
+    @Test func unknownCurrentGenerationCorrectionResultIsStrictNoOp() async throws {
+        let fixture = makeFixture()
+        defer { fixture.removeSettingsFile() }
+        fixture.model.beginCorrectionSessionForTesting()
+        let unknownCaptionID = UUID()
+        let overlayBefore = fixture.model.overlayState
+        let transcriptBefore = fixture.model.transcriptEntries
+
+        fixture.model.correction.enqueue(CorrectionJob(
+            captionID: unknownCaptionID,
+            sessionGeneration: fixture.model.correction.sessionGeneration,
+            capturedAt: Date(),
+            sourceID: fixture.microphone.id,
+            sourceName: fixture.microphone.name,
+            sourceLanguageID: "en",
+            targetLanguageID: "zh-Hans",
+            localOriginal: "unknown local original",
+            localTranslation: "unknown local translation",
+            audioWAVData: nil
+        ))
+        try await waitUntil { await fixture.responder.callCount() == 1 }
+        #expect(fixture.model.correctedCaptionCountForTesting == 0)
+
+        await fixture.responder.release(
+            captionID: unknownCaptionID,
+            output: .init(
+                correctedOriginal: nil,
+                correctedTranslation: "unknown corrected translation"
+            )
+        )
+        try await waitForQuiescence()
+
+        #expect(fixture.model.correctedCaptionCountForTesting == 0)
+        #expect(fixture.model.overlayState == overlayBefore)
+        #expect(fixture.model.transcriptEntries == transcriptBefore)
+    }
+
     @Test func disabledPoliciesDoNotSubmitWhileEnabledSiblingStillDoes() async throws {
         let globallyDisabled = makeFixture(correctionSettings: configuredCorrectionSettings(isEnabled: false))
         defer { globallyDisabled.removeSettingsFile() }
@@ -376,6 +413,62 @@ import Testing
         #expect(await failed.correctionAudioCaptureEnabledForTesting() == false)
     }
 
+    @Test(arguments: CorrectionProviderIdentityField.allCases)
+    func providerIdentityChangeDropsPendingWAVBeforeSubmittingLocalText(
+        _ field: CorrectionProviderIdentityField
+    ) async throws {
+        let fixture = makeFixture()
+        defer { fixture.removeSettingsFile() }
+        let session = LiveTranscriptionSession()
+        fixture.model.beginCorrectionSessionForTesting()
+        fixture.model.registerSuccessfulLiveSessionForTesting(session, source: fixture.microphone)
+        try await waitUntil { await session.correctionAudioCaptureEnabledForTesting() }
+
+        let captionID = fixture.model.enqueuePendingLocalCaptionForTesting(
+            source: fixture.microphone,
+            original: "pending before provider change",
+            audioWAVData: sampleWAV
+        )
+        var replacementSettings = fixture.model.correction.settings
+        field.replace(in: &replacementSettings)
+        fixture.model.correction.settings = replacementSettings
+        fixture.model.finalizePendingLocalCaptionForTesting(
+            captionID: captionID,
+            translation: "local after provider change"
+        )
+
+        try await waitUntil { await fixture.responder.callCount() == 1 }
+        #expect(await fixture.responder.requestSettings(call: 0) == replacementSettings)
+        #expect(await fixture.responder.audioPresence() == [false])
+        #expect(await fixture.responder.requestModes() == [.textOnly])
+        #expect(await fixture.responder.currentLocalTranslations() == ["local after provider change"])
+    }
+
+    @Test(arguments: CorrectionProviderIdentityField.allCases)
+    func providerIdentityChangeClearsAndRearmsLiveSentenceAudioWithoutReplacingSession(
+        _ field: CorrectionProviderIdentityField
+    ) async throws {
+        let fixture = makeFixture()
+        defer { fixture.removeSettingsFile() }
+        let session = LiveTranscriptionSession()
+        fixture.model.beginCorrectionSessionForTesting()
+        fixture.model.registerSuccessfulLiveSessionForTesting(session, source: fixture.microphone)
+        try await waitUntil { await session.correctionAudioCaptureEnabledForTesting() }
+        try await fillAudioBuffer(session)
+
+        var replacementSettings = fixture.model.correction.settings
+        field.replace(in: &replacementSettings)
+        fixture.model.correction.settings = replacementSettings
+
+        try await waitUntil {
+            let enabled = await session.correctionAudioCaptureEnabledForTesting()
+            let frameCount = await session.correctionAudioFrameCountForTesting()
+            return enabled && frameCount == 0
+        }
+        #expect(fixture.model.liveTranscriptionSessionCountForTesting == 1)
+        #expect(await session.correctionAudioCaptureEnabledForTesting())
+    }
+
     @Test func runtimePolicyChangesUpdateCaptureCancelSourceAndPreserveLocalSessions() async throws {
         let fixture = makeFixture()
         defer { fixture.removeSettingsFile() }
@@ -573,6 +666,23 @@ private let sampleWAV = Data([
     0x02, 0x00, 0x00, 0x00, 0x00, 0x00,
 ])
 
+enum CorrectionProviderIdentityField: CaseIterable, Sendable {
+    case apiKey
+    case baseURL
+    case model
+
+    func replace(in settings: inout CorrectionSettings) {
+        switch self {
+        case .apiKey:
+            settings.apiKey = "replacement-placeholder-key"
+        case .baseURL:
+            settings.baseURL = "https://replacement.example.invalid/v1"
+        case .model:
+            settings.model = "replacement-model"
+        }
+    }
+}
+
 private func makeSettingsURL() -> URL {
     FileManager.default.temporaryDirectory
         .appendingPathComponent("v2s-app-model-correction-\(UUID().uuidString).json")
@@ -705,6 +815,8 @@ actor IntegrationHeldCorrectionResponder: CorrectionResponding {
     func startedSourceIDs() -> [String] { calls.map(\.sourceID) }
     func currentLocalTranslations() -> [String] { calls.map(\.localTranslation) }
     func audioPresence() -> [Bool] { calls.map { $0.audioWAVData?.isEmpty == false } }
+    func requestModes() -> [CorrectionInputMode] { calls.map(\.prompt.mode) }
+    func requestSettings(call index: Int) -> CorrectionSettings { calls[index].settings }
     func contextSourceIDs(call index: Int) -> [String] { calls[index].contextSourceIDs }
 
     private static func payload(from content: String) throws -> [String: Any] {

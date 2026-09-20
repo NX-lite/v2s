@@ -75,7 +75,7 @@ final class AppModel: ObservableObject {
     // Committed translation per caption; late translations may only replace
     // displayed text that still matches what this pipeline committed.
     private var translationRevisions: [UUID: String] = [:]
-    private var submittedCorrectionCaptionIDs: Set<UUID> = []
+    private var submittedCorrectionSourceIDsByCaptionID: [UUID: String] = [:]
     private var correctedCaptionIDs: Set<UUID> = []
     private var sourceCorrectionAudioPolicyEpochs: [String: Int] = [:]
     private var recentRecognizedCaptionTexts: [RecentRecognizedCaption] = []
@@ -993,6 +993,8 @@ final class AppModel: ObservableObject {
                 correctionSessionIsActive = false
             }
         } else if providerChanged {
+            invalidateAllPendingCorrectionAudio()
+            resetLiveCorrectionAudioCapture(using: settings)
             if correctionSessionIsActive {
                 correction.endSession()
                 correctionSessionIsActive = false
@@ -1032,6 +1034,15 @@ final class AppModel: ObservableObject {
     ) {
         liveTranscriptionSessionsBySourceID[sourceID] = session
         session.setCorrectionAudioCaptureEnabled(correction.settings.isEnabled(for: sourceID))
+    }
+
+    private func resetLiveCorrectionAudioCapture(using settings: CorrectionSettings) {
+        for (sourceID, session) in liveTranscriptionSessionsBySourceID {
+            session.setCorrectionAudioCaptureEnabled(false)
+            if settings.isEnabled(for: sourceID) {
+                session.setCorrectionAudioCaptureEnabled(true)
+            }
+        }
     }
 
     private func invalidatePendingCorrectionAudio(for sourceID: String) {
@@ -2489,6 +2500,10 @@ final class AppModel: ObservableObject {
         liveTranscriptionSessionsBySourceID.count
     }
 
+    var correctedCaptionCountForTesting: Int {
+        correctedCaptionIDs.count
+    }
+
     private func makeQueuedCaptionForTesting(
         source: InputSource,
         original: String,
@@ -2580,7 +2595,7 @@ final class AppModel: ObservableObject {
         pendingCaptions.removeAll()
         readyCaptionTranslations.removeAll()
         translationRevisions.removeAll()
-        submittedCorrectionCaptionIDs.removeAll()
+        submittedCorrectionSourceIDsByCaptionID.removeAll()
         correctedCaptionIDs.removeAll()
         sourceCorrectionAudioPolicyEpochs.removeAll()
         recentRecognizedCaptionTexts.removeAll()
@@ -2765,8 +2780,9 @@ final class AppModel: ObservableObject {
         for caption: QueuedCaption,
         localTranslation: String
     ) {
-        guard submittedCorrectionCaptionIDs.insert(caption.id).inserted else { return }
         guard correction.settings.isEnabled(for: caption.sourceID) else { return }
+        guard submittedCorrectionSourceIDsByCaptionID[caption.id] == nil else { return }
+        submittedCorrectionSourceIDsByCaptionID[caption.id] = caption.sourceID
 
         let currentPolicyEpoch = sourceCorrectionAudioPolicyEpochs[caption.sourceID, default: 0]
         let eligibleAudio = caption.correctionAudioPolicyEpoch == currentPolicyEpoch
@@ -2789,10 +2805,23 @@ final class AppModel: ObservableObject {
     private func applyCorrectionResult(_ result: CorrectionResult) {
         guard result.sessionGeneration == correction.sessionGeneration else { return }
 
+        let transcriptIndex = transcriptEntries.firstIndex {
+            $0.id == result.captionID && $0.sourceID == result.sourceID
+        }
+        let historyIndex = overlayState?.history.lastIndex {
+            $0.id == result.captionID
+        }
+        let isCurrentCaption = displayedCaption?.id == result.captionID
+            && displayedCaption?.sourceID == result.sourceID
+            && overlayState?.committedCaptionID == result.captionID
+        guard submittedCorrectionSourceIDsByCaptionID[result.captionID] == result.sourceID,
+              transcriptIndex != nil || historyIndex != nil || isCurrentCaption else {
+            return
+        }
+
         var effectiveSourceText: String?
         var effectiveTranslatedText: String?
-        if let index = transcriptEntries.firstIndex(where: { $0.id == result.captionID }),
-           transcriptEntries[index].sourceID == result.sourceID {
+        if let index = transcriptIndex {
             if result.mode == .audio {
                 transcriptEntries[index].correctedSourceText = result.correctedOriginal
             }
@@ -2803,7 +2832,7 @@ final class AppModel: ObservableObject {
 
         correctedCaptionIDs.insert(result.captionID)
 
-        if let index = overlayState?.history.lastIndex(where: { $0.id == result.captionID }) {
+        if let index = historyIndex {
             if result.mode == .audio,
                let correctedOriginal = result.correctedOriginal,
                correctedOriginal.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty == false {
@@ -2816,9 +2845,7 @@ final class AppModel: ObservableObject {
             effectiveTranslatedText = effectiveTranslatedText ?? overlayState?.history[index].translatedText
         }
 
-        guard displayedCaption?.id == result.captionID,
-              displayedCaption?.sourceID == result.sourceID,
-              overlayState?.committedCaptionID == result.captionID else {
+        guard isCurrentCaption else {
             return
         }
 
