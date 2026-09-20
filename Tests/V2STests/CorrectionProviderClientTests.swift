@@ -192,6 +192,78 @@ import Testing
         }
     }
 
+    @Test func unpaddedAudioIsRedactedFromEveryProviderError() async {
+        let audioData = Data([1, 2, 3])
+        let encodedAudio = audioData.base64EncodedString()
+        #expect(encodedAudio == "AQID")
+
+        for provider in ProviderKind.allCases {
+            let payload = providerError("input_audio rejected; echoed media: \(encodedAudio); note: TEST")
+            let transport = StubHTTPTransport(stubs: [.init(status: 400, data: payload)])
+            let client = makeClient(provider, transport: transport)
+
+            do {
+                _ = try await client.correct(prompt: audioPrompt(), audioWAVData: audioData)
+                Issue.record("Expected audioUnsupported for \(provider)")
+            } catch let error as OpenAIResponsesClient.ClientError {
+                guard case .audioUnsupported(let message) = error else {
+                    Issue.record("Expected audioUnsupported for \(provider), got \(error)")
+                    continue
+                }
+                #expect(message.contains("[redacted-media]"))
+                #expect(!message.contains(encodedAudio))
+                #expect(message.contains("note: TEST"))
+                #expect(!(error.errorDescription ?? "").contains(encodedAudio))
+            } catch {
+                Issue.record("Expected ClientError for \(provider), got \(error)")
+            }
+        }
+    }
+
+    @Test func unpaddedImageIsRedactedFromImageUnsupportedError() async {
+        let imageData = Data([1, 2, 3])
+        let encodedImage = imageData.base64EncodedString()
+        #expect(encodedImage == "AQID")
+        let payload = providerError("image input rejected; echoed media: \(encodedImage)")
+        let transport = StubHTTPTransport(stubs: [.init(status: 400, data: payload)])
+        let client = makeClient(.responses, transport: transport)
+
+        do {
+            _ = try await client.respond(instructions: "System", prompt: "Question", screenshotPNGData: imageData)
+            Issue.record("Expected imageUnsupported")
+        } catch let error as OpenAIResponsesClient.ClientError {
+            guard case .imageUnsupported(let message) = error else {
+                Issue.record("Expected imageUnsupported, got \(error)")
+                return
+            }
+            #expect(message.contains("[redacted-media]"))
+            #expect(!message.contains(encodedImage))
+            #expect(!(error.errorDescription ?? "").contains(encodedImage))
+        } catch {
+            Issue.record("Expected ClientError, got \(error)")
+        }
+    }
+
+    @Test func nonMediaErrorPreservesOrdinaryTextAndShortBase64LookingWord() async {
+        let message = "Provider note TEST remains ordinary text"
+        let transport = StubHTTPTransport(stubs: [.init(status: 400, data: providerError(message))])
+        let client = makeClient(.chat, transport: transport)
+
+        do {
+            _ = try await client.correct(prompt: textPrompt(), audioWAVData: nil)
+            Issue.record("Expected HTTP error")
+        } catch let error as OpenAIResponsesClient.ClientError {
+            guard case .http(let status, let errorMessage) = error else {
+                Issue.record("Expected HTTP error, got \(error)")
+                return
+            }
+            #expect(status == 400)
+            #expect(errorMessage == message)
+        } catch {
+            Issue.record("Expected ClientError, got \(error)")
+        }
+    }
+
     @Test func generic400AndAudioKeywordsWithoutAudioStayHTTP() async {
         for audioData: Data? in [Data([1]), nil] {
             let message = audioData == nil ? "input_audio unavailable" : "generic bad request"

@@ -187,7 +187,13 @@ struct OpenAIResponsesClient: Sendable {
         }
 
         let sentMedia: SentMediaKind = audioWAVData == nil ? (screenshotPNGData == nil ? .none : .image) : .audio
-        let data = try await successfulData(for: request, apiKey: apiKey, sentMedia: sentMedia)
+        let mediaValues = Self.encodedMediaValues([screenshotPNGData, audioWAVData])
+        let data = try await successfulData(
+            for: request,
+            apiKey: apiKey,
+            sentMedia: sentMedia,
+            sensitiveMediaValues: mediaValues
+        )
         let text: String
         switch endpoint {
         case .chat:
@@ -217,7 +223,13 @@ struct OpenAIResponsesClient: Sendable {
         )
         let request = try jsonRequest(url: url, method: "POST", body: body)
         let sentMedia: SentMediaKind = audioWAVData == nil ? (screenshotPNGData == nil ? .none : .image) : .audio
-        let data = try await successfulData(for: request, apiKey: apiKey, sentMedia: sentMedia)
+        let mediaValues = Self.encodedMediaValues([screenshotPNGData, audioWAVData])
+        let data = try await successfulData(
+            for: request,
+            apiKey: apiKey,
+            sentMedia: sentMedia,
+            sensitiveMediaValues: mediaValues
+        )
         let text = try Self.decode(GeminiGenerateContentPayload.self, from: data).outputText
         guard !text.isEmpty else { throw ClientError.invalidResponse }
         return Response(text: text, imageWasSent: screenshotPNGData != nil)
@@ -317,7 +329,12 @@ struct OpenAIResponsesClient: Sendable {
         return request
     }
 
-    private func successfulData(for request: URLRequest, apiKey: String, sentMedia: SentMediaKind = .none) async throws -> Data {
+    private func successfulData(
+        for request: URLRequest,
+        apiKey: String,
+        sentMedia: SentMediaKind = .none,
+        sensitiveMediaValues: [String] = []
+    ) async throws -> Data {
         let data: Data
         let response: HTTPURLResponse
         do {
@@ -326,7 +343,11 @@ struct OpenAIResponsesClient: Sendable {
             throw ClientError.invalidResponse
         }
         guard (200..<300).contains(response.statusCode) else {
-            let message = Self.sanitizedErrorMessage(from: data, apiKey: apiKey) ?? "HTTP \(response.statusCode)"
+            let message = Self.sanitizedErrorMessage(
+                from: data,
+                apiKey: apiKey,
+                sensitiveMediaValues: sensitiveMediaValues
+            ) ?? "HTTP \(response.statusCode)"
             if sentMedia == .image && Self.isImageCapabilityRejection(status: response.statusCode, message: message) {
                 throw ClientError.imageUnsupported(message: message)
             }
@@ -517,15 +538,29 @@ struct OpenAIResponsesClient: Sendable {
         }
     }
 
-    private static func sanitizedErrorMessage(from data: Data, apiKey: String) -> String? {
+    private static func encodedMediaValues(_ values: [Data?]) -> [String] {
+        values.compactMap { value in
+            guard let value, !value.isEmpty else { return nil }
+            return value.base64EncodedString()
+        }
+    }
+
+    private static func sanitizedErrorMessage(
+        from data: Data,
+        apiKey: String,
+        sensitiveMediaValues: [String]
+    ) -> String? {
         guard let payload = try? JSONDecoder().decode(ProviderErrorPayload.self, from: data) else { return nil }
         let raw = payload.error.message ?? payload.error.status
         guard let raw, !raw.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else { return nil }
-        return sanitize(raw, apiKey: apiKey)
+        return sanitize(raw, apiKey: apiKey, sensitiveMediaValues: sensitiveMediaValues)
     }
 
-    private static func sanitize(_ message: String, apiKey: String) -> String {
+    private static func sanitize(_ message: String, apiKey: String, sensitiveMediaValues: [String]) -> String {
         var sanitized = message.trimmingCharacters(in: .whitespacesAndNewlines)
+        for mediaValue in sensitiveMediaValues.sorted(by: { $0.count > $1.count }) where !mediaValue.isEmpty {
+            sanitized = sanitized.replacingOccurrences(of: mediaValue, with: "[redacted-media]")
+        }
         sanitized = sanitized.replacingOccurrences(of: apiKey, with: "[redacted]")
         sanitized = sanitized.replacingOccurrences(of: "authorization", with: "[redacted-header]", options: .caseInsensitive)
         sanitized = sanitized.replacingOccurrences(
