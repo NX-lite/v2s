@@ -439,6 +439,28 @@ final class LiveTranscriptionSession: NSObject, @unchecked Sendable {
         }
     }
 
+    /// Clears provider-bound audio and installs the final capture policy as one
+    /// capture-queue transaction. The caller resumes only after the new capture
+    /// epoch is visible to committed-emission delivery.
+    func resetCorrectionAudioCapture(enabled: Bool) async {
+        await withCheckedContinuation { continuation in
+            captureQueue.async { [weak self] in
+                guard let self else {
+                    continuation.resume()
+                    return
+                }
+                beginCommittedDeliveryStateMutation()
+                resetCorrectionAudioBuffer()
+                transcriptDeliveryLock.lock()
+                correctionAudioCaptureEpoch &+= 1
+                correctionAudioCaptureEnabled = enabled
+                transcriptDeliveryLock.unlock()
+                endCommittedDeliveryStateMutation()
+                continuation.resume()
+            }
+        }
+    }
+
     func correctionAudioCaptureEnabledForTesting() async -> Bool {
         await withCheckedContinuation { continuation in
             captureQueue.async { [weak self] in

@@ -86,6 +86,35 @@ import Testing
         #expect(await session.correctionAudioFrameCountForTesting() == 0)
     }
 
+    @Test @MainActor func resettingCorrectionAudioCaptureInvalidatesOldWAVAndRearmsBeforeReturning() async throws {
+        let session = LiveTranscriptionSession()
+        let recorder = RecognizedSentenceRecorder()
+        session.setTranscriptHandlerForTesting { recorder.record($0) }
+        let buffer = try makeMono16KBuffer(samples: [0.25, -0.25, 0.5])
+
+        session.setCorrectionAudioCaptureEnabled(true)
+        await session.appendCorrectionAudioBufferForTesting(buffer)
+        await session.captureCommittedEmissionForDeferredDeliveryAfterAudioExtractionForTesting(
+            text: "Old provider sentence."
+        )
+
+        await session.resetCorrectionAudioCapture(enabled: true)
+
+        #expect(await session.correctionAudioCaptureEnabledForTesting())
+        #expect(await session.correctionAudioFrameCountForTesting() == 0)
+        await session.deliverQueuedCommittedEmissionForTesting()
+        #expect(recorder.texts == ["Old provider sentence."])
+        #expect(recorder.receivedAudio == [false])
+
+        await session.appendCorrectionAudioBufferForTesting(buffer)
+        await session.captureCommittedEmissionForDeferredDeliveryAfterAudioExtractionForTesting(
+            text: "New provider sentence."
+        )
+        await session.deliverQueuedCommittedEmissionForTesting()
+        #expect(recorder.texts == ["Old provider sentence.", "New provider sentence."])
+        #expect(recorder.receivedAudio == [false, true])
+    }
+
     @Test func stoppingAndResettingRecognitionGenerationClearCorrectionAudioFrames() async throws {
         let session = LiveTranscriptionSession()
         let buffer = try makeMono16KBuffer(samples: [0.25, -0.25, 0.5])

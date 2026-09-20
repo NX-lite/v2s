@@ -78,6 +78,12 @@ final class AppModel: ObservableObject {
     private var submittedCorrectionSourceIDsByCaptionID: [UUID: String] = [:]
     private var correctedCaptionIDs: Set<UUID> = []
     private var sourceCorrectionAudioPolicyEpochs: [String: Int] = [:]
+    private var providerAudioTransitionGeneration: Int = 0
+    private var providerAudioTransitionTokensBySourceID: [String: Int] = [:]
+    #if DEBUG
+    private var providerAudioTransitionResetPauseBudgetForTesting = 0
+    private var pausedProviderAudioTransitionResetsForTesting: [Int: CheckedContinuation<Void, Never>] = [:]
+    #endif
     private var recentRecognizedCaptionTexts: [RecentRecognizedCaption] = []
     private var recentArchivedCaption: RecentArchivedCaption?
     private var finalizedDraftPromotionIDs: [(id: UUID, time: Date)] = []
@@ -993,8 +999,7 @@ final class AppModel: ObservableObject {
                 correctionSessionIsActive = false
             }
         } else if providerChanged {
-            invalidateAllPendingCorrectionAudio()
-            resetLiveCorrectionAudioCapture(using: settings)
+            beginProviderAudioTransition()
             if correctionSessionIsActive {
                 correction.endSession()
                 correctionSessionIsActive = false
@@ -1021,6 +1026,7 @@ final class AppModel: ObservableObject {
     private func endCorrectionSessionAndClearLiveAudio() {
         correction.endSession()
         correctionSessionIsActive = false
+        invalidateProviderAudioTransitions()
         invalidateAllPendingCorrectionAudio()
         for session in liveTranscriptionSessionsBySourceID.values {
             session.setCorrectionAudioCaptureEnabled(false)
@@ -1036,13 +1042,52 @@ final class AppModel: ObservableObject {
         session.setCorrectionAudioCaptureEnabled(correction.settings.isEnabled(for: sourceID))
     }
 
-    private func resetLiveCorrectionAudioCapture(using settings: CorrectionSettings) {
-        for (sourceID, session) in liveTranscriptionSessionsBySourceID {
-            session.setCorrectionAudioCaptureEnabled(false)
-            if settings.isEnabled(for: sourceID) {
-                session.setCorrectionAudioCaptureEnabled(true)
+    private func beginProviderAudioTransition() {
+        providerAudioTransitionGeneration &+= 1
+        let transitionToken = providerAudioTransitionGeneration
+        let sessions = liveTranscriptionSessionsBySourceID
+
+        for sourceID in sessions.keys {
+            providerAudioTransitionTokensBySourceID[sourceID] = transitionToken
+        }
+        invalidateAllPendingCorrectionAudio()
+
+        Task { @MainActor [weak self] in
+            guard let self else { return }
+
+            for (sourceID, session) in sessions {
+                guard providerAudioTransitionTokensBySourceID[sourceID] == transitionToken else {
+                    continue
+                }
+                #if DEBUG
+                await pauseProviderAudioTransitionResetForTestingIfNeeded(token: transitionToken)
+                #endif
+                guard providerAudioTransitionTokensBySourceID[sourceID] == transitionToken else {
+                    continue
+                }
+                await session.resetCorrectionAudioCapture(
+                    enabled: correction.settings.isEnabled(for: sourceID)
+                )
+            }
+
+            for sourceID in sessions.keys
+            where providerAudioTransitionTokensBySourceID[sourceID] == transitionToken {
+                providerAudioTransitionTokensBySourceID.removeValue(forKey: sourceID)
             }
         }
+    }
+
+    private func invalidateProviderAudioTransitions() {
+        providerAudioTransitionGeneration &+= 1
+        providerAudioTransitionTokensBySourceID.removeAll()
+        #if DEBUG
+        providerAudioTransitionResetPauseBudgetForTesting = 0
+        let pausedResets = pausedProviderAudioTransitionResetsForTesting.values
+        pausedProviderAudioTransitionResetsForTesting.removeAll()
+        for continuation in pausedResets {
+            continuation.resume()
+        }
+        #endif
     }
 
     private func invalidatePendingCorrectionAudio(for sourceID: String) {
@@ -2173,6 +2218,9 @@ final class AppModel: ObservableObject {
         }
         let capturedAt = Date()
         let correctionAudioPolicyEpoch = sourceCorrectionAudioPolicyEpochs[source.id, default: 0]
+        let correctionAudioWAVData = providerAudioTransitionTokensBySourceID[source.id] == nil
+            ? sentence.audioWAVData
+            : nil
 
         if let promotionID = sentence.promotionSegmentID {
             guard isFinalizedDraftPromotionID(promotionID) == false else {
@@ -2197,7 +2245,7 @@ final class AppModel: ObservableObject {
                 targetLanguageID: targetLanguageID,
                 promotedDraftTranslation: promotedDraftTranslation,
                 capturedAt: capturedAt,
-                audioWAVData: sentence.audioWAVData,
+                audioWAVData: correctionAudioWAVData,
                 correctionAudioPolicyEpoch: correctionAudioPolicyEpoch
             )
 
@@ -2221,7 +2269,7 @@ final class AppModel: ObservableObject {
                 targetLanguageID: targetLanguageID,
                 promotedDraftTranslation: nil,
                 capturedAt: capturedAt,
-                audioWAVData: sentence.audioWAVData,
+                audioWAVData: correctionAudioWAVData,
                 correctionAudioPolicyEpoch: correctionAudioPolicyEpoch
             )
 
@@ -2475,8 +2523,20 @@ final class AppModel: ObservableObject {
 
     func registerSuccessfulLiveSessionForTesting(
         _ session: LiveTranscriptionSession,
-        source: InputSource
+        source: InputSource,
+        deliverRecognizedSentences: Bool = false
     ) {
+        if deliverRecognizedSentences {
+            session.setTranscriptHandlerForTesting { [weak self] sentence in
+                guard let self else { return }
+                enqueueRecognizedSentence(
+                    sentence,
+                    source: source,
+                    sourceLanguageID: languageID(for: source),
+                    targetLanguageID: outputLanguageIDForSource(source)
+                )
+            }
+        }
         if liveTranscriptionSessions.contains(where: { $0 === session }) == false {
             liveTranscriptionSessions.append(session)
         }
@@ -2502,6 +2562,38 @@ final class AppModel: ObservableObject {
 
     var correctedCaptionCountForTesting: Int {
         correctedCaptionIDs.count
+    }
+
+    var pendingCaptionCountForTesting: Int {
+        pendingCaptions.count
+    }
+
+    func pauseNextProviderAudioTransitionResetForTesting() {
+        providerAudioTransitionResetPauseBudgetForTesting += 1
+    }
+
+    var pausedProviderAudioTransitionResetCountForTesting: Int {
+        pausedProviderAudioTransitionResetsForTesting.count
+    }
+
+    func resumeOldestProviderAudioTransitionResetForTesting() {
+        guard let token = pausedProviderAudioTransitionResetsForTesting.keys.min(),
+              let continuation = pausedProviderAudioTransitionResetsForTesting.removeValue(forKey: token) else {
+            return
+        }
+        continuation.resume()
+    }
+
+    func providerAudioTransitionIsActiveForTesting(sourceID: String) -> Bool {
+        providerAudioTransitionTokensBySourceID[sourceID] != nil
+    }
+
+    private func pauseProviderAudioTransitionResetForTestingIfNeeded(token: Int) async {
+        guard providerAudioTransitionResetPauseBudgetForTesting > 0 else { return }
+        providerAudioTransitionResetPauseBudgetForTesting -= 1
+        await withCheckedContinuation { continuation in
+            pausedProviderAudioTransitionResetsForTesting[token] = continuation
+        }
     }
 
     private func makeQueuedCaptionForTesting(
@@ -2598,6 +2690,7 @@ final class AppModel: ObservableObject {
         submittedCorrectionSourceIDsByCaptionID.removeAll()
         correctedCaptionIDs.removeAll()
         sourceCorrectionAudioPolicyEpochs.removeAll()
+        invalidateProviderAudioTransitions()
         recentRecognizedCaptionTexts.removeAll()
         recentArchivedCaption = nil
         finalizedDraftPromotionIDs.removeAll()
@@ -2785,7 +2878,8 @@ final class AppModel: ObservableObject {
         submittedCorrectionSourceIDsByCaptionID[caption.id] = caption.sourceID
 
         let currentPolicyEpoch = sourceCorrectionAudioPolicyEpochs[caption.sourceID, default: 0]
-        let eligibleAudio = caption.correctionAudioPolicyEpoch == currentPolicyEpoch
+        let eligibleAudio = providerAudioTransitionTokensBySourceID[caption.sourceID] == nil
+            && caption.correctionAudioPolicyEpoch == currentPolicyEpoch
             ? caption.audioWAVData
             : nil
         correction.enqueue(CorrectionJob(

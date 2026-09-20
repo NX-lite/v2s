@@ -469,6 +469,99 @@ import Testing
         #expect(await session.correctionAudioCaptureEnabledForTesting())
     }
 
+    @Test func providerResetBarrierFencesDeferredOldWAVAndRearmsFreshAudio() async throws {
+        let fixture = makeFixture()
+        defer { fixture.removeSettingsFile() }
+        let session = LiveTranscriptionSession()
+        fixture.model.sourceLanguageOverrides[fixture.microphone.id] = "en"
+        fixture.model.sourceOutputLanguageOverrides[fixture.microphone.id] = "en"
+        fixture.model.beginCorrectionSessionForTesting()
+        fixture.model.pauseNextProviderAudioTransitionResetForTesting()
+        fixture.model.registerSuccessfulLiveSessionForTesting(
+            session,
+            source: fixture.microphone,
+            deliverRecognizedSentences: true
+        )
+        try await waitUntil { await session.correctionAudioCaptureEnabledForTesting() }
+        try await fillAudioBuffer(session)
+        await session.captureCommittedEmissionForDeferredDeliveryAfterAudioExtractionForTesting(
+            text: "Old."
+        )
+
+        var replacementSettings = fixture.model.correction.settings
+        replacementSettings.model = "barrier-replacement-model"
+        fixture.model.correction.settings = replacementSettings
+        try await waitUntil {
+            fixture.model.pausedProviderAudioTransitionResetCountForTesting == 1
+        }
+
+        await session.deliverQueuedCommittedEmissionForTesting()
+        try await waitUntil(timeout: .seconds(5)) {
+            await fixture.responder.callCount() == 1
+        }
+        #expect(await fixture.responder.requestSettings(call: 0) == replacementSettings)
+        #expect(await fixture.responder.audioPresence() == [false])
+        #expect(await fixture.responder.requestModes() == [.textOnly])
+
+        await fixture.responder.release(
+            captionID: UUID(),
+            output: .init(correctedOriginal: nil, correctedTranslation: "Old.")
+        )
+        fixture.model.resumeOldestProviderAudioTransitionResetForTesting()
+        try await waitUntil {
+            let captureEnabled = await session.correctionAudioCaptureEnabledForTesting()
+            return fixture.model.providerAudioTransitionIsActiveForTesting(sourceID: fixture.microphone.id) == false
+                && captureEnabled
+        }
+        #expect(fixture.model.liveTranscriptionSessionCountForTesting == 1)
+        try await waitUntil(timeout: .seconds(5)) {
+            fixture.model.pendingCaptionCountForTesting == 0
+        }
+
+        try await fillAudioBuffer(session)
+        await session.captureCommittedEmissionForDeferredDeliveryAfterAudioExtractionForTesting(
+            text: "Fresh."
+        )
+        await session.deliverQueuedCommittedEmissionForTesting()
+        try await waitUntil(timeout: .seconds(8)) {
+            await fixture.responder.callCount() == 2
+        }
+        #expect(await fixture.responder.audioPresence() == [false, true])
+        #expect(await fixture.responder.requestModes() == [.textOnly, .audio])
+    }
+
+    @Test func olderProviderResetTaskCannotClearNewerTransition() async throws {
+        let fixture = makeFixture()
+        defer { fixture.removeSettingsFile() }
+        let session = LiveTranscriptionSession()
+        fixture.model.beginCorrectionSessionForTesting()
+        fixture.model.registerSuccessfulLiveSessionForTesting(session, source: fixture.microphone)
+        try await waitUntil { await session.correctionAudioCaptureEnabledForTesting() }
+        fixture.model.pauseNextProviderAudioTransitionResetForTesting()
+        fixture.model.pauseNextProviderAudioTransitionResetForTesting()
+
+        fixture.model.correction.settings.model = "first-replacement-model"
+        try await waitUntil {
+            fixture.model.pausedProviderAudioTransitionResetCountForTesting == 1
+        }
+        fixture.model.correction.settings.model = "second-replacement-model"
+        try await waitUntil {
+            fixture.model.pausedProviderAudioTransitionResetCountForTesting == 2
+        }
+
+        fixture.model.resumeOldestProviderAudioTransitionResetForTesting()
+        try await waitUntil {
+            fixture.model.pausedProviderAudioTransitionResetCountForTesting == 1
+        }
+        #expect(fixture.model.providerAudioTransitionIsActiveForTesting(sourceID: fixture.microphone.id))
+
+        fixture.model.resumeOldestProviderAudioTransitionResetForTesting()
+        try await waitUntil {
+            fixture.model.providerAudioTransitionIsActiveForTesting(sourceID: fixture.microphone.id) == false
+        }
+        #expect(await session.correctionAudioCaptureEnabledForTesting())
+    }
+
     @Test func runtimePolicyChangesUpdateCaptureCancelSourceAndPreserveLocalSessions() async throws {
         let fixture = makeFixture()
         defer { fixture.removeSettingsFile() }
