@@ -539,9 +539,11 @@ struct OpenAIResponsesClient: Sendable {
     }
 
     private static func encodedMediaValues(_ values: [Data?]) -> [String] {
-        values.compactMap { value in
-            guard let value, !value.isEmpty else { return nil }
-            return value.base64EncodedString()
+        values.flatMap { value -> [String] in
+            guard let value, !value.isEmpty else { return [] }
+            let padded = value.base64EncodedString()
+            let unpadded = padded.trimmingCharacters(in: CharacterSet(charactersIn: "="))
+            return unpadded.isEmpty || unpadded == padded ? [padded] : [padded, unpadded]
         }
     }
 
@@ -565,11 +567,6 @@ struct OpenAIResponsesClient: Sendable {
         sanitized = sanitized.replacingOccurrences(of: "authorization", with: "[redacted-header]", options: .caseInsensitive)
         sanitized = sanitized.replacingOccurrences(
             of: "(?i)data:[^\\s\\\"']*;base64,[A-Za-z0-9+/]+={0,2}",
-            with: "[redacted-media]",
-            options: .regularExpression
-        )
-        sanitized = sanitized.replacingOccurrences(
-            of: "(?<![A-Za-z0-9+/])[A-Za-z0-9+/]{2,}={1,2}(?![A-Za-z0-9+/=])",
             with: "[redacted-media]",
             options: .regularExpression
         )
