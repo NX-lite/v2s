@@ -64,6 +64,7 @@ final class RealtimeCorrectionCoordinator: ObservableObject {
 
     private static let maximumConcurrentCalls = 2
     private static let maximumWaitingPerSource = 3
+    private static let maximumSkippedDiagnostics = 32
 
     private let responder: any CorrectionResponding
     private let promptBuilder: CorrectionPromptBuilder
@@ -114,7 +115,7 @@ final class RealtimeCorrectionCoordinator: ObservableObject {
         nextEnqueueOrdinal &+= 1
         var waiting = waitingBySource[job.sourceID, default: []]
         if waiting.count == Self.maximumWaitingPerSource {
-            skippedCaptionIDs.append(waiting.removeFirst().job.captionID)
+            recordSkipped(waiting.removeFirst().job.captionID)
         }
         waiting.append(WaitingJob(job: job, ordinal: nextEnqueueOrdinal))
         waitingBySource[job.sourceID] = waiting
@@ -284,6 +285,11 @@ final class RealtimeCorrectionCoordinator: ObservableObject {
         generation: Int,
         token: UUID
     ) async {
+        guard !Task.isCancelled,
+              isCurrent(job.sourceID, generation: generation, token: token) else {
+            releaseSlot(sourceID: job.sourceID, token: token)
+            return
+        }
         do {
             let output = try await responder.correct(
                 settings: settings,
@@ -399,6 +405,13 @@ final class RealtimeCorrectionCoordinator: ObservableObject {
         sourceEntries.append(SuccessfulEntry(entry: entry, ordinal: nextSuccessOrdinal))
         sourceEntries.sort(by: Self.successOrder)
         successfulBySource[job.sourceID] = Array(sourceEntries.suffix(CorrectionPromptBuilder.contextLimit))
+    }
+
+    private func recordSkipped(_ captionID: UUID) {
+        skippedCaptionIDs.append(captionID)
+        if skippedCaptionIDs.count > Self.maximumSkippedDiagnostics {
+            skippedCaptionIDs.removeFirst(skippedCaptionIDs.count - Self.maximumSkippedDiagnostics)
+        }
     }
 
     private static func successOrder(_ lhs: SuccessfulEntry, _ rhs: SuccessfulEntry) -> Bool {

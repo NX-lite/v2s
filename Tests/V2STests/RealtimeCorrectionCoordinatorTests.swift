@@ -42,6 +42,20 @@ import Testing
         await waitUntil { await responder.callCount() == 1 }
     }
 
+    @Test func skippedDiagnosticsRemainBoundedAndKeepNewestCaptionIDs() async {
+        let responder = HeldCorrectionResponder()
+        let coordinator = makeCoordinator(responder: responder)
+        coordinator.beginSession()
+
+        for sequence in 1 ... 100 {
+            coordinator.enqueue(job(coordinator, sourceID: "mic-1", sequence: sequence))
+        }
+
+        #expect(coordinator.skippedCaptionIDs.count == 32)
+        #expect(coordinator.skippedCaptionIDs == (66 ... 97).map(id))
+        #expect(coordinator.waitingCaptionIDs(for: "mic-1") == [id(98), id(99), id(100)])
+    }
+
     @Test func equalTimestampHeadsUseStableEnqueueOrder() async {
         let responder = HeldCorrectionResponder()
         let coordinator = makeCoordinator(responder: responder)
@@ -76,6 +90,82 @@ import Testing
 
         let context = await responder.contextOriginals(call: 7)
         #expect(context == (1 ... 6).map { "call \($0)" })
+    }
+
+    @Test func queuedTargetBuildsContextOnlyWhenItActuallyDispatches() async {
+        let responder = HeldCorrectionResponder()
+        let coordinator = makeCoordinator(responder: responder)
+        coordinator.beginSession()
+
+        coordinator.enqueue(job(coordinator, sourceID: "new-context", sequence: 1))
+        coordinator.enqueue(job(coordinator, sourceID: "other-active", sequence: 2))
+        await waitUntil { await responder.callCount() == 2 }
+        coordinator.enqueue(job(coordinator, sourceID: "queued-target", sequence: 50))
+
+        await responder.releaseHeldCall(
+            sourceID: "new-context",
+            output: .init(correctedOriginal: "corrected source", correctedTranslation: "corrected translation")
+        )
+        await waitUntil { await responder.callCount() == 3 }
+
+        let context = await responder.contextEntries(call: 2)
+        #expect(context.count == 1)
+        #expect(context.first?.sourceID == "new-context")
+        #expect(context.first?.sourceName == "new-context")
+        #expect(context.first?.sourceLanguageID == "en")
+        #expect(context.first?.targetLanguageID == "zh-Hans")
+        #expect(context.first?.original == "corrected source")
+        #expect(context.first?.translation == "corrected translation")
+    }
+
+    @Test func globalContextUsesNewestSixAcrossSourcesWithCompleteSemantics() async {
+        let responder = HeldCorrectionResponder(steps: Array(repeating: .success, count: 8))
+        let coordinator = makeCoordinator(responder: responder)
+        coordinator.beginSession()
+        var resultCount = 0
+        coordinator.onResult = { _ in resultCount += 1 }
+
+        for sequence in 1 ... 7 {
+            coordinator.enqueue(job(
+                sourceID: "source-\(sequence)",
+                sourceName: "Source \(sequence)",
+                sourceLanguageID: "source-language-\(sequence)",
+                targetLanguageID: "target-language-\(sequence)",
+                sequence: sequence,
+                generation: coordinator.sessionGeneration
+            ))
+            await waitUntil { resultCount == sequence }
+        }
+        coordinator.enqueue(job(coordinator, sourceID: "target", sequence: 200))
+        await waitUntil { resultCount == 8 }
+
+        let context = await responder.contextEntries(call: 7)
+        #expect(context.map(\.sourceID) == (2 ... 7).map { "source-\($0)" })
+        #expect(context.map(\.sourceName) == (2 ... 7).map { "Source \($0)" })
+        #expect(context.map(\.sourceLanguageID) == (2 ... 7).map { "source-language-\($0)" })
+        #expect(context.map(\.targetLanguageID) == (2 ... 7).map { "target-language-\($0)" })
+        #expect(context.map(\.original) == (1 ... 6).map { "call \($0)" })
+        #expect(context.map(\.translation) == (1 ... 6).map { "translated call \($0)" })
+    }
+
+    @Test func isolatedSourceSuccessStillContributesToOtherGlobalContext() async {
+        let responder = HeldCorrectionResponder(steps: [.success, .success])
+        var settings = configuredSettings()
+        settings.isolatedContextSourceIDs = ["isolated"]
+        let coordinator = makeCoordinator(settings: settings, responder: responder)
+        coordinator.beginSession()
+        var resultCount = 0
+        coordinator.onResult = { _ in resultCount += 1 }
+
+        coordinator.enqueue(job(coordinator, sourceID: "isolated", sequence: 1))
+        await waitUntil { resultCount == 1 }
+        coordinator.enqueue(job(coordinator, sourceID: "global-observer", sequence: 2))
+        await waitUntil { resultCount == 2 }
+
+        let context = await responder.contextEntries(call: 1)
+        #expect(context.map(\.sourceID) == ["isolated"])
+        #expect(context.map(\.original) == ["call 0"])
+        #expect(context.map(\.translation) == ["translated call 0"])
     }
 
     @Test func isolatedContextUsesOnlyCurrentSourceNewestSix() async {
@@ -269,6 +359,29 @@ import Testing
         #expect(await responder.maximumConcurrentCallCount() == 2)
     }
 
+    @Test func synchronousInvalidationBeforeDispatchNeverCallsResponder() async {
+        for (offset, invalidation) in ImmediateInvalidation.allCases.enumerated() {
+            let responder = HeldCorrectionResponder(steps: [.success])
+            let coordinator = makeCoordinator(responder: responder)
+            coordinator.beginSession()
+            coordinator.enqueue(job(coordinator, sourceID: "source-\(offset)", sequence: 100 + offset))
+
+            switch invalidation {
+            case .cancelSource:
+                coordinator.cancel(sourceID: "source-\(offset)")
+            case .endSession:
+                coordinator.endSession()
+            case .disable:
+                coordinator.settings.isEnabled = false
+            case .providerChange:
+                coordinator.settings.model = "replacement-model"
+            }
+
+            try? await Task.sleep(for: .milliseconds(30))
+            #expect(await responder.callCount() == 0, "Unexpected request after \(invalidation)")
+        }
+    }
+
     @Test func disabledAndInvalidSettingsNeverCallResponder() async {
         let disabledResponder = HeldCorrectionResponder()
         let disabled = makeCoordinator(settings: .default, responder: disabledResponder)
@@ -398,6 +511,9 @@ private func job(
 
 private func job(
     sourceID: String,
+    sourceName: String? = nil,
+    sourceLanguageID: String = "en",
+    targetLanguageID: String = "zh-Hans",
     sequence: Int,
     generation: Int,
     capturedAt: Date? = nil,
@@ -408,9 +524,9 @@ private func job(
         sessionGeneration: generation,
         capturedAt: capturedAt ?? Date(timeIntervalSince1970: TimeInterval(sequence)),
         sourceID: sourceID,
-        sourceName: sourceID,
-        sourceLanguageID: "en",
-        targetLanguageID: "zh-Hans",
+        sourceName: sourceName ?? sourceID,
+        sourceLanguageID: sourceLanguageID,
+        targetLanguageID: targetLanguageID,
         localOriginal: "\(sourceID)-\(sequence)",
         localTranslation: "local-\(sourceID)-\(sequence)",
         audioWAVData: audio
@@ -441,6 +557,15 @@ private func waitUntil(
 }
 
 private struct HeldCorrectionResponder: CorrectionResponding {
+    struct RecordedContextEntry: Equatable, Sendable {
+        let sourceID: String
+        let sourceName: String
+        let sourceLanguageID: String
+        let targetLanguageID: String
+        let original: String
+        let translation: String
+    }
+
     enum Failure: Error, Sendable, Equatable {
         case audioUnsupported
         case http(Int)
@@ -498,6 +623,7 @@ private struct HeldCorrectionResponder: CorrectionResponding {
     func modes(for sourceID: String) async -> [CorrectionInputMode] { await state.calls.filter { $0.sourceID == sourceID }.map(\.prompt.mode) }
     func audioPresence(for sourceID: String) async -> [Bool] { await state.calls.filter { $0.sourceID == sourceID }.map { $0.audioWAVData?.isEmpty == false } }
     func contextOriginals(call index: Int) async -> [String] { await state.calls[index].contextOriginals }
+    func contextEntries(call index: Int) async -> [RecordedContextEntry] { await state.calls[index].contextEntries }
     func releaseHeldCall(sourceID: String, output: CorrectionProviderOutput) async { await state.releaseHeldCall(sourceID: sourceID, result: .success(output)) }
     func failHeldCall(sourceID: String, error: Failure) async { await state.releaseHeldCall(sourceID: sourceID, result: .failure(error)) }
     func releaseModelFetch(_ result: Result<[String], Failure>) async { await state.releaseModelFetch(result) }
@@ -509,7 +635,11 @@ private struct HeldCorrectionResponder: CorrectionResponding {
             let sequence: Int
             let prompt: CorrectionPrompt
             let audioWAVData: Data?
-            let contextOriginals: [String]
+            let contextEntries: [RecordedContextEntry]
+
+            var contextOriginals: [String] {
+                contextEntries.map(\.original)
+            }
         }
 
         let steps: [Step]
@@ -538,7 +668,7 @@ private struct HeldCorrectionResponder: CorrectionResponding {
                 sequence: current.sequence,
                 prompt: prompt,
                 audioWAVData: audioWAVData,
-                contextOriginals: Self.contextOriginals(prompt.userContent)
+                contextEntries: Self.contextEntries(prompt.userContent)
             ))
             activeIndices.insert(index)
             maximumConcurrentCallCount = max(maximumConcurrentCallCount, activeIndices.count)
@@ -629,10 +759,27 @@ private struct HeldCorrectionResponder: CorrectionResponding {
             return (sourceID, sequence)
         }
 
-        private static func contextOriginals(_ content: String) -> [String] {
+        private static func contextEntries(_ content: String) -> [RecordedContextEntry] {
             let payload = jsonPayload(content)
             let context = payload["context"] as? [[String: Any]] ?? []
-            return context.compactMap { $0["original"] as? String }
+            return context.compactMap { value in
+                guard let sourceID = value["sourceID"] as? String,
+                      let sourceName = value["sourceName"] as? String,
+                      let sourceLanguageID = value["sourceLanguageID"] as? String,
+                      let targetLanguageID = value["targetLanguageID"] as? String,
+                      let original = value["original"] as? String,
+                      let translation = value["translation"] as? String else {
+                    return nil
+                }
+                return RecordedContextEntry(
+                    sourceID: sourceID,
+                    sourceName: sourceName,
+                    sourceLanguageID: sourceLanguageID,
+                    targetLanguageID: targetLanguageID,
+                    original: original,
+                    translation: translation
+                )
+            }
         }
 
         private static func jsonPayload(_ content: String) -> [String: Any] {
@@ -650,4 +797,11 @@ private struct HeldCorrectionResponder: CorrectionResponding {
 private struct OpaqueFailure: LocalizedError, Sendable {
     let detail: String
     var errorDescription: String? { detail }
+}
+
+private enum ImmediateInvalidation: CaseIterable {
+    case cancelSource
+    case endSession
+    case disable
+    case providerChange
 }
