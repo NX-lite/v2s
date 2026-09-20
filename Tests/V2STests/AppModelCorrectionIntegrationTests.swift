@@ -24,7 +24,8 @@ import Testing
         try await waitUntil { await fixture.responder.callCount() == 1 }
         let epoch = fixture.model.overlayState?.captionEpoch
 
-        await fixture.responder.release(
+        try await releaseHeldCorrection(
+            fixture.responder,
             captionID: captionID,
             output: .init(correctedOriginal: "hello world", correctedTranslation: "你好，世界")
         )
@@ -51,7 +52,8 @@ import Testing
             audioWAVData: nil
         )
         try await waitUntil { await fixture.responder.callCount() == 1 }
-        await fixture.responder.release(
+        try await releaseHeldCorrection(
+            fixture.responder,
             captionID: captionID,
             output: .init(correctedOriginal: "must be ignored", correctedTranslation: "corrected translation")
         )
@@ -88,7 +90,8 @@ import Testing
         )
         let epoch = fixture.model.overlayState?.captionEpoch
 
-        await fixture.responder.release(
+        try await releaseHeldCorrection(
+            fixture.responder,
             captionID: firstID,
             output: .init(correctedOriginal: "first corrected", correctedTranslation: "first corrected translation")
         )
@@ -119,7 +122,8 @@ import Testing
         fixture.model.beginCorrectionSessionForTesting()
         #expect(fixture.model.correction.sessionGeneration > oldGeneration)
 
-        await fixture.responder.release(
+        try await releaseHeldCorrection(
+            fixture.responder,
             captionID: captionID,
             output: .init(correctedOriginal: "stale corrected", correctedTranslation: "stale translation")
         )
@@ -151,19 +155,85 @@ import Testing
         ))
         try await waitUntil { await fixture.responder.callCount() == 1 }
         #expect(fixture.model.correctedCaptionCountForTesting == 0)
+        let receiptCount = fixture.model.correctionResultReceiptCountForTesting
 
-        await fixture.responder.release(
+        try await releaseHeldCorrection(
+            fixture.responder,
             captionID: unknownCaptionID,
             output: .init(
                 correctedOriginal: nil,
                 correctedTranslation: "unknown corrected translation"
             )
         )
-        try await waitForQuiescence()
+        try await waitUntil {
+            fixture.model.correctionResultReceiptCountForTesting == receiptCount + 1
+        }
 
         #expect(fixture.model.correctedCaptionCountForTesting == 0)
         #expect(fixture.model.overlayState == overlayBefore)
         #expect(fixture.model.transcriptEntries == transcriptBefore)
+    }
+
+    @Test func heldResponderRejectsUnknownCaptionIDBeforeReleasingBoundRequest() async throws {
+        let fixture = makeFixture()
+        defer { fixture.removeSettingsFile() }
+        fixture.model.beginCorrectionSessionForTesting()
+        let captionID = fixture.model.commitLocalCaptionForTesting(
+            source: fixture.microphone,
+            original: "bound request",
+            translation: "bound translation",
+            audioWAVData: sampleWAV
+        )
+        try await waitUntil { await fixture.responder.callCount() == 1 }
+        try await fixture.responder.associateNextCall(with: captionID)
+
+        let releasedUnknownCaption = await fixture.responder.release(
+            captionID: UUID(),
+            output: .init(correctedOriginal: "wrong", correctedTranslation: "wrong")
+        )
+        #expect(releasedUnknownCaption == false)
+        let releasedBoundCaption = await fixture.responder.release(
+            captionID: captionID,
+            output: .init(correctedOriginal: "bound corrected", correctedTranslation: "bound corrected translation")
+        )
+        #expect(releasedBoundCaption)
+        try await waitUntil {
+            fixture.model.transcriptEntries.first?.sourceText == "bound corrected"
+        }
+        #expect(fixture.model.submittedCorrectionCaptionIDsForTesting.isEmpty)
+    }
+
+    @Test func correctedCaptionTrackingPrunesAfterTranscriptClearAndHistoryEviction() async throws {
+        let fixture = makeFixture()
+        defer { fixture.removeSettingsFile() }
+        fixture.model.beginCorrectionSessionForTesting()
+        let historyLimit = fixture.model.overlayHistoryLimitForTesting
+
+        for index in 0 ..< historyLimit + 2 {
+            let captionID = fixture.model.commitLocalCaptionForTesting(
+                source: fixture.microphone,
+                original: "local \(index)",
+                translation: "translation \(index)",
+                audioWAVData: sampleWAV
+            )
+            try await waitUntil { await fixture.responder.callCount() == index + 1 }
+            try await releaseHeldCorrection(
+                fixture.responder,
+                captionID: captionID,
+                output: .init(
+                    correctedOriginal: "corrected \(index)",
+                    correctedTranslation: "corrected translation \(index)"
+                )
+            )
+            try await waitUntil {
+                fixture.model.transcriptEntries.first(where: { $0.id == captionID })?.sourceText
+                    == "corrected \(index)"
+            }
+            fixture.model.clearTranscript()
+        }
+
+        #expect(fixture.model.overlayState?.history.count == historyLimit)
+        #expect(fixture.model.correctedCaptionCountForTesting == historyLimit + 1)
     }
 
     @Test func disabledPoliciesDoNotSubmitWhileEnabledSiblingStillDoes() async throws {
@@ -199,7 +269,8 @@ import Testing
         )
         try await waitUntil { await sourceDisabled.responder.callCount() == 1 }
         #expect(await sourceDisabled.responder.startedSourceIDs() == ["app-1"])
-        await sourceDisabled.responder.release(
+        try await releaseHeldCorrection(
+            sourceDisabled.responder,
             captionID: siblingID,
             output: .init(correctedOriginal: "corrected sibling", correctedTranslation: "corrected enabled translation")
         )
@@ -221,7 +292,8 @@ import Testing
             capturedAt: Date(timeIntervalSince1970: 1)
         )
         try await waitUntil { await fixture.responder.callCount() == 1 }
-        await fixture.responder.release(
+        try await releaseHeldCorrection(
+            fixture.responder,
             captionID: micFirst,
             output: .init(correctedOriginal: "mic corrected", correctedTranslation: "mic corrected translation")
         )
@@ -235,7 +307,8 @@ import Testing
             capturedAt: Date(timeIntervalSince1970: 2)
         )
         try await waitUntil { await fixture.responder.callCount() == 2 }
-        await fixture.responder.release(
+        try await releaseHeldCorrection(
+            fixture.responder,
             captionID: appFirst,
             output: .init(correctedOriginal: "app corrected", correctedTranslation: "app corrected translation")
         )
@@ -307,7 +380,8 @@ import Testing
             audioWAVData: sampleWAV
         )
         try await waitUntil { await fixture.responder.callCount() == 1 }
-        await fixture.responder.release(
+        try await releaseHeldCorrection(
+            fixture.responder,
             captionID: captionID,
             output: .init(correctedOriginal: "corrected original", correctedTranslation: "corrected translation")
         )
@@ -316,7 +390,6 @@ import Testing
         }
 
         fixture.model.applyLocalTranslationForTesting("late local translation", captionID: captionID)
-        try await waitForQuiescence()
 
         let entry = try #require(fixture.model.transcriptEntries.first)
         #expect(await fixture.responder.callCount() == 1)
@@ -337,7 +410,8 @@ import Testing
             audioWAVData: sampleWAV
         )
         try await waitUntil { await fixture.responder.callCount() == 1 }
-        await fixture.responder.release(
+        try await releaseHeldCorrection(
+            fixture.responder,
             captionID: captionID,
             output: .init(correctedOriginal: "app corrected original", correctedTranslation: "app corrected translation")
         )
@@ -359,6 +433,109 @@ import Testing
         try await verifyTerminalCleanup { $0.stopSession() }
         try await verifyTerminalCleanup { $0.failLiveSessionForTesting() }
         try await verifyTerminalCleanup { $0.completeFullStartupFailureForTesting() }
+    }
+
+    @Test func stopDuringResourcePreparationCannotResumeStaleSessionStart() async throws {
+        let fixture = makeFixture()
+        defer { fixture.removeSettingsFile() }
+        let resourceGate = AsyncTestGate()
+        var createdSessions: [LiveTranscriptionSession] = []
+        fixture.model.selectedSourceIDs = [fixture.microphone.id]
+        fixture.model.setSessionResourcePreparationOperationForTesting {
+            await resourceGate.suspend()
+        }
+        fixture.model.setLiveTranscriptionSessionFactoryForTesting {
+            let session = LiveTranscriptionSession()
+            session.setStartOperationForTesting {}
+            createdSessions.append(session)
+            return session
+        }
+
+        let startTask = Task { @MainActor in
+            await fixture.model.startSession()
+        }
+        await resourceGate.waitUntilSuspended()
+
+        fixture.model.stopSession()
+        let terminalCorrectionGeneration = fixture.model.correction.sessionGeneration
+        await resourceGate.resume()
+        await startTask.value
+
+        #expect(createdSessions.isEmpty)
+        #expect(fixture.model.correction.sessionGeneration == terminalCorrectionGeneration)
+        #expect(fixture.model.correctionSessionIsActiveForTesting == false)
+        #expect(fixture.model.liveTranscriptionSessionCountForTesting == 0)
+        #expect(fixture.model.sessionState == .idle)
+    }
+
+    @Test func stopDuringSourceStartStopsOnlyTheStaleLocalSession() async throws {
+        let fixture = makeFixture()
+        defer { fixture.removeSettingsFile() }
+        let sourceStartGate = AsyncTestGate()
+        let session = LiveTranscriptionSession()
+        session.setStartOperationForTesting {
+            await sourceStartGate.suspend()
+        }
+        fixture.model.selectedSourceIDs = [fixture.microphone.id]
+        fixture.model.setSessionResourcePreparationOperationForTesting {}
+        fixture.model.setLiveTranscriptionSessionFactoryForTesting { session }
+
+        let startTask = Task { @MainActor in
+            await fixture.model.startSession()
+        }
+        await sourceStartGate.waitUntilSuspended()
+
+        fixture.model.stopSession()
+        let terminalCorrectionGeneration = fixture.model.correction.sessionGeneration
+        await sourceStartGate.resume()
+        await startTask.value
+
+        #expect(await session.stopInvocationCountForTesting() == 1)
+        #expect(fixture.model.correction.sessionGeneration == terminalCorrectionGeneration)
+        #expect(fixture.model.correctionSessionIsActiveForTesting == false)
+        #expect(fixture.model.liveTranscriptionSessionCountForTesting == 0)
+        #expect(fixture.model.sessionState == .idle)
+    }
+
+    @Test func olderStartCannotOverwriteASecondSuccessfulSession() async throws {
+        let fixture = makeFixture()
+        defer { fixture.removeSettingsFile() }
+        let firstStartGate = AsyncTestGate()
+        let firstSession = LiveTranscriptionSession()
+        firstSession.setStartOperationForTesting {
+            await firstStartGate.suspend()
+        }
+        let secondSession = LiveTranscriptionSession()
+        secondSession.setStartOperationForTesting {}
+        var factoryCallCount = 0
+        fixture.model.selectedSourceIDs = [fixture.microphone.id]
+        fixture.model.setSessionResourcePreparationOperationForTesting {}
+        fixture.model.setLiveTranscriptionSessionFactoryForTesting {
+            defer { factoryCallCount += 1 }
+            return factoryCallCount == 0 ? firstSession : secondSession
+        }
+
+        let firstStartTask = Task { @MainActor in
+            await fixture.model.startSession()
+        }
+        await firstStartGate.waitUntilSuspended()
+
+        await fixture.model.startSession()
+        let currentCorrectionGeneration = fixture.model.correction.sessionGeneration
+        #expect(fixture.model.registeredLiveSessionForTesting(sourceID: fixture.microphone.id) === secondSession)
+        #expect(fixture.model.liveTranscriptionSessionCountForTesting == 1)
+        #expect(fixture.model.sessionState == .running)
+
+        await firstStartGate.resume()
+        await firstStartTask.value
+
+        #expect(await firstSession.stopInvocationCountForTesting() == 1)
+        #expect(await secondSession.stopInvocationCountForTesting() == 0)
+        #expect(fixture.model.correction.sessionGeneration == currentCorrectionGeneration)
+        #expect(fixture.model.correctionSessionIsActiveForTesting)
+        #expect(fixture.model.registeredLiveSessionForTesting(sourceID: fixture.microphone.id) === secondSession)
+        #expect(fixture.model.liveTranscriptionSessionCountForTesting == 1)
+        #expect(fixture.model.sessionState == .running)
     }
 
     @Test func appModelTeardownEndsCorrectionAndClearsEveryLiveAudioBuffer() async throws {
@@ -503,8 +680,10 @@ import Testing
         #expect(await fixture.responder.audioPresence() == [false])
         #expect(await fixture.responder.requestModes() == [.textOnly])
 
-        await fixture.responder.release(
-            captionID: UUID(),
+        let oldCaptionID = try #require(fixture.model.submittedCorrectionCaptionIDsForTesting.first)
+        try await releaseHeldCorrection(
+            fixture.responder,
+            captionID: oldCaptionID,
             output: .init(correctedOriginal: nil, correctedTranslation: "Old.")
         )
         fixture.model.resumeOldestProviderAudioTransitionResetForTesting()
@@ -589,6 +768,8 @@ import Testing
             audioWAVData: sampleWAV
         )
         try await waitUntil { await fixture.responder.callCount() == 2 }
+        try await fixture.responder.associateNextCall(with: microphoneCaptionID)
+        try await fixture.responder.associateNextCall(with: applicationCaptionID)
 
         fixture.model.correction.settings.disabledSourceIDs = [fixture.microphone.id]
         try await waitUntil {
@@ -596,14 +777,14 @@ import Testing
             let applicationEnabled = await applicationSession.correctionAudioCaptureEnabledForTesting()
             return !microphoneEnabled && applicationEnabled
         }
-        await fixture.responder.release(
+        #expect(await fixture.responder.release(
             captionID: microphoneCaptionID,
             output: .init(correctedOriginal: "cancelled correction", correctedTranslation: "cancelled translation")
-        )
-        await fixture.responder.release(
+        ))
+        #expect(await fixture.responder.release(
             captionID: applicationCaptionID,
             output: .init(correctedOriginal: "app corrected", correctedTranslation: "app corrected translation")
-        )
+        ))
         try await waitUntil {
             fixture.model.transcriptEntries.first(where: { $0.id == applicationCaptionID })?.sourceText == "app corrected"
         }
@@ -704,6 +885,7 @@ private struct CorrectionFixture {
     let application: InputSource
 
     func removeSettingsFile() {
+        responder.cancelAll()
         try? FileManager.default.removeItem(at: settingsURL)
     }
 }
@@ -852,7 +1034,7 @@ actor IntegrationHeldCorrectionResponder: CorrectionResponding {
     }
 
     private var calls: [Call] = []
-    private var continuations: [CheckedContinuation<CorrectionProviderOutput, Error>] = []
+    nonisolated private let continuationRegistry = HeldCorrectionContinuationRegistry()
 
     nonisolated func validate(settings: CorrectionSettings) throws {
         guard settings.apiKey.isEmpty == false,
@@ -895,13 +1077,20 @@ actor IntegrationHeldCorrectionResponder: CorrectionResponding {
                 return sourceID
             }
         ))
-        return try await withCheckedThrowingContinuation { continuations.append($0) }
+        return try await withCheckedThrowingContinuation { continuationRegistry.append($0) }
     }
 
-    func release(captionID: UUID, output: CorrectionProviderOutput) {
-        _ = captionID
-        guard continuations.isEmpty == false else { return }
-        continuations.removeFirst().resume(returning: output)
+    func associateNextCall(with captionID: UUID) throws {
+        try continuationRegistry.associateNext(with: captionID)
+    }
+
+    @discardableResult
+    func release(captionID: UUID, output: CorrectionProviderOutput) -> Bool {
+        continuationRegistry.release(captionID: captionID, output: output)
+    }
+
+    nonisolated func cancelAll() {
+        continuationRegistry.cancelAll()
     }
 
     func callCount() -> Int { calls.count }
@@ -926,5 +1115,99 @@ actor IntegrationHeldCorrectionResponder: CorrectionResponding {
     }
 }
 
+private final class HeldCorrectionContinuationRegistry: @unchecked Sendable {
+    private let lock = NSLock()
+    private var unbound: [CheckedContinuation<CorrectionProviderOutput, Error>] = []
+    private var bound: [UUID: CheckedContinuation<CorrectionProviderOutput, Error>] = [:]
+
+    deinit {
+        cancelAll()
+    }
+
+    func append(_ continuation: CheckedContinuation<CorrectionProviderOutput, Error>) {
+        lock.lock()
+        unbound.append(continuation)
+        lock.unlock()
+    }
+
+    func associateNext(with captionID: UUID) throws {
+        lock.lock()
+        defer { lock.unlock() }
+        guard bound[captionID] == nil, unbound.isEmpty == false else {
+            throw IntegrationNoHeldCorrectionCall()
+        }
+        bound[captionID] = unbound.removeFirst()
+    }
+
+    func release(captionID: UUID, output: CorrectionProviderOutput) -> Bool {
+        lock.lock()
+        var continuation = bound.removeValue(forKey: captionID)
+        if continuation == nil, bound.isEmpty, unbound.count == 1 {
+            continuation = unbound.removeFirst()
+        }
+        lock.unlock()
+        guard let continuation else {
+            return false
+        }
+        continuation.resume(returning: output)
+        return true
+    }
+
+    func cancelAll() {
+        lock.lock()
+        let continuations = unbound + Array(bound.values)
+        unbound.removeAll()
+        bound.removeAll()
+        lock.unlock()
+        for continuation in continuations {
+            continuation.resume(throwing: CancellationError())
+        }
+    }
+}
+
+private func releaseHeldCorrection(
+    _ responder: IntegrationHeldCorrectionResponder,
+    captionID: UUID,
+    output: CorrectionProviderOutput
+) async throws {
+    try await responder.associateNextCall(with: captionID)
+    guard await responder.release(captionID: captionID, output: output) else {
+        throw IntegrationUnknownCaptionID()
+    }
+}
+
 private struct CorrectionIntegrationWaitTimeout: Error {}
 private struct CorrectionIntegrationPromptParsingFailure: Error {}
+private struct IntegrationUnknownCaptionID: Error {}
+private struct IntegrationNoHeldCorrectionCall: Error {}
+
+private actor AsyncTestGate {
+    private var isSuspended = false
+    private var suspensionContinuation: CheckedContinuation<Void, Never>?
+    private var observers: [CheckedContinuation<Void, Never>] = []
+
+    func suspend() async {
+        isSuspended = true
+        let observers = observers
+        self.observers.removeAll()
+        for observer in observers {
+            observer.resume()
+        }
+        await withCheckedContinuation { continuation in
+            suspensionContinuation = continuation
+        }
+    }
+
+    func waitUntilSuspended() async {
+        guard isSuspended == false else { return }
+        await withCheckedContinuation { continuation in
+            observers.append(continuation)
+        }
+    }
+
+    func resume() {
+        isSuspended = false
+        suspensionContinuation?.resume()
+        suspensionContinuation = nil
+    }
+}

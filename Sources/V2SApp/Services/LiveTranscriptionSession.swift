@@ -243,6 +243,10 @@ final class LiveTranscriptionSession: NSObject, @unchecked Sendable {
     private var fatalErrorHandler: (@MainActor (String) -> Void)?
     @MainActor private var recentCommittedSentenceHistory: [RecentCommittedSentence] = []
     @MainActor private var shouldInvalidateCommittedDeliveryAfterAuthorizationForTesting = false
+    #if DEBUG
+    private var startOperationForTesting: (@Sendable () async throws -> Void)?
+    private var stopInvocationCount = 0
+    #endif
 
     private func localized(_ key: AppTextKey, _ arguments: CVarArg...) -> String {
         AppLocalization.formattedString(key, languageID: interfaceLanguageID, arguments: arguments)
@@ -307,6 +311,13 @@ final class LiveTranscriptionSession: NSObject, @unchecked Sendable {
         errorHandler: @escaping @MainActor (String) -> Void,
         fatalErrorHandler: @escaping @MainActor (String) -> Void
     ) async throws {
+        #if DEBUG
+        if let startOperationForTesting {
+            try await startOperationForTesting()
+            return
+        }
+        #endif
+
         self.transcriptHandler = transcriptHandler
         self.partialHandler = partialHandler
         self.modeConfig = modeConfig
@@ -387,6 +398,9 @@ final class LiveTranscriptionSession: NSObject, @unchecked Sendable {
     }
 
     private func stopOnCaptureQueue() {
+        #if DEBUG
+        stopInvocationCount += 1
+        #endif
         beginCommittedDeliveryStateMutation()
         defer { endCommittedDeliveryStateMutation() }
 
@@ -460,6 +474,22 @@ final class LiveTranscriptionSession: NSObject, @unchecked Sendable {
             }
         }
     }
+
+    #if DEBUG
+    func setStartOperationForTesting(
+        _ operation: @escaping @Sendable () async throws -> Void
+    ) {
+        startOperationForTesting = operation
+    }
+
+    func stopInvocationCountForTesting() async -> Int {
+        await withCheckedContinuation { continuation in
+            captureQueue.async { [weak self] in
+                continuation.resume(returning: self?.stopInvocationCount ?? 0)
+            }
+        }
+    }
+    #endif
 
     func correctionAudioCaptureEnabledForTesting() async -> Bool {
         await withCheckedContinuation { continuation in

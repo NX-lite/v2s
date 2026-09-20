@@ -45,6 +45,7 @@ final class AppModel: ObservableObject {
     private var liveTranscriptionSessions: [LiveTranscriptionSession] = []
     private var liveTranscriptionSessionsBySourceID: [String: LiveTranscriptionSession] = [:]
     private var correctionSessionIsActive = false
+    private var sessionLifecycleGeneration: Int = 0
     // Sources whose capture actually started. A multi-source session tolerates inputs
     // that fail to open, so this can be a subset of `selectedSources` while running.
     private var activeSources: [InputSource] = []
@@ -83,6 +84,9 @@ final class AppModel: ObservableObject {
     #if DEBUG
     private var providerAudioTransitionResetPauseBudgetForTesting = 0
     private var pausedProviderAudioTransitionResetsForTesting: [Int: CheckedContinuation<Void, Never>] = [:]
+    private var sessionResourcePreparationOperationForTesting: (@MainActor () async -> Void)?
+    private var liveTranscriptionSessionFactoryForTesting: (@MainActor () -> LiveTranscriptionSession)?
+    private var correctionResultReceiptCountForTestingStorage = 0
     #endif
     private var recentRecognizedCaptionTexts: [RecentRecognizedCaption] = []
     private var recentArchivedCaption: RecentArchivedCaption?
@@ -617,14 +621,20 @@ final class AppModel: ObservableObject {
     }
 
     func startSession() async {
+        sessionLifecycleGeneration &+= 1
+        let lifecycleGeneration = sessionLifecycleGeneration
         assistant.resetForNewSession()
         // Finish releasing any earlier capture resources before opening replacements.
         endCorrectionSessionAndClearLiveAudio()
         await stopLiveTranscriptionSessionsAndWait()
+        guard sessionLifecycleGeneration == lifecycleGeneration else {
+            return
+        }
         refreshSources()
 
         let selectedSources = self.selectedSources
         guard selectedSources.isEmpty == false else {
+            invalidateSessionLifecycleGeneration(ifCurrent: lifecycleGeneration)
             sessionState = .error
             setStatus(.chooseInputSourceBeforeStarting)
             isOverlayVisible = false
@@ -637,7 +647,11 @@ final class AppModel: ObservableObject {
         resetLiveTextPipeline()
         setStatus(.checkingLanguageResources)
         await awaitSelectedLanguageResourcePreparationIfNeeded()
+        guard sessionLifecycleGeneration == lifecycleGeneration else {
+            return
+        }
         guard hasBlockingLanguageResourceStatuses == false else {
+            invalidateSessionLifecycleGeneration(ifCurrent: lifecycleGeneration)
             setStatus(.downloadLanguageResourcesInSystemSettings)
             return
         }
@@ -674,7 +688,7 @@ final class AppModel: ObservableObject {
         for source in selectedSources {
             let sourceLanguageID = languageID(for: source)
             let targetLanguageID = outputLanguageIDForSource(source)
-            let session = LiveTranscriptionSession()
+            let session = makeLiveTranscriptionSession()
             // Identity only. Capturing the session in the handler it is about to own
             // would retain it for the session's own lifetime.
             let sessionID = ObjectIdentifier(session)
@@ -687,6 +701,7 @@ final class AppModel: ObservableObject {
                     modeConfig: config,
                     contextualStrings: recognitionHints,
                     transcriptHandler: { [weak self] sentence in
+                        guard self?.sessionLifecycleGeneration == lifecycleGeneration else { return }
                         self?.enqueueRecognizedSentence(
                             sentence,
                             source: source,
@@ -695,6 +710,7 @@ final class AppModel: ObservableObject {
                         )
                     },
                     partialHandler: { [weak self] draft in
+                        guard self?.sessionLifecycleGeneration == lifecycleGeneration else { return }
                         self?.handlePartialDraft(
                             draft,
                             source: source,
@@ -703,6 +719,7 @@ final class AppModel: ObservableObject {
                         )
                     },
                     errorHandler: { [weak self] message in
+                        guard self?.sessionLifecycleGeneration == lifecycleGeneration else { return }
                         self?.sessionState = .error
                         self?.setStatus(.custom(message))
                         self?.overlayState = OverlayPreviewState(
@@ -713,6 +730,7 @@ final class AppModel: ObservableObject {
                     },
                     fatalErrorHandler: { [weak self] message in
                         guard let self else { return }
+                        guard sessionLifecycleGeneration == lifecycleGeneration else { return }
                         // While startSession() owns the state machine it decides what a
                         // fatal error means: a source that never finished starting is
                         // only that source's failure, not the whole session's. Recording
@@ -726,6 +744,14 @@ final class AppModel: ObservableObject {
                     }
                 )
 
+                guard sessionLifecycleGeneration == lifecycleGeneration else {
+                    await stopStaleSessionStart(
+                        sessions: startedSessions + [session],
+                        sources: startedSources + [source]
+                    )
+                    return
+                }
+
                 registerCorrectionAudioControl(session, sourceID: source.id)
                 startedSessions.append(session)
                 startedSources.append(source)
@@ -735,6 +761,13 @@ final class AppModel: ObservableObject {
                 // remaining selections instead of turning a partial failure into a
                 // global "Unable to start" state.
                 await session.stopAndWait()
+                guard sessionLifecycleGeneration == lifecycleGeneration else {
+                    await stopStaleSessionStart(
+                        sessions: startedSessions,
+                        sources: startedSources
+                    )
+                    return
+                }
                 startupFailures.append(error)
             }
 
@@ -767,6 +800,10 @@ final class AppModel: ObservableObject {
         }
 
         isStartingSession = false
+        guard sessionLifecycleGeneration == lifecycleGeneration else {
+            await stopStaleSessionStart(sessions: startedSessions, sources: startedSources)
+            return
+        }
 
         if startedSessions.isEmpty == false {
             liveTranscriptionSessions = startedSessions
@@ -805,6 +842,7 @@ final class AppModel: ObservableObject {
             return
         }
 
+        invalidateSessionLifecycleGeneration(ifCurrent: lifecycleGeneration)
         resetLiveTextPipeline()
         endCorrectionSessionAndClearLiveAudio()
         liveTranscriptionSession = nil
@@ -831,6 +869,7 @@ final class AppModel: ObservableObject {
     /// failing ends the logical session, so its siblings stop before the global
     /// "capture stopped" state is shown.
     private func handleFatalSessionError(_ message: String, sourceName: String) {
+        invalidateSessionLifecycleGeneration()
         endCorrectionSessionAndClearLiveAudio()
         stopLiveTranscriptionSessions()
         sessionState = .error
@@ -843,6 +882,7 @@ final class AppModel: ObservableObject {
     }
 
     func stopSession() {
+        invalidateSessionLifecycleGeneration()
         assistant.cancelRequest()
         endCorrectionSessionAndClearLiveAudio()
         resetLiveTextPipeline()
@@ -881,6 +921,28 @@ final class AppModel: ObservableObject {
         liveTranscriptionSession = nil
         activeSources.removeAll()
         return sessions
+    }
+
+    private func invalidateSessionLifecycleGeneration() {
+        sessionLifecycleGeneration &+= 1
+    }
+
+    private func invalidateSessionLifecycleGeneration(ifCurrent generation: Int) {
+        guard sessionLifecycleGeneration == generation else { return }
+        invalidateSessionLifecycleGeneration()
+    }
+
+    private func stopStaleSessionStart(
+        sessions: [LiveTranscriptionSession],
+        sources: [InputSource]
+    ) async {
+        for (session, source) in zip(sessions, sources) {
+            if liveTranscriptionSessionsBySourceID[source.id] === session {
+                liveTranscriptionSessionsBySourceID.removeValue(forKey: source.id)
+                session.setCorrectionAudioCaptureEnabled(false)
+            }
+            await session.stopAndWait()
+        }
     }
 
     func showOverlayPreview() {
@@ -1106,6 +1168,7 @@ final class AppModel: ObservableObject {
     }
 
     func prepareForApplicationTermination() {
+        invalidateSessionLifecycleGeneration()
         assistant.cancelRequest()
         endCorrectionSessionAndClearLiveAudio()
     }
@@ -1340,6 +1403,13 @@ final class AppModel: ObservableObject {
     }
 
     private func awaitSelectedLanguageResourcePreparationIfNeeded() async {
+        #if DEBUG
+        if let sessionResourcePreparationOperationForTesting {
+            await sessionResourcePreparationOperationForTesting()
+            return
+        }
+        #endif
+
         if languageResourcePreparationTask == nil {
             scheduleSelectedLanguageResourcePreparation()
         }
@@ -2434,6 +2504,7 @@ final class AppModel: ObservableObject {
     func clearTranscript() {
         transcriptEntries.removeAll()
         transcriptGeneration &+= 1
+        pruneCorrectedCaptionTracking()
     }
 
     #if DEBUG
@@ -2474,6 +2545,26 @@ final class AppModel: ObservableObject {
 
     func beginCorrectionSessionForTesting() {
         beginCorrectionSession()
+    }
+
+    func setSessionResourcePreparationOperationForTesting(
+        _ operation: @escaping @MainActor () async -> Void
+    ) {
+        sessionResourcePreparationOperationForTesting = operation
+    }
+
+    func setLiveTranscriptionSessionFactoryForTesting(
+        _ factory: @escaping @MainActor () -> LiveTranscriptionSession
+    ) {
+        liveTranscriptionSessionFactoryForTesting = factory
+    }
+
+    var correctionSessionIsActiveForTesting: Bool {
+        correctionSessionIsActive
+    }
+
+    func registeredLiveSessionForTesting(sourceID: String) -> LiveTranscriptionSession? {
+        liveTranscriptionSessionsBySourceID[sourceID]
     }
 
     @discardableResult
@@ -2552,6 +2643,7 @@ final class AppModel: ObservableObject {
     }
 
     func completeFullStartupFailureForTesting() {
+        invalidateSessionLifecycleGeneration()
         endCorrectionSessionAndClearLiveAudio()
         stopLiveTranscriptionSessions()
     }
@@ -2564,8 +2656,20 @@ final class AppModel: ObservableObject {
         correctedCaptionIDs.count
     }
 
+    var overlayHistoryLimitForTesting: Int {
+        Self.overlayHistoryLimit
+    }
+
     var pendingCaptionCountForTesting: Int {
         pendingCaptions.count
+    }
+
+    var submittedCorrectionCaptionIDsForTesting: Set<UUID> {
+        Set(submittedCorrectionSourceIDsByCaptionID.keys)
+    }
+
+    var correctionResultReceiptCountForTesting: Int {
+        correctionResultReceiptCountForTestingStorage
     }
 
     func pauseNextProviderAudioTransitionResetForTesting() {
@@ -2652,6 +2756,15 @@ final class AppModel: ObservableObject {
         submitCorrectionIfEnabled(for: caption, localTranslation: translation)
     }
     #endif
+
+    private func makeLiveTranscriptionSession() -> LiveTranscriptionSession {
+        #if DEBUG
+        if let liveTranscriptionSessionFactoryForTesting {
+            return liveTranscriptionSessionFactoryForTesting()
+        }
+        #endif
+        return LiveTranscriptionSession()
+    }
 
     var shouldReserveCommittedCaptionSlot: Bool {
         guard sessionState == .running else {
@@ -2897,7 +3010,14 @@ final class AppModel: ObservableObject {
     }
 
     private func applyCorrectionResult(_ result: CorrectionResult) {
+        #if DEBUG
+        correctionResultReceiptCountForTestingStorage += 1
+        #endif
         guard result.sessionGeneration == correction.sessionGeneration else { return }
+        guard submittedCorrectionSourceIDsByCaptionID[result.captionID] == result.sourceID else {
+            return
+        }
+        submittedCorrectionSourceIDsByCaptionID.removeValue(forKey: result.captionID)
 
         let transcriptIndex = transcriptEntries.firstIndex {
             $0.id == result.captionID && $0.sourceID == result.sourceID
@@ -2908,8 +3028,7 @@ final class AppModel: ObservableObject {
         let isCurrentCaption = displayedCaption?.id == result.captionID
             && displayedCaption?.sourceID == result.sourceID
             && overlayState?.committedCaptionID == result.captionID
-        guard submittedCorrectionSourceIDsByCaptionID[result.captionID] == result.sourceID,
-              transcriptIndex != nil || historyIndex != nil || isCurrentCaption else {
+        guard transcriptIndex != nil || historyIndex != nil || isCurrentCaption else {
             return
         }
 
@@ -3719,9 +3838,23 @@ final class AppModel: ObservableObject {
             if overlayHistoryScrollOffset > 0 {
                 overlayHistoryScrollOffset = max(0, overlayHistoryScrollOffset - overflow)
             }
+            pruneCorrectedCaptionTracking()
         }
 
         clampOverlayHistoryScrollOffset()
+    }
+
+    private func pruneCorrectedCaptionTracking() {
+        var retainedCaptionIDs = Set(pendingCaptions.map(\.id))
+        retainedCaptionIDs.formUnion(transcriptEntries.map(\.id))
+        retainedCaptionIDs.formUnion(overlayState?.history.map(\.id) ?? [])
+        if let captionID = displayedCaption?.id {
+            retainedCaptionIDs.insert(captionID)
+        }
+        if let captionID = overlayState?.committedCaptionID {
+            retainedCaptionIDs.insert(captionID)
+        }
+        correctedCaptionIDs.formIntersection(retainedCaptionIDs)
     }
 
     private func shouldStoreOverlayHistory(translatedText: String, sourceText: String) -> Bool {
