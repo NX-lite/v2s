@@ -2504,7 +2504,7 @@ final class AppModel: ObservableObject {
     func clearTranscript() {
         transcriptEntries.removeAll()
         transcriptGeneration &+= 1
-        pruneCorrectedCaptionTracking()
+        pruneCorrectionCaptionTracking()
     }
 
     #if DEBUG
@@ -3838,13 +3838,13 @@ final class AppModel: ObservableObject {
             if overlayHistoryScrollOffset > 0 {
                 overlayHistoryScrollOffset = max(0, overlayHistoryScrollOffset - overflow)
             }
-            pruneCorrectedCaptionTracking()
+            pruneCorrectionCaptionTracking()
         }
 
         clampOverlayHistoryScrollOffset()
     }
 
-    private func pruneCorrectedCaptionTracking() {
+    private func pruneCorrectionCaptionTracking() {
         var retainedCaptionIDs = Set(pendingCaptions.map(\.id))
         retainedCaptionIDs.formUnion(transcriptEntries.map(\.id))
         retainedCaptionIDs.formUnion(overlayState?.history.map(\.id) ?? [])
@@ -3853,6 +3853,9 @@ final class AppModel: ObservableObject {
         }
         if let captionID = overlayState?.committedCaptionID {
             retainedCaptionIDs.insert(captionID)
+        }
+        submittedCorrectionSourceIDsByCaptionID = submittedCorrectionSourceIDsByCaptionID.filter {
+            retainedCaptionIDs.contains($0.key)
         }
         correctedCaptionIDs.formIntersection(retainedCaptionIDs)
     }

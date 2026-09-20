@@ -236,6 +236,66 @@ import Testing
         #expect(fixture.model.correctedCaptionCountForTesting == historyLimit + 1)
     }
 
+    @Test func submittedTrackingPrunesEvictedFailureButRetainsActiveHistoryCaption() async throws {
+        let fixture = makeFixture()
+        defer { fixture.removeSettingsFile() }
+        fixture.model.beginCorrectionSessionForTesting()
+
+        let failedCaptionID = fixture.model.commitLocalCaptionForTesting(
+            source: fixture.microphone,
+            original: "failed local",
+            translation: "failed translation",
+            audioWAVData: sampleWAV
+        )
+        try await waitUntil { await fixture.responder.callCount() == 1 }
+        try await fixture.responder.associateNextCall(with: failedCaptionID)
+        fixture.responder.cancelAll()
+        try await waitUntil {
+            if case .warning = fixture.model.correction.status {
+                return true
+            }
+            return false
+        }
+
+        let activeCaptionID = fixture.model.commitLocalCaptionForTesting(
+            source: fixture.application,
+            original: "active local",
+            translation: "active translation",
+            audioWAVData: sampleWAV
+        )
+        try await waitUntil { await fixture.responder.callCount() == 2 }
+        try await fixture.responder.associateNextCall(with: activeCaptionID)
+        fixture.model.clearTranscript()
+        fixture.model.correction.settings.disabledSourceIDs = [fixture.microphone.id]
+
+        for index in 0 ..< fixture.model.overlayHistoryLimitForTesting {
+            fixture.model.commitLocalCaptionForTesting(
+                source: fixture.microphone,
+                original: "local \(index)",
+                translation: "translation \(index)",
+                audioWAVData: sampleWAV
+            )
+            fixture.model.clearTranscript()
+        }
+
+        #expect(fixture.model.overlayState?.history.contains(where: { $0.id == failedCaptionID }) == false)
+        #expect(fixture.model.overlayState?.history.contains(where: { $0.id == activeCaptionID }) == true)
+        #expect(fixture.model.submittedCorrectionCaptionIDsForTesting == [activeCaptionID])
+
+        #expect(await fixture.responder.release(
+            captionID: activeCaptionID,
+            output: .init(
+                correctedOriginal: "active corrected",
+                correctedTranslation: "active corrected translation"
+            )
+        ))
+        try await waitUntil {
+            fixture.model.overlayState?.history.first(where: { $0.id == activeCaptionID })?.sourceText
+                == "active corrected"
+        }
+        #expect(fixture.model.submittedCorrectionCaptionIDsForTesting.isEmpty)
+    }
+
     @Test func disabledPoliciesDoNotSubmitWhileEnabledSiblingStillDoes() async throws {
         let globallyDisabled = makeFixture(correctionSettings: configuredCorrectionSettings(isEnabled: false))
         defer { globallyDisabled.removeSettingsFile() }
