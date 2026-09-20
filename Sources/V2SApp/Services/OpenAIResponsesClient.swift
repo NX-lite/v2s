@@ -98,7 +98,14 @@ struct OpenAIResponsesClient: Sendable {
     }
 
     func correct(prompt: CorrectionPrompt, audioWAVData: Data?) async throws -> CorrectionProviderOutput {
-        guard prompt.mode != .audio || audioWAVData != nil else { throw ClientError.invalidRequest }
+        let requestAudioWAVData: Data?
+        switch prompt.mode {
+        case .audio:
+            guard let audioWAVData, !audioWAVData.isEmpty else { throw ClientError.invalidRequest }
+            requestAudioWAVData = audioWAVData
+        case .textOnly:
+            requestAudioWAVData = nil
+        }
 
         let configuration = try validatedRequestConfiguration()
         let response: Response
@@ -110,7 +117,7 @@ struct OpenAIResponsesClient: Sendable {
                 instructions: prompt.instructions,
                 prompt: prompt.userContent,
                 screenshotPNGData: nil,
-                audioWAVData: audioWAVData
+                audioWAVData: requestAudioWAVData
             )
         case .openAI(let endpoint):
             response = try await respondOpenAI(
@@ -120,7 +127,7 @@ struct OpenAIResponsesClient: Sendable {
                 instructions: prompt.instructions,
                 prompt: prompt.userContent,
                 screenshotPNGData: nil,
-                audioWAVData: audioWAVData
+                audioWAVData: requestAudioWAVData
             )
         }
         return try Self.decodeCorrectionOutput(response.text, mode: prompt.mode)

@@ -66,12 +66,42 @@ import Testing
         }
     }
 
+    @Test func textOnlyRequestsIgnoreSuppliedAudioData() async throws {
+        for provider in ProviderKind.allCases {
+            let transport = StubHTTPTransport(stubs: [.init(status: 200, data: providerResponse(provider, output: textOutput()))])
+            let client = makeClient(provider, transport: transport)
+
+            let result = try await client.correct(prompt: textPrompt(), audioWAVData: Data([1, 2]))
+            let request = try #require(await transport.firstRequest())
+            let body = try #require(request.httpBody)
+            let serializedBody = try #require(String(data: body, encoding: .utf8))
+
+            #expect(!serializedBody.contains("input_audio"))
+            #expect(!serializedBody.contains("input_image"))
+            #expect(!serializedBody.contains("image_url"))
+            #expect(!serializedBody.contains("inline_data"))
+            #expect(!serializedBody.contains("AQI="))
+            #expect(!serializedBody.contains("audio/wav"))
+            #expect(result == .init(correctedOriginal: nil, correctedTranslation: "Translation"))
+        }
+    }
+
     @Test func audioCorrectionRequiresAudioData() async {
         let transport = StubHTTPTransport(stubs: [])
         let client = makeClient(.chat, transport: transport)
 
         await #expect(throws: OpenAIResponsesClient.ClientError.invalidRequest) {
             try await client.correct(prompt: audioPrompt(), audioWAVData: nil)
+        }
+        #expect(await transport.requestCount() == 0)
+    }
+
+    @Test func audioCorrectionRejectsEmptyAudioData() async {
+        let transport = StubHTTPTransport(stubs: [])
+        let client = makeClient(.chat, transport: transport)
+
+        await #expect(throws: OpenAIResponsesClient.ClientError.invalidRequest) {
+            try await client.correct(prompt: audioPrompt(), audioWAVData: Data())
         }
         #expect(await transport.requestCount() == 0)
     }
