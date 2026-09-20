@@ -17,6 +17,7 @@ struct OverlayPreviewState: Equatable {
     var translatedText: String
     var sourceText: String
     var sourceName: String
+    var committedCaptionID: UUID? = nil
 
     // MARK: Draft layer — partial ASR, shown below committed
     var draftSourceText: String? = nil

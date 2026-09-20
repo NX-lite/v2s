@@ -1,3 +1,4 @@
+import AVFoundation
 import Foundation
 import Testing
 @testable import v2s
@@ -170,6 +171,8 @@ import Testing
             targetLanguageID: "zh-Hans",
             localSourceText: "First source",
             localTranslatedText: "First translation",
+            correctedSourceText: "Corrected first source",
+            correctedTranslatedText: "Corrected first translation",
             timestamp: Date(timeIntervalSince1970: 200)
         )
         let second = TranscriptEntry(
@@ -180,6 +183,8 @@ import Testing
             targetLanguageID: "en",
             localSourceText: "Second source",
             localTranslatedText: "Second translation",
+            correctedSourceText: nil,
+            correctedTranslatedText: "Corrected second translation",
             timestamp: Date(timeIntervalSince1970: 100)
         )
 
@@ -193,8 +198,8 @@ import Testing
         #expect(snapshot.outputLanguageID == model.outputLanguageID)
         #expect(snapshot.outputLanguageName == model.languageName(for: model.outputLanguageID))
         #expect(snapshot.entries == [
-            .init(timestamp: first.timestamp, sourceName: "Desk Mic", sourceLanguageID: "en", sourceLanguageName: model.languageName(for: "en"), targetLanguageID: "zh-Hans", targetLanguageName: model.languageName(for: "zh-Hans"), sourceText: "First source", translatedText: "First translation"),
-            .init(timestamp: second.timestamp, sourceName: "Remote Mic", sourceLanguageID: "ja", sourceLanguageName: model.languageName(for: "ja"), targetLanguageID: "en", targetLanguageName: model.languageName(for: "en"), sourceText: "Second source", translatedText: "Second translation"),
+            .init(timestamp: first.timestamp, sourceName: "Desk Mic", sourceLanguageID: "en", sourceLanguageName: model.languageName(for: "en"), targetLanguageID: "zh-Hans", targetLanguageName: model.languageName(for: "zh-Hans"), sourceText: "Corrected first source", translatedText: "Corrected first translation"),
+            .init(timestamp: second.timestamp, sourceName: "Remote Mic", sourceLanguageID: "ja", sourceLanguageName: model.languageName(for: "ja"), targetLanguageID: "en", targetLanguageName: model.languageName(for: "en"), sourceText: "Second source", translatedText: "Corrected second translation"),
         ])
     }
 
@@ -248,7 +253,16 @@ import Testing
 
         let originalAssistant = configuredAssistantSettings()
         let store = SettingsStore(fileURL: settingsURL)
-        store.save(makeAppSettings(assistant: originalAssistant))
+        var originalSettings = makeAppSettings(assistant: originalAssistant)
+        originalSettings.correction = CorrectionSettings(
+            isEnabled: true,
+            apiKey: "correction-placeholder-key",
+            baseURL: "https://example.invalid/correction/v1",
+            model: "correction-model",
+            disabledSourceIDs: ["source:secondary"],
+            isolatedContextSourceIDs: ["source:primary"]
+        )
+        store.save(originalSettings)
         let coordinator = AssistantCoordinator(settings: originalAssistant)
         let model = AppModel(
             settingsStore: store,
@@ -280,6 +294,7 @@ import Testing
         #expect(reloaded.subtitleMode == .reading)
         #expect(reloaded.subtitleDisplayMode == .translatedOnly)
         #expect(reloaded.glossary == ["ETA": "预计到达时间"])
+        #expect(reloaded.correction == originalSettings.correction)
     }
 
     @Test func defaultCoordinatorLoadsTheNestedAssistantSettingsWithoutOverwritingThem() {
@@ -483,17 +498,54 @@ import Testing
         defer { try? FileManager.default.removeItem(at: settingsURL) }
 
         let responder = HeldResponder()
+        let correctionResponder = IntegrationHeldCorrectionResponder()
+        let correctionSettings = CorrectionSettings(
+            isEnabled: true,
+            apiKey: "correction-placeholder-key",
+            baseURL: "https://example.invalid/correction/v1",
+            model: "correction-model",
+            disabledSourceIDs: [],
+            isolatedContextSourceIDs: []
+        )
         let assistant = AssistantCoordinator(
             settings: configuredAssistantSettings(),
             responder: responder,
             screenContextProvider: ReadyScreenContextProvider(),
             promptBuilder: StaticPromptBuilder()
         )
-        let model = AppModel(
-            settingsStore: SettingsStore(fileURL: settingsURL),
-            sourceCatalogService: TestSourceCatalogService(),
-            assistant: assistant
+        let store = SettingsStore(fileURL: settingsURL)
+        var settings = makeAppSettings(assistant: configuredAssistantSettings())
+        settings.correction = correctionSettings
+        store.save(settings)
+        let correction = RealtimeCorrectionCoordinator(
+            settings: correctionSettings,
+            responder: correctionResponder
         )
+        let model = AppModel(
+            settingsStore: store,
+            sourceCatalogService: TestSourceCatalogService(),
+            assistant: assistant,
+            correction: correction
+        )
+        let source = InputSource(
+            id: "termination-mic",
+            name: "Termination Mic",
+            detail: "Synthetic microphone",
+            category: .microphone
+        )
+        let liveSession = LiveTranscriptionSession()
+        model.beginCorrectionSessionForTesting()
+        model.registerSuccessfulLiveSessionForTesting(liveSession, source: source)
+        await waitForCorrectionCapture(on: liveSession, enabled: true)
+        await appendTerminationAudio(to: liveSession)
+        let captionID = model.commitLocalCaptionForTesting(
+            source: source,
+            original: "termination local",
+            translation: "termination translation",
+            audioWAVData: Data("RIFF synthetic".utf8)
+        )
+        await waitForCorrectionCall(on: correctionResponder)
+        let activeCorrectionGeneration = correction.sessionGeneration
 
         model.assistant.request(.followUp, snapshot: model.assistantTranscriptSnapshot())
         await waitForCall(on: responder)
@@ -502,12 +554,24 @@ import Testing
         delegate.applicationWillTerminate(Notification(name: .init("test.termination")))
         #expect(model.assistant.requestState == .idle)
         #expect(model.assistant.replies.isEmpty)
+        await waitForCorrectionCapture(on: liveSession, enabled: false)
+        #expect(correction.sessionGeneration > activeCorrectionGeneration)
+        #expect(await liveSession.correctionAudioFrameCountForTesting() == 0)
 
         await responder.release(text: "Late termination response")
+        await correctionResponder.release(
+            captionID: captionID,
+            output: .init(
+                correctedOriginal: "late corrected original",
+                correctedTranslation: "late corrected translation"
+            )
+        )
         await drainTasks()
 
         #expect(model.assistant.requestState == .idle)
         #expect(model.assistant.replies.isEmpty)
+        #expect(model.transcriptEntries.first?.sourceText == "termination local")
+        #expect(model.transcriptEntries.first?.translatedText == "termination translation")
     }
 
     private func makeSettingsURL() -> URL {
@@ -576,6 +640,50 @@ import Testing
         for _ in 0..<20 {
             await Task.yield()
         }
+    }
+
+    private func waitForCorrectionCall(on responder: IntegrationHeldCorrectionResponder) async {
+        let clock = ContinuousClock()
+        let deadline = clock.now.advanced(by: .seconds(2))
+        while await responder.callCount() != 1 {
+            if clock.now >= deadline {
+                Issue.record("Timed out waiting for the held correction request")
+                return
+            }
+            try? await Task.sleep(for: .milliseconds(10))
+        }
+    }
+
+    private func waitForCorrectionCapture(
+        on session: LiveTranscriptionSession,
+        enabled: Bool
+    ) async {
+        let clock = ContinuousClock()
+        let deadline = clock.now.advanced(by: .seconds(2))
+        while await session.correctionAudioCaptureEnabledForTesting() != enabled {
+            if clock.now >= deadline {
+                Issue.record("Timed out waiting for correction audio capture state")
+                return
+            }
+            try? await Task.sleep(for: .milliseconds(10))
+        }
+    }
+
+    private func appendTerminationAudio(to session: LiveTranscriptionSession) async {
+        guard let format = AVAudioFormat(
+            commonFormat: .pcmFormatFloat32,
+            sampleRate: 16_000,
+            channels: 1,
+            interleaved: true
+        ), let buffer = AVAudioPCMBuffer(pcmFormat: format, frameCapacity: 2) else {
+            Issue.record("Unable to build synthetic termination audio")
+            return
+        }
+        buffer.frameLength = 2
+        buffer.floatChannelData?[0][0] = 0.25
+        buffer.floatChannelData?[0][1] = -0.25
+        await session.appendCorrectionAudioBufferForTesting(buffer)
+        #expect(await session.correctionAudioFrameCountForTesting() == 2)
     }
 }
 

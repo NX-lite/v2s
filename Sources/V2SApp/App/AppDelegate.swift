@@ -425,7 +425,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     }
 
     func applicationWillTerminate(_ notification: Notification) {
-        appModel.assistant.cancelRequest()
+        appModel.prepareForApplicationTermination()
         globalHotKeyController?.invalidate()
         hotKeyRegistrationErrorBridge?.invalidate()
         hotKeyRegistrationErrorBridge = nil

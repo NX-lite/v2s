@@ -33,13 +33,18 @@ final class AppModel: ObservableObject {
     private let settingsStore: SettingsStore
     private let sourceCatalogService: any SourceCatalogLoading
     let assistant: AssistantCoordinator
+    let correction: RealtimeCorrectionCoordinator
     private var assistantSettingsCancellable: AnyCancellable?
     private var assistantPresentationCancellable: AnyCancellable?
+    private var correctionSettingsCancellable: AnyCancellable?
+    private var previousCorrectionSettings: CorrectionSettings
     private let translationCoordinator = TranslationCoordinator()
     private let glossaryService = GlossaryService()
     private let speedMonitor = SpeedMonitor()
     private var liveTranscriptionSession: LiveTranscriptionSession?
     private var liveTranscriptionSessions: [LiveTranscriptionSession] = []
+    private var liveTranscriptionSessionsBySourceID: [String: LiveTranscriptionSession] = [:]
+    private var correctionSessionIsActive = false
     // Sources whose capture actually started. A multi-source session tolerates inputs
     // that fail to open, so this can be a subset of `selectedSources` while running.
     private var activeSources: [InputSource] = []
@@ -70,6 +75,9 @@ final class AppModel: ObservableObject {
     // Committed translation per caption; late translations may only replace
     // displayed text that still matches what this pipeline committed.
     private var translationRevisions: [UUID: String] = [:]
+    private var submittedCorrectionCaptionIDs: Set<UUID> = []
+    private var correctedCaptionIDs: Set<UUID> = []
+    private var sourceCorrectionAudioPolicyEpochs: [String: Int] = [:]
     private var recentRecognizedCaptionTexts: [RecentRecognizedCaption] = []
     private var recentArchivedCaption: RecentArchivedCaption?
     private var finalizedDraftPromotionIDs: [(id: UUID, time: Date)] = []
@@ -193,12 +201,15 @@ final class AppModel: ObservableObject {
     init(
         settingsStore: SettingsStore,
         sourceCatalogService: any SourceCatalogLoading,
-        assistant: AssistantCoordinator? = nil
+        assistant: AssistantCoordinator? = nil,
+        correction: RealtimeCorrectionCoordinator? = nil
     ) {
         let settings = settingsStore.load()
         self.settingsStore = settingsStore
         self.sourceCatalogService = sourceCatalogService
         self.assistant = assistant ?? AssistantCoordinator(settings: settings.assistant)
+        self.correction = correction ?? RealtimeCorrectionCoordinator(settings: settings.correction)
+        self.previousCorrectionSettings = self.correction.settings
 
         self.selectedSourceID = settings.selectedSourceID
         var initialSelectedSourceIDs = Set(settings.selectedSourceIDs)
@@ -229,6 +240,9 @@ final class AppModel: ObservableObject {
             self?.translationLocaleIdentifier(for: languageID)
                 ?? LanguageCatalog.translationLocaleIdentifier(for: languageID)
         }
+        self.correction.onResult = { [weak self] result in
+            self?.applyCorrectionResult(result)
+        }
 
         isBootstrapping = false
         applyStatusMessage()
@@ -245,6 +259,13 @@ final class AppModel: ObservableObject {
                 self?.persistSettings(assistantSettings: assistantSettings)
             }
 
+        correctionSettingsCancellable = self.correction.$settings
+            .dropFirst()
+            .removeDuplicates()
+            .sink { [weak self] correctionSettings in
+                self?.correctionSettingsDidChange(correctionSettings)
+            }
+
         assistantPresentationCancellable = Publishers.CombineLatest(
             self.assistant.$overlayMode,
             self.assistant.$replies
@@ -255,6 +276,16 @@ final class AppModel: ObservableObject {
                     replies: replies
                 )
             }
+    }
+
+    isolated deinit {
+        correction.onResult = nil
+        if correctionSessionIsActive {
+            correction.endSession()
+        }
+        for session in liveTranscriptionSessionsBySourceID.values {
+            session.setCorrectionAudioCaptureEnabled(false)
+        }
     }
 
     convenience init() {
@@ -582,6 +613,7 @@ final class AppModel: ObservableObject {
     func startSession() async {
         assistant.resetForNewSession()
         // Finish releasing any earlier capture resources before opening replacements.
+        endCorrectionSessionAndClearLiveAudio()
         await stopLiveTranscriptionSessionsAndWait()
         refreshSources()
 
@@ -603,6 +635,7 @@ final class AppModel: ObservableObject {
             setStatus(.downloadLanguageResourcesInSystemSettings)
             return
         }
+        beginCorrectionSession()
 
         let previousTranscriptEntries = transcriptEntries
         let previousTranscriptInputLanguageID = transcriptInputLanguageID
@@ -687,6 +720,7 @@ final class AppModel: ObservableObject {
                     }
                 )
 
+                registerCorrectionAudioControl(session, sourceID: source.id)
                 startedSessions.append(session)
                 startedSources.append(source)
             } catch {
@@ -766,6 +800,7 @@ final class AppModel: ObservableObject {
         }
 
         resetLiveTextPipeline()
+        endCorrectionSessionAndClearLiveAudio()
         liveTranscriptionSession = nil
         liveTranscriptionSessions.removeAll()
         activeSources.removeAll()
@@ -790,6 +825,7 @@ final class AppModel: ObservableObject {
     /// failing ends the logical session, so its siblings stop before the global
     /// "capture stopped" state is shown.
     private func handleFatalSessionError(_ message: String, sourceName: String) {
+        endCorrectionSessionAndClearLiveAudio()
         stopLiveTranscriptionSessions()
         sessionState = .error
         setStatus(.custom(message))
@@ -802,6 +838,7 @@ final class AppModel: ObservableObject {
 
     func stopSession() {
         assistant.cancelRequest()
+        endCorrectionSessionAndClearLiveAudio()
         resetLiveTextPipeline()
         stopLiveTranscriptionSessions()
         sessionState = .idle
@@ -887,10 +924,16 @@ final class AppModel: ObservableObject {
     }
 
     func persistSettings() {
-        persistSettings(assistantSettings: assistant.settings)
+        persistSettings(
+            assistantSettings: assistant.settings,
+            correctionSettings: correction.settings
+        )
     }
 
-    private func persistSettings(assistantSettings: AssistantSettings) {
+    private func persistSettings(
+        assistantSettings: AssistantSettings,
+        correctionSettings: CorrectionSettings? = nil
+    ) {
         guard isBootstrapping == false else {
             return
         }
@@ -907,10 +950,108 @@ final class AppModel: ObservableObject {
             subtitleMode: subtitleMode,
             subtitleDisplayMode: subtitleDisplayMode,
             glossary: glossary,
-            assistant: assistantSettings
+            assistant: assistantSettings,
+            correction: correctionSettings ?? correction.settings
         )
 
         settingsStore.save(settings)
+    }
+
+    private func correctionSettingsDidChange(_ settings: CorrectionSettings) {
+        let previous = previousCorrectionSettings
+        previousCorrectionSettings = settings
+        persistSettings(
+            assistantSettings: assistant.settings,
+            correctionSettings: settings
+        )
+
+        for (sourceID, session) in liveTranscriptionSessionsBySourceID {
+            let wasEnabled = previous.isEnabled(for: sourceID)
+            let isEnabled = settings.isEnabled(for: sourceID)
+            if wasEnabled != isEnabled {
+                session.setCorrectionAudioCaptureEnabled(isEnabled)
+            }
+        }
+
+        let newlyDisabledSourceIDs = Set(settings.disabledSourceIDs)
+            .subtracting(previous.disabledSourceIDs)
+        for sourceID in newlyDisabledSourceIDs {
+            correction.cancel(sourceID: sourceID)
+            invalidatePendingCorrectionAudio(for: sourceID)
+        }
+
+        let providerChanged = previous.apiKey != settings.apiKey
+            || previous.baseURL != settings.baseURL
+            || previous.model != settings.model
+        let disabledGlobally = previous.isEnabled && !settings.isEnabled
+        let enabledGlobally = !previous.isEnabled && settings.isEnabled
+
+        if disabledGlobally {
+            invalidateAllPendingCorrectionAudio()
+            if correctionSessionIsActive {
+                correction.endSession()
+                correctionSessionIsActive = false
+            }
+        } else if providerChanged {
+            if correctionSessionIsActive {
+                correction.endSession()
+                correctionSessionIsActive = false
+            }
+            if settings.isEnabled && liveTranscriptionSessionsBySourceID.isEmpty == false {
+                correction.beginSession()
+                correctionSessionIsActive = true
+            }
+        } else if enabledGlobally,
+                  liveTranscriptionSessionsBySourceID.isEmpty == false {
+            correction.beginSession()
+            correctionSessionIsActive = true
+        }
+    }
+
+    private func beginCorrectionSession() {
+        if correctionSessionIsActive {
+            correction.endSession()
+        }
+        correction.beginSession()
+        correctionSessionIsActive = true
+    }
+
+    private func endCorrectionSessionAndClearLiveAudio() {
+        correction.endSession()
+        correctionSessionIsActive = false
+        invalidateAllPendingCorrectionAudio()
+        for session in liveTranscriptionSessionsBySourceID.values {
+            session.setCorrectionAudioCaptureEnabled(false)
+        }
+        liveTranscriptionSessionsBySourceID.removeAll()
+    }
+
+    private func registerCorrectionAudioControl(
+        _ session: LiveTranscriptionSession,
+        sourceID: String
+    ) {
+        liveTranscriptionSessionsBySourceID[sourceID] = session
+        session.setCorrectionAudioCaptureEnabled(correction.settings.isEnabled(for: sourceID))
+    }
+
+    private func invalidatePendingCorrectionAudio(for sourceID: String) {
+        sourceCorrectionAudioPolicyEpochs[sourceID, default: 0] &+= 1
+        for index in pendingCaptions.indices where pendingCaptions[index].sourceID == sourceID {
+            pendingCaptions[index].audioWAVData = nil
+        }
+    }
+
+    private func invalidateAllPendingCorrectionAudio() {
+        let sourceIDs = Set(pendingCaptions.map(\.sourceID))
+            .union(liveTranscriptionSessionsBySourceID.keys)
+        for sourceID in sourceIDs {
+            invalidatePendingCorrectionAudio(for: sourceID)
+        }
+    }
+
+    func prepareForApplicationTermination() {
+        assistant.cancelRequest()
+        endCorrectionSessionAndClearLiveAudio()
     }
 
     private static func normalizedOverlayStyle(_ style: OverlayStyle) -> OverlayStyle {
@@ -1882,6 +2023,7 @@ final class AppModel: ObservableObject {
         clearDraftOverlay()
         overlayState?.translatedText = ""
         overlayState?.sourceText = ""
+        overlayState?.committedCaptionID = nil
         overlayState?.committedPromotionID = nil
         displayedCaption = nil
         displayedCaptionLastVisualUpdateAt = Date.distantPast
@@ -1906,6 +2048,7 @@ final class AppModel: ObservableObject {
     private func updateCommittedOverlay(
         translatedText: String,
         sourceText: String,
+        captionID: UUID? = nil,
         promotionID: UUID? = nil,
         bumpEpoch: Bool = false,
         lateTranslation: Bool = false
@@ -1916,6 +2059,9 @@ final class AppModel: ObservableObject {
 
         overlayState?.translatedText = translatedText
         overlayState?.sourceText = sourceText
+        if let captionID {
+            overlayState?.committedCaptionID = captionID
+        }
         if let promotionID {
             overlayState?.committedPromotionID = promotionID
         }
@@ -2014,6 +2160,8 @@ final class AppModel: ObservableObject {
         guard sourceText.isEmpty == false else {
             return
         }
+        let capturedAt = Date()
+        let correctionAudioPolicyEpoch = sourceCorrectionAudioPolicyEpochs[source.id, default: 0]
 
         if let promotionID = sentence.promotionSegmentID {
             guard isFinalizedDraftPromotionID(promotionID) == false else {
@@ -2036,7 +2184,10 @@ final class AppModel: ObservableObject {
                 sourceName: source.name,
                 sourceLanguageID: sourceLanguageID,
                 targetLanguageID: targetLanguageID,
-                promotedDraftTranslation: promotedDraftTranslation
+                promotedDraftTranslation: promotedDraftTranslation,
+                capturedAt: capturedAt,
+                audioWAVData: sentence.audioWAVData,
+                correctionAudioPolicyEpoch: correctionAudioPolicyEpoch
             )
 
             rememberRecognizedSentence(sourceText)
@@ -2057,7 +2208,10 @@ final class AppModel: ObservableObject {
                 sourceName: source.name,
                 sourceLanguageID: sourceLanguageID,
                 targetLanguageID: targetLanguageID,
-                promotedDraftTranslation: nil
+                promotedDraftTranslation: nil,
+                capturedAt: capturedAt,
+                audioWAVData: sentence.audioWAVData,
+                correctionAudioPolicyEpoch: correctionAudioPolicyEpoch
             )
 
             rememberRecognizedSentence(sourceText)
@@ -2117,11 +2271,6 @@ final class AppModel: ObservableObject {
                     ? (translatedText ?? "")
                     : displayedCaption.sourceText
 
-                updateCommittedOverlay(
-                    translatedText: resolvedTranslation,
-                    sourceText: displayedCaption.sourceText,
-                    lateTranslation: translationExpected && resolvedTranslation.isEmpty == false
-                )
                 upsertTranscriptEntry(
                     id: displayedCaption.id,
                     sourceID: displayedCaption.sourceID,
@@ -2130,6 +2279,14 @@ final class AppModel: ObservableObject {
                     targetLanguageID: displayedCaption.targetLanguageID,
                     sourceText: displayedCaption.sourceText,
                     translatedText: resolvedTranslation
+                )
+                guard correctedCaptionIDs.contains(displayedCaption.id) == false else {
+                    return
+                }
+                updateCommittedOverlay(
+                    translatedText: resolvedTranslation,
+                    sourceText: displayedCaption.sourceText,
+                    lateTranslation: translationExpected && resolvedTranslation.isEmpty == false
                 )
             }
         }
@@ -2255,6 +2412,138 @@ final class AppModel: ObservableObject {
             )
         }
     }
+
+    func beginCorrectionSessionForTesting() {
+        beginCorrectionSession()
+    }
+
+    @discardableResult
+    func commitLocalCaptionForTesting(
+        source: InputSource,
+        original: String,
+        translation: String,
+        audioWAVData: Data?,
+        capturedAt: Date = Date()
+    ) -> UUID {
+        let caption = makeQueuedCaptionForTesting(
+            source: source,
+            original: original,
+            audioWAVData: audioWAVData,
+            capturedAt: capturedAt
+        )
+        commitLocalCaptionForTesting(caption, translation: translation)
+        return caption.id
+    }
+
+    @discardableResult
+    func enqueuePendingLocalCaptionForTesting(
+        source: InputSource,
+        original: String,
+        audioWAVData: Data?,
+        capturedAt: Date = Date()
+    ) -> UUID {
+        let caption = makeQueuedCaptionForTesting(
+            source: source,
+            original: original,
+            audioWAVData: audioWAVData,
+            capturedAt: capturedAt
+        )
+        pendingCaptions.append(caption)
+        return caption.id
+    }
+
+    func finalizePendingLocalCaptionForTesting(captionID: UUID, translation: String) {
+        guard let index = pendingCaptions.firstIndex(where: { $0.id == captionID }) else { return }
+        let caption = pendingCaptions.remove(at: index)
+        commitLocalCaptionForTesting(caption, translation: translation)
+    }
+
+    func applyLocalTranslationForTesting(_ translation: String, captionID: UUID) {
+        applyLateCaptionTranslation(translation, for: captionID)
+    }
+
+    func registerSuccessfulLiveSessionForTesting(
+        _ session: LiveTranscriptionSession,
+        source: InputSource
+    ) {
+        if liveTranscriptionSessions.contains(where: { $0 === session }) == false {
+            liveTranscriptionSessions.append(session)
+        }
+        liveTranscriptionSession = liveTranscriptionSessions.first
+        if activeSources.contains(source) == false {
+            activeSources.append(source)
+        }
+        registerCorrectionAudioControl(session, sourceID: source.id)
+    }
+
+    func failLiveSessionForTesting() {
+        handleFatalSessionError("Synthetic fatal failure", sourceName: activeSourceDisplayName)
+    }
+
+    func completeFullStartupFailureForTesting() {
+        endCorrectionSessionAndClearLiveAudio()
+        stopLiveTranscriptionSessions()
+    }
+
+    var liveTranscriptionSessionCountForTesting: Int {
+        liveTranscriptionSessionsBySourceID.count
+    }
+
+    private func makeQueuedCaptionForTesting(
+        source: InputSource,
+        original: String,
+        audioWAVData: Data?,
+        capturedAt: Date
+    ) -> QueuedCaption {
+        QueuedCaption(
+            id: UUID(),
+            promotionID: UUID(),
+            sourceID: source.id,
+            sourceText: original,
+            sourceName: source.name,
+            sourceLanguageID: languageID(for: source),
+            targetLanguageID: outputLanguageIDForSource(source),
+            promotedDraftTranslation: nil,
+            capturedAt: capturedAt,
+            audioWAVData: audioWAVData,
+            correctionAudioPolicyEpoch: sourceCorrectionAudioPolicyEpochs[source.id, default: 0]
+        )
+    }
+
+    private func commitLocalCaptionForTesting(_ caption: QueuedCaption, translation: String) {
+        if overlayState == nil {
+            overlayState = OverlayPreviewState(
+                translatedText: "",
+                sourceText: "",
+                sourceName: caption.sourceName
+            )
+        }
+        capturePreviousCaption()
+        displayedCaption = caption
+        updateCommittedOverlay(
+            translatedText: translation,
+            sourceText: caption.sourceText,
+            captionID: caption.id,
+            promotionID: caption.promotionID,
+            bumpEpoch: true
+        )
+        overlayState?.sourceName = caption.sourceName
+        upsertTranscriptEntry(
+            id: caption.id,
+            sourceID: caption.sourceID,
+            sourceName: caption.sourceName,
+            sourceLanguageID: caption.sourceLanguageID,
+            targetLanguageID: caption.targetLanguageID,
+            sourceText: caption.sourceText,
+            translatedText: translation
+        )
+        if translation.isEmpty {
+            translationRevisions.removeValue(forKey: caption.id)
+        } else {
+            translationRevisions[caption.id] = translation
+        }
+        submitCorrectionIfEnabled(for: caption, localTranslation: translation)
+    }
     #endif
 
     var shouldReserveCommittedCaptionSlot: Bool {
@@ -2291,6 +2580,9 @@ final class AppModel: ObservableObject {
         pendingCaptions.removeAll()
         readyCaptionTranslations.removeAll()
         translationRevisions.removeAll()
+        submittedCorrectionCaptionIDs.removeAll()
+        correctedCaptionIDs.removeAll()
+        sourceCorrectionAudioPolicyEpochs.removeAll()
         recentRecognizedCaptionTexts.removeAll()
         recentArchivedCaption = nil
         finalizedDraftPromotionIDs.removeAll()
@@ -2363,6 +2655,7 @@ final class AppModel: ObservableObject {
             updateCommittedOverlay(
                 translatedText: initialTranslation ?? (translationExpected ? "" : caption.sourceText),
                 sourceText: caption.sourceText,
+                captionID: caption.id,
                 promotionID: caption.promotionID,
                 bumpEpoch: true
             )
@@ -2446,6 +2739,11 @@ final class AppModel: ObservableObject {
                 translationRevisions.removeValue(forKey: caption.id)
             }
 
+            submitCorrectionIfEnabled(
+                for: caption,
+                localTranslation: resolvedTranslation
+            )
+
             let holdDuration = computeDisplayDuration(
                 sourceText: caption.sourceText,
                 translatedText: resolvedTranslation
@@ -2461,6 +2759,83 @@ final class AppModel: ObservableObject {
             // defer runs here: removes caption from pendingCaptions + readyCaptionTranslations
         }
         // defer runs here: captionDisplayTask = nil
+    }
+
+    private func submitCorrectionIfEnabled(
+        for caption: QueuedCaption,
+        localTranslation: String
+    ) {
+        guard submittedCorrectionCaptionIDs.insert(caption.id).inserted else { return }
+        guard correction.settings.isEnabled(for: caption.sourceID) else { return }
+
+        let currentPolicyEpoch = sourceCorrectionAudioPolicyEpochs[caption.sourceID, default: 0]
+        let eligibleAudio = caption.correctionAudioPolicyEpoch == currentPolicyEpoch
+            ? caption.audioWAVData
+            : nil
+        correction.enqueue(CorrectionJob(
+            captionID: caption.id,
+            sessionGeneration: correction.sessionGeneration,
+            capturedAt: caption.capturedAt,
+            sourceID: caption.sourceID,
+            sourceName: caption.sourceName,
+            sourceLanguageID: caption.sourceLanguageID,
+            targetLanguageID: caption.targetLanguageID,
+            localOriginal: caption.sourceText,
+            localTranslation: localTranslation,
+            audioWAVData: eligibleAudio
+        ))
+    }
+
+    private func applyCorrectionResult(_ result: CorrectionResult) {
+        guard result.sessionGeneration == correction.sessionGeneration else { return }
+
+        var effectiveSourceText: String?
+        var effectiveTranslatedText: String?
+        if let index = transcriptEntries.firstIndex(where: { $0.id == result.captionID }),
+           transcriptEntries[index].sourceID == result.sourceID {
+            if result.mode == .audio {
+                transcriptEntries[index].correctedSourceText = result.correctedOriginal
+            }
+            transcriptEntries[index].correctedTranslatedText = result.correctedTranslation
+            effectiveSourceText = transcriptEntries[index].sourceText
+            effectiveTranslatedText = transcriptEntries[index].translatedText
+        }
+
+        correctedCaptionIDs.insert(result.captionID)
+
+        if let index = overlayState?.history.lastIndex(where: { $0.id == result.captionID }) {
+            if result.mode == .audio,
+               let correctedOriginal = result.correctedOriginal,
+               correctedOriginal.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty == false {
+                overlayState?.history[index].sourceText = correctedOriginal
+            }
+            if result.correctedTranslation.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty == false {
+                overlayState?.history[index].translatedText = result.correctedTranslation
+            }
+            effectiveSourceText = effectiveSourceText ?? overlayState?.history[index].sourceText
+            effectiveTranslatedText = effectiveTranslatedText ?? overlayState?.history[index].translatedText
+        }
+
+        guard displayedCaption?.id == result.captionID,
+              displayedCaption?.sourceID == result.sourceID,
+              overlayState?.committedCaptionID == result.captionID else {
+            return
+        }
+
+        let sourceText = effectiveSourceText
+            ?? (result.mode == .audio ? result.correctedOriginal : nil)
+            ?? overlayState?.sourceText
+            ?? ""
+        let translatedText = effectiveTranslatedText
+            ?? (result.correctedTranslation.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+                ? overlayState?.translatedText ?? ""
+                : result.correctedTranslation)
+        updateCommittedOverlay(
+            translatedText: translatedText,
+            sourceText: sourceText,
+            lateTranslation: true
+        )
+        scheduleCommittedCaptionArchiveIfNeeded()
     }
 
     private func normalizedCaptionText(_ text: String) -> String {
@@ -2790,8 +3165,18 @@ final class AppModel: ObservableObject {
         var didApplyTranslation = false
         var didApplyDisplayedTranslation = false
 
+        if let index = transcriptEntries.firstIndex(where: { $0.id == captionID }) {
+            transcriptEntries[index].localTranslatedText = translatedText
+            didApplyTranslation = true
+        }
+
+        guard correctedCaptionIDs.contains(captionID) == false else {
+            return
+        }
+
         if displayedCaption?.id == captionID,
            let state = overlayState,
+           state.committedCaptionID == captionID,
            shouldReplaceCommittedTranslation(state.translatedText, for: captionID),
            state.sourceText.isEmpty == false {
             updateCommittedOverlay(
@@ -2806,12 +3191,6 @@ final class AppModel: ObservableObject {
         if let index = overlayState?.history.lastIndex(where: { $0.id == captionID }),
            shouldReplaceCommittedTranslation(overlayState?.history[index].translatedText ?? "", for: captionID) {
             overlayState?.history[index].translatedText = translatedText
-            didApplyTranslation = true
-        }
-
-        if let index = transcriptEntries.firstIndex(where: { $0.id == captionID }),
-           shouldReplaceCommittedTranslation(transcriptEntries[index].translatedText, for: captionID) {
-            transcriptEntries[index].localTranslatedText = translatedText
             didApplyTranslation = true
         }
 
@@ -3188,10 +3567,17 @@ final class AppModel: ObservableObject {
             return
         }
 
-        if let lastEntry = overlayState?.history.last,
-           lastEntry.translatedText == translatedText,
-           lastEntry.sourceText == sourceText {
-            return
+        if let lastEntry = overlayState?.history.last {
+            if let captionID {
+                if lastEntry.id == captionID,
+                   lastEntry.translatedText == translatedText,
+                   lastEntry.sourceText == sourceText {
+                    return
+                }
+            } else if lastEntry.translatedText == translatedText,
+                      lastEntry.sourceText == sourceText {
+                return
+            }
         }
 
         if overlayHistoryScrollOffset > 0 {
@@ -3381,6 +3767,9 @@ private struct QueuedCaption: Identifiable, Equatable {
     let sourceLanguageID: String
     let targetLanguageID: String
     let promotedDraftTranslation: String?
+    let capturedAt: Date
+    var audioWAVData: Data?
+    let correctionAudioPolicyEpoch: Int
 }
 
 private struct SpeechLanguageCatalog {

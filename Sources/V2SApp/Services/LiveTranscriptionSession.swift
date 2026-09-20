@@ -426,6 +426,7 @@ final class LiveTranscriptionSession: NSObject, @unchecked Sendable {
     func setCorrectionAudioCaptureEnabled(_ enabled: Bool) {
         captureQueue.async { [weak self] in
             guard let self else { return }
+            guard correctionAudioCaptureEnabled != enabled else { return }
             beginCommittedDeliveryStateMutation()
             defer { endCommittedDeliveryStateMutation() }
             transcriptDeliveryLock.lock()
@@ -434,6 +435,14 @@ final class LiveTranscriptionSession: NSObject, @unchecked Sendable {
             transcriptDeliveryLock.unlock()
             if enabled == false {
                 resetCorrectionAudioBuffer()
+            }
+        }
+    }
+
+    func correctionAudioCaptureEnabledForTesting() async -> Bool {
+        await withCheckedContinuation { continuation in
+            captureQueue.async { [weak self] in
+                continuation.resume(returning: self?.correctionAudioCaptureEnabled ?? false)
             }
         }
     }
