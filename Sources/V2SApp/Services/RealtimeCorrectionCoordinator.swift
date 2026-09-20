@@ -71,7 +71,6 @@ final class RealtimeCorrectionCoordinator: ObservableObject {
     private var sessionIsActive = false
     private var sessionUsesTextOnly = false
     private var nextEnqueueOrdinal: UInt64 = 0
-    private var nextSuccessOrdinal: UInt64 = 0
     private var waitingBySource: [String: [WaitingJob]] = [:]
     private var activeBySource: [String: ActiveDispatch] = [:]
     private var successfulBySource: [String: [SuccessfulEntry]] = [:]
@@ -134,7 +133,7 @@ final class RealtimeCorrectionCoordinator: ObservableObject {
         sessionIsActive = false
         invalidateActiveCalls()
         clearSessionState()
-        status = settings.isEnabled ? .ready : .disabled
+        refreshSessionStatus()
     }
 
     func fetchModels() {
@@ -159,19 +158,15 @@ final class RealtimeCorrectionCoordinator: ObservableObject {
         let requestSettings = settings
         modelFetchToken = token
         modelFetchState = .fetching
-        modelFetchTask = Task { [weak self] in
-            guard let self else { return }
+        let responder = self.responder
+        modelFetchTask = Task.detached { [weak self, responder] in
+            let mayStart = await self?.isCurrentModelFetch(generation: generation, token: token)
+            guard !Task.isCancelled, mayStart == true else { return }
             do {
                 let models = try await responder.fetchAvailableModels(settings: requestSettings)
-                guard modelFetchGeneration == generation, modelFetchToken == token else { return }
-                modelFetchState = .fetched(models)
-                modelFetchTask = nil
-                modelFetchToken = nil
+                await self?.finishModelFetch(models, generation: generation, token: token)
             } catch {
-                guard modelFetchGeneration == generation, modelFetchToken == token else { return }
-                modelFetchState = .failed(sanitizedDetail(for: error))
-                modelFetchTask = nil
-                modelFetchToken = nil
+                await self?.finishModelFetch(error: error, generation: generation, token: token)
             }
         }
     }
@@ -198,19 +193,15 @@ final class RealtimeCorrectionCoordinator: ObservableObject {
         let requestSettings = settings
         apiTestToken = token
         apiTestState = .testing
-        apiTestTask = Task { [weak self] in
-            guard let self else { return }
+        let responder = self.responder
+        apiTestTask = Task.detached { [weak self, responder] in
+            let mayStart = await self?.isCurrentAPITest(generation: generation, token: token)
+            guard !Task.isCancelled, mayStart == true else { return }
             do {
                 let response = try await responder.testConnection(settings: requestSettings)
-                guard apiTestGeneration == generation, apiTestToken == token else { return }
-                apiTestState = .passed(String(response.prefix(80)))
-                apiTestTask = nil
-                apiTestToken = nil
+                await self?.finishAPITest(response, generation: generation, token: token)
             } catch {
-                guard apiTestGeneration == generation, apiTestToken == token else { return }
-                apiTestState = .failed(sanitizedDetail(for: error))
-                apiTestTask = nil
-                apiTestToken = nil
+                await self?.finishAPITest(error: error, generation: generation, token: token)
             }
         }
     }
@@ -233,7 +224,7 @@ final class RealtimeCorrectionCoordinator: ObservableObject {
             } else {
                 waitingBySource[next.job.sourceID] = sourceWaiting
             }
-            dispatch(next.job)
+            dispatch(next)
         }
     }
 
@@ -248,7 +239,8 @@ final class RealtimeCorrectionCoordinator: ObservableObject {
         }
     }
 
-    private func dispatch(_ job: CorrectionJob) {
+    private func dispatch(_ waitingJob: WaitingJob) {
+        let job = waitingJob.job
         let mode: CorrectionInputMode = sessionUsesTextOnly || job.audioWAVData?.isEmpty != false
             ? .textOnly
             : .audio
@@ -261,68 +253,104 @@ final class RealtimeCorrectionCoordinator: ObservableObject {
         activeBySource[job.sourceID] = active
         status = mode == .audio ? .audio : .textOnly
 
-        let task = Task { [weak self] in
-            guard let self else { return }
-            await self.performCorrection(
-                job: job,
-                settings: requestSettings,
-                context: context,
-                prompt: prompt,
-                mode: mode,
+        let responder = self.responder
+        let promptBuilder = self.promptBuilder
+        active.task = Task.detached { [weak self, responder, promptBuilder] in
+            let mayStart = await self?.mayStartProviderCall(
+                sourceID: job.sourceID,
                 generation: generation,
                 token: token
             )
-        }
-        active.task = task
-    }
-
-    private func performCorrection(
-        job: CorrectionJob,
-        settings: CorrectionSettings,
-        context: [CorrectionContextEntry],
-        prompt: CorrectionPrompt,
-        mode: CorrectionInputMode,
-        generation: Int,
-        token: UUID
-    ) async {
-        guard !Task.isCancelled,
-              isCurrent(job.sourceID, generation: generation, token: token) else {
-            releaseSlot(sourceID: job.sourceID, token: token)
-            return
-        }
-        do {
-            let output = try await responder.correct(
-                settings: settings,
-                prompt: prompt,
-                audioWAVData: mode == .audio ? job.audioWAVData : nil
-            )
-            finishSuccess(output, job: job, mode: mode, generation: generation, token: token)
-        } catch let error as OpenAIResponsesClient.ClientError {
-            guard case .audioUnsupported = error, mode == .audio else {
-                finishFailure(error, sourceID: job.sourceID, generation: generation, token: token)
-                return
-            }
-            guard isCurrent(job.sourceID, generation: generation, token: token) else {
-                releaseSlot(sourceID: job.sourceID, token: token)
+            guard !Task.isCancelled, mayStart == true else {
+                await self?.releaseSlot(sourceID: job.sourceID, token: token)
                 return
             }
 
-            sessionUsesTextOnly = true
-            status = .textOnly
-            let fallbackPrompt = promptBuilder.build(job: job, context: context, mode: .textOnly)
             do {
                 let output = try await responder.correct(
-                    settings: settings,
-                    prompt: fallbackPrompt,
-                    audioWAVData: nil
+                    settings: requestSettings,
+                    prompt: prompt,
+                    audioWAVData: mode == .audio ? job.audioWAVData : nil
                 )
-                finishSuccess(output, job: job, mode: .textOnly, generation: generation, token: token)
+                await self?.finishSuccess(
+                    output,
+                    job: job,
+                    mode: mode,
+                    generation: generation,
+                    token: token,
+                    enqueueOrdinal: waitingJob.ordinal
+                )
+            } catch let error as OpenAIResponsesClient.ClientError {
+                guard case .audioUnsupported = error, mode == .audio else {
+                    await self?.finishFailure(
+                        error,
+                        sourceID: job.sourceID,
+                        generation: generation,
+                        token: token
+                    )
+                    return
+                }
+
+                let mayRetry = await self?.prepareAudioFallback(
+                    sourceID: job.sourceID,
+                    generation: generation,
+                    token: token
+                )
+                guard !Task.isCancelled, mayRetry == true else {
+                    await self?.releaseSlot(sourceID: job.sourceID, token: token)
+                    return
+                }
+
+                let fallbackPrompt = promptBuilder.build(job: job, context: context, mode: .textOnly)
+                guard !Task.isCancelled else {
+                    await self?.releaseSlot(sourceID: job.sourceID, token: token)
+                    return
+                }
+                do {
+                    let output = try await responder.correct(
+                        settings: requestSettings,
+                        prompt: fallbackPrompt,
+                        audioWAVData: nil
+                    )
+                    await self?.finishSuccess(
+                        output,
+                        job: job,
+                        mode: .textOnly,
+                        generation: generation,
+                        token: token,
+                        enqueueOrdinal: waitingJob.ordinal
+                    )
+                } catch {
+                    await self?.finishFailure(
+                        error,
+                        sourceID: job.sourceID,
+                        generation: generation,
+                        token: token
+                    )
+                }
             } catch {
-                finishFailure(error, sourceID: job.sourceID, generation: generation, token: token)
+                await self?.finishFailure(
+                    error,
+                    sourceID: job.sourceID,
+                    generation: generation,
+                    token: token
+                )
             }
-        } catch {
-            finishFailure(error, sourceID: job.sourceID, generation: generation, token: token)
         }
+    }
+
+    private func mayStartProviderCall(sourceID: String, generation: Int, token: UUID) -> Bool {
+        !Task.isCancelled && isCurrent(sourceID, generation: generation, token: token)
+    }
+
+    private func prepareAudioFallback(sourceID: String, generation: Int, token: UUID) -> Bool {
+        guard !Task.isCancelled,
+              isCurrent(sourceID, generation: generation, token: token) else {
+            return false
+        }
+        sessionUsesTextOnly = true
+        status = .textOnly
+        return true
     }
 
     private func finishSuccess(
@@ -330,7 +358,8 @@ final class RealtimeCorrectionCoordinator: ObservableObject {
         job: CorrectionJob,
         mode: CorrectionInputMode,
         generation: Int,
-        token: UUID
+        token: UUID,
+        enqueueOrdinal: UInt64
     ) {
         guard isCurrent(job.sourceID, generation: generation, token: token) else {
             releaseSlot(sourceID: job.sourceID, token: token)
@@ -346,10 +375,11 @@ final class RealtimeCorrectionCoordinator: ObservableObject {
             correctedTranslation: output.correctedTranslation,
             mode: mode
         )
-        recordSuccess(job: job, result: result)
-        onResult?(result)
+        recordSuccess(job: job, result: result, enqueueOrdinal: enqueueOrdinal)
         status = sessionUsesTextOnly ? .textOnly : (mode == .audio ? .audio : .textOnly)
+        let resultHandler = onResult
         releaseSlot(sourceID: job.sourceID, token: token)
+        resultHandler?(result)
     }
 
     private func finishFailure(
@@ -379,6 +409,42 @@ final class RealtimeCorrectionCoordinator: ObservableObject {
         drain()
     }
 
+    private func isCurrentModelFetch(generation: Int, token: UUID) -> Bool {
+        modelFetchGeneration == generation && modelFetchToken == token
+    }
+
+    private func finishModelFetch(_ models: [String], generation: Int, token: UUID) {
+        guard isCurrentModelFetch(generation: generation, token: token) else { return }
+        modelFetchState = .fetched(models)
+        modelFetchTask = nil
+        modelFetchToken = nil
+    }
+
+    private func finishModelFetch(error: Error, generation: Int, token: UUID) {
+        guard isCurrentModelFetch(generation: generation, token: token) else { return }
+        modelFetchState = .failed(sanitizedDetail(for: error))
+        modelFetchTask = nil
+        modelFetchToken = nil
+    }
+
+    private func isCurrentAPITest(generation: Int, token: UUID) -> Bool {
+        apiTestGeneration == generation && apiTestToken == token
+    }
+
+    private func finishAPITest(_ response: String, generation: Int, token: UUID) {
+        guard isCurrentAPITest(generation: generation, token: token) else { return }
+        apiTestState = .passed(String(response.prefix(80)))
+        apiTestTask = nil
+        apiTestToken = nil
+    }
+
+    private func finishAPITest(error: Error, generation: Int, token: UUID) {
+        guard isCurrentAPITest(generation: generation, token: token) else { return }
+        apiTestState = .failed(sanitizedDetail(for: error))
+        apiTestTask = nil
+        apiTestToken = nil
+    }
+
     private func context(for sourceID: String) -> [CorrectionContextEntry] {
         let candidates: [SuccessfulEntry]
         if settings.usesIsolatedContext(for: sourceID) {
@@ -389,8 +455,7 @@ final class RealtimeCorrectionCoordinator: ObservableObject {
         return candidates.sorted(by: Self.successOrder).suffix(CorrectionPromptBuilder.contextLimit).map(\.entry)
     }
 
-    private func recordSuccess(job: CorrectionJob, result: CorrectionResult) {
-        nextSuccessOrdinal &+= 1
+    private func recordSuccess(job: CorrectionJob, result: CorrectionResult, enqueueOrdinal: UInt64) {
         let entry = CorrectionContextEntry(
             captionID: job.captionID,
             capturedAt: job.capturedAt,
@@ -402,7 +467,7 @@ final class RealtimeCorrectionCoordinator: ObservableObject {
             translation: result.correctedTranslation
         )
         var sourceEntries = successfulBySource[job.sourceID, default: []]
-        sourceEntries.append(SuccessfulEntry(entry: entry, ordinal: nextSuccessOrdinal))
+        sourceEntries.append(SuccessfulEntry(entry: entry, ordinal: enqueueOrdinal))
         sourceEntries.sort(by: Self.successOrder)
         successfulBySource[job.sourceID] = Array(sourceEntries.suffix(CorrectionPromptBuilder.contextLimit))
     }
@@ -463,7 +528,6 @@ final class RealtimeCorrectionCoordinator: ObservableObject {
         skippedCaptionIDs.removeAll()
         sessionUsesTextOnly = false
         nextEnqueueOrdinal = 0
-        nextSuccessOrdinal = 0
     }
 
     @discardableResult

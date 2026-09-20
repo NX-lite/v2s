@@ -4,8 +4,8 @@ import Testing
 
 @MainActor
 @Suite struct RealtimeCorrectionCoordinatorTests {
-    @Test func sameSourceIsSequentialAndDifferentSourcesReachTwoWayConcurrency() async {
-        let responder = HeldCorrectionResponder()
+    @Test func sameSourceIsSequentialAndDifferentSourcesReachTwoWayConcurrency() async throws {
+        let responder = HeldCorrectionResponder(steps: [.held, .held])
         let coordinator = makeCoordinator(responder: responder)
         coordinator.beginSession()
 
@@ -14,7 +14,7 @@ import Testing
         coordinator.enqueue(job(coordinator, sourceID: "app-1", sequence: 1))
         coordinator.enqueue(job(coordinator, sourceID: "app-2", sequence: 1))
 
-        await waitUntil {
+        try await waitUntil {
             await responder.activeSourceIDs() == Set(["mic-1", "app-1"])
         }
         #expect(await responder.maximumConcurrentCallCount() == 2)
@@ -22,14 +22,14 @@ import Testing
 
         await responder.releaseHeldCall(sourceID: "mic-1", output: output("mic-1"))
         await responder.releaseHeldCall(sourceID: "app-1", output: output("app-1"))
-        await waitUntil {
+        try await waitUntil {
             (await responder.startedSequences(for: "mic-1")).contains(2)
         }
         #expect(await responder.maximumConcurrentCallCount() == 2)
     }
 
-    @Test func fourthWaitingJobDropsOldestWaitingNotActive() async {
-        let responder = HeldCorrectionResponder()
+    @Test func fourthWaitingJobDropsOldestWaitingNotActive() async throws {
+        let responder = HeldCorrectionResponder(steps: [.held])
         let coordinator = makeCoordinator(responder: responder)
         coordinator.beginSession()
 
@@ -39,11 +39,12 @@ import Testing
 
         #expect(coordinator.waitingCaptionIDs(for: "mic-1") == [id(3), id(4), id(5)])
         #expect(coordinator.skippedCaptionIDs == [id(2)])
-        await waitUntil { await responder.callCount() == 1 }
+        try await waitUntil { await responder.callCount() == 1 }
+        await responder.releaseHeldCall(sourceID: "mic-1", output: output("finished"))
     }
 
-    @Test func skippedDiagnosticsRemainBoundedAndKeepNewestCaptionIDs() async {
-        let responder = HeldCorrectionResponder()
+    @Test func skippedDiagnosticsRemainBoundedAndKeepNewestCaptionIDs() async throws {
+        let responder = HeldCorrectionResponder(steps: [.held])
         let coordinator = makeCoordinator(responder: responder)
         coordinator.beginSession()
 
@@ -54,27 +55,30 @@ import Testing
         #expect(coordinator.skippedCaptionIDs.count == 32)
         #expect(coordinator.skippedCaptionIDs == (66 ... 97).map(id))
         #expect(coordinator.waitingCaptionIDs(for: "mic-1") == [id(98), id(99), id(100)])
+        await responder.releaseHeldCall(sourceID: "mic-1", output: output("finished"))
     }
 
-    @Test func equalTimestampHeadsUseStableEnqueueOrder() async {
-        let responder = HeldCorrectionResponder()
+    @Test func equalTimestampHeadsUseStableEnqueueOrder() async throws {
+        let responder = HeldCorrectionResponder(steps: [.held, .held, .held])
         let coordinator = makeCoordinator(responder: responder)
         coordinator.beginSession()
         let timestamp = Date(timeIntervalSince1970: 10)
 
         coordinator.enqueue(job(coordinator, sourceID: "active-a", sequence: 1, capturedAt: timestamp.addingTimeInterval(-1)))
         coordinator.enqueue(job(coordinator, sourceID: "active-b", sequence: 1, capturedAt: timestamp.addingTimeInterval(-1)))
-        await waitUntil { await responder.activeSourceIDs().count == 2 }
+        try await waitUntil { await responder.activeSourceIDs().count == 2 }
 
         coordinator.enqueue(job(coordinator, sourceID: "first-equal", sequence: 1, capturedAt: timestamp))
         coordinator.enqueue(job(coordinator, sourceID: "second-equal", sequence: 1, capturedAt: timestamp))
         await responder.releaseHeldCall(sourceID: "active-a", output: output("active-a"))
 
-        await waitUntil { await responder.activeSourceIDs().contains("first-equal") }
+        try await waitUntil { await responder.startedSourceIDs().contains("first-equal") }
         #expect(!(await responder.startedSourceIDs()).contains("second-equal"))
+        await responder.releaseHeldCall(sourceID: "first-equal", output: output("first-equal"))
+        await responder.releaseHeldCall(sourceID: "active-b", output: output("active-b"))
     }
 
-    @Test func globalContextUsesNewestSixSuccessfulEntries() async {
+    @Test func globalContextUsesNewestSixSuccessfulEntries() async throws {
         let responder = HeldCorrectionResponder(steps: Array(repeating: .success, count: 8))
         let coordinator = makeCoordinator(responder: responder)
         coordinator.beginSession()
@@ -83,30 +87,30 @@ import Testing
 
         for sequence in 1 ... 7 {
             coordinator.enqueue(job(coordinator, sourceID: "history", sequence: sequence))
-            await waitUntil { resultCount == sequence }
+            try await waitUntil { resultCount == sequence }
         }
         coordinator.enqueue(job(coordinator, sourceID: "target", sequence: 8))
-        await waitUntil { resultCount == 8 }
+        try await waitUntil { resultCount == 8 }
 
         let context = await responder.contextOriginals(call: 7)
         #expect(context == (1 ... 6).map { "call \($0)" })
     }
 
-    @Test func queuedTargetBuildsContextOnlyWhenItActuallyDispatches() async {
-        let responder = HeldCorrectionResponder()
+    @Test func queuedTargetBuildsContextOnlyWhenItActuallyDispatches() async throws {
+        let responder = HeldCorrectionResponder(steps: [.held, .held])
         let coordinator = makeCoordinator(responder: responder)
         coordinator.beginSession()
 
         coordinator.enqueue(job(coordinator, sourceID: "new-context", sequence: 1))
         coordinator.enqueue(job(coordinator, sourceID: "other-active", sequence: 2))
-        await waitUntil { await responder.callCount() == 2 }
+        try await waitUntil { await responder.callCount() == 2 }
         coordinator.enqueue(job(coordinator, sourceID: "queued-target", sequence: 50))
 
         await responder.releaseHeldCall(
             sourceID: "new-context",
             output: .init(correctedOriginal: "corrected source", correctedTranslation: "corrected translation")
         )
-        await waitUntil { await responder.callCount() == 3 }
+        try await waitUntil { await responder.callCount() == 3 }
 
         let context = await responder.contextEntries(call: 2)
         #expect(context.count == 1)
@@ -116,9 +120,10 @@ import Testing
         #expect(context.first?.targetLanguageID == "zh-Hans")
         #expect(context.first?.original == "corrected source")
         #expect(context.first?.translation == "corrected translation")
+        await responder.releaseHeldCall(sourceID: "other-active", output: output("other"))
     }
 
-    @Test func globalContextUsesNewestSixAcrossSourcesWithCompleteSemantics() async {
+    @Test func globalContextUsesNewestSixAcrossSourcesWithCompleteSemantics() async throws {
         let responder = HeldCorrectionResponder(steps: Array(repeating: .success, count: 8))
         let coordinator = makeCoordinator(responder: responder)
         coordinator.beginSession()
@@ -134,10 +139,10 @@ import Testing
                 sequence: sequence,
                 generation: coordinator.sessionGeneration
             ))
-            await waitUntil { resultCount == sequence }
+            try await waitUntil { resultCount == sequence }
         }
         coordinator.enqueue(job(coordinator, sourceID: "target", sequence: 200))
-        await waitUntil { resultCount == 8 }
+        try await waitUntil { resultCount == 8 }
 
         let context = await responder.contextEntries(call: 7)
         #expect(context.map(\.sourceID) == (2 ... 7).map { "source-\($0)" })
@@ -148,7 +153,7 @@ import Testing
         #expect(context.map(\.translation) == (1 ... 6).map { "translated call \($0)" })
     }
 
-    @Test func isolatedSourceSuccessStillContributesToOtherGlobalContext() async {
+    @Test func isolatedSourceSuccessStillContributesToOtherGlobalContext() async throws {
         let responder = HeldCorrectionResponder(steps: [.success, .success])
         var settings = configuredSettings()
         settings.isolatedContextSourceIDs = ["isolated"]
@@ -158,9 +163,9 @@ import Testing
         coordinator.onResult = { _ in resultCount += 1 }
 
         coordinator.enqueue(job(coordinator, sourceID: "isolated", sequence: 1))
-        await waitUntil { resultCount == 1 }
+        try await waitUntil { resultCount == 1 }
         coordinator.enqueue(job(coordinator, sourceID: "global-observer", sequence: 2))
-        await waitUntil { resultCount == 2 }
+        try await waitUntil { resultCount == 2 }
 
         let context = await responder.contextEntries(call: 1)
         #expect(context.map(\.sourceID) == ["isolated"])
@@ -168,7 +173,7 @@ import Testing
         #expect(context.map(\.translation) == ["translated call 0"])
     }
 
-    @Test func isolatedContextUsesOnlyCurrentSourceNewestSix() async {
+    @Test func isolatedContextUsesOnlyCurrentSourceNewestSix() async throws {
         let responder = HeldCorrectionResponder(steps: Array(repeating: .success, count: 10))
         var settings = configuredSettings()
         settings.isolatedContextSourceIDs = ["mic"]
@@ -179,18 +184,18 @@ import Testing
 
         for sequence in 1 ... 4 {
             coordinator.enqueue(job(coordinator, sourceID: "mic", sequence: sequence))
-            await waitUntil { resultCount == sequence * 2 - 1 }
+            try await waitUntil { resultCount == sequence * 2 - 1 }
             coordinator.enqueue(job(coordinator, sourceID: "app", sequence: sequence + 10))
-            await waitUntil { resultCount == sequence * 2 }
+            try await waitUntil { resultCount == sequence * 2 }
         }
         coordinator.enqueue(job(coordinator, sourceID: "mic", sequence: 99))
-        await waitUntil { resultCount == 9 }
+        try await waitUntil { resultCount == 9 }
 
         let context = await responder.contextOriginals(call: 8)
         #expect(context == ["call 0", "call 2", "call 4", "call 6"])
     }
 
-    @Test func failedAndSkippedJobsNeverEnterContext() async {
+    @Test func failedAndSkippedJobsNeverEnterContext() async throws {
         let responder = HeldCorrectionResponder(steps: [.held, .success, .success, .success, .success])
         let coordinator = makeCoordinator(responder: responder)
         coordinator.beginSession()
@@ -200,20 +205,20 @@ import Testing
         for sequence in 1 ... 5 {
             coordinator.enqueue(job(coordinator, sourceID: "mic", sequence: sequence))
         }
-        await waitUntil { await responder.callCount() == 1 }
+        try await waitUntil { await responder.callCount() == 1 }
         await responder.failHeldCall(sourceID: "mic", error: .opaque("private detail"))
-        await waitUntil { resultCount == 3 }
+        try await waitUntil { resultCount == 3 }
 
         coordinator.enqueue(job(coordinator, sourceID: "target", sequence: 9))
-        await waitUntil { resultCount == 4 }
+        try await waitUntil { resultCount == 4 }
 
         #expect(coordinator.skippedCaptionIDs == [id(2)])
         let context = await responder.contextOriginals(call: 4)
         #expect(context == ["call 1", "call 2", "call 3"])
     }
 
-    @Test func concurrentAudioUnsupportedJobsEachRetryOnceAndDowngradeSession() async {
-        let responder = HeldCorrectionResponder()
+    @Test func concurrentAudioUnsupportedJobsEachRetryOnceAndDowngradeSession() async throws {
+        let responder = HeldCorrectionResponder(steps: [.held, .held, .held, .held])
         let coordinator = makeCoordinator(responder: responder)
         coordinator.beginSession()
         var results: [CorrectionResult] = []
@@ -221,14 +226,14 @@ import Testing
 
         coordinator.enqueue(job(coordinator, sourceID: "mic", sequence: 1))
         coordinator.enqueue(job(coordinator, sourceID: "app", sequence: 2))
-        await waitUntil { await responder.callCount() == 2 }
+        try await waitUntil { await responder.callCount() == 2 }
         await responder.failHeldCall(sourceID: "mic", error: .audioUnsupported)
         await responder.failHeldCall(sourceID: "app", error: .audioUnsupported)
-        await waitUntil { await responder.callCount() == 4 }
+        try await waitUntil { await responder.callCount() == 4 }
 
         await responder.releaseHeldCall(sourceID: "mic", output: output("mic retry"))
         await responder.releaseHeldCall(sourceID: "app", output: output("app retry"))
-        await waitUntil { results.count == 2 }
+        try await waitUntil { results.count == 2 }
 
         #expect(coordinator.status == .textOnly)
         #expect(await responder.modes(for: "mic") == [.audio, .textOnly])
@@ -237,7 +242,7 @@ import Testing
         #expect(await responder.audioPresence(for: "app") == [true, false])
     }
 
-    @Test func authenticationRateLimitAndTimeoutDoNotDowngrade() async {
+    @Test func authenticationRateLimitAndTimeoutDoNotDowngrade() async throws {
         for failure in [HeldCorrectionResponder.Failure.http(401), .http(429), .timeout] {
             let responder = HeldCorrectionResponder(steps: [.failure(failure), .success])
             let coordinator = makeCoordinator(responder: responder)
@@ -246,16 +251,16 @@ import Testing
             coordinator.onResult = { _ in resultCount += 1 }
 
             coordinator.enqueue(job(coordinator, sourceID: "mic", sequence: 1))
-            await waitUntil { await responder.callCount() == 1 }
+            try await waitUntil { await responder.callCount() == 1 }
             coordinator.enqueue(job(coordinator, sourceID: "mic", sequence: 2))
-            await waitUntil { resultCount == 1 }
+            try await waitUntil { resultCount == 1 }
 
             #expect(await responder.modes(for: "mic") == [.audio, .audio])
             #expect(coordinator.status != .textOnly)
         }
     }
 
-    @Test func audioLessJobUsesTextOnlyWithoutDowngradingLaterAudio() async {
+    @Test func audioLessJobUsesTextOnlyWithoutDowngradingLaterAudio() async throws {
         let responder = HeldCorrectionResponder(steps: [.success, .success])
         let coordinator = makeCoordinator(responder: responder)
         coordinator.beginSession()
@@ -263,9 +268,9 @@ import Testing
         coordinator.onResult = { _ in resultCount += 1 }
 
         coordinator.enqueue(job(coordinator, sourceID: "mic", sequence: 1, audio: nil))
-        await waitUntil { resultCount == 1 }
+        try await waitUntil { resultCount == 1 }
         coordinator.enqueue(job(coordinator, sourceID: "mic", sequence: 2))
-        await waitUntil { resultCount == 2 }
+        try await waitUntil { resultCount == 2 }
 
         #expect(await responder.modes(for: "mic") == [.textOnly, .audio])
         #expect(await responder.audioPresence(for: "mic") == [false, true])
@@ -280,74 +285,72 @@ import Testing
         coordinator.beginSession()
 
         coordinator.enqueue(job(sourceID: "mic", sequence: 1, generation: staleGeneration))
-        try? await Task.sleep(for: .milliseconds(30))
-
         #expect(await responder.callCount() == 0)
         #expect(coordinator.waitingCaptionIDs(for: "mic").isEmpty)
     }
 
-    @Test func endSessionRejectsHeldLateResult() async {
-        let responder = HeldCorrectionResponder()
+    @Test func endSessionRejectsHeldLateResult() async throws {
+        let responder = HeldCorrectionResponder(steps: [.held])
         let coordinator = makeCoordinator(responder: responder)
         coordinator.beginSession()
         var results: [CorrectionResult] = []
         coordinator.onResult = { results.append($0) }
         coordinator.enqueue(job(coordinator, sourceID: "mic", sequence: 1))
-        await waitUntil { await responder.callCount() == 1 }
+        try await waitUntil { await responder.callCount() == 1 }
 
         coordinator.endSession()
         await responder.releaseHeldCall(sourceID: "mic", output: output("stale"))
-        try? await Task.sleep(for: .milliseconds(30))
+        try await waitUntil { await responder.activeSourceIDs().isEmpty }
 
         #expect(results.isEmpty)
     }
 
-    @Test func providerChangeRejectsHeldLateResultAndKeepsSessionActive() async {
-        let responder = HeldCorrectionResponder()
+    @Test func providerChangeRejectsHeldLateResultAndKeepsSessionActive() async throws {
+        let responder = HeldCorrectionResponder(steps: [.held, .held])
         let coordinator = makeCoordinator(responder: responder)
         coordinator.beginSession()
         var results: [CorrectionResult] = []
         coordinator.onResult = { results.append($0) }
         coordinator.enqueue(job(coordinator, sourceID: "old", sequence: 1))
-        await waitUntil { await responder.callCount() == 1 }
+        try await waitUntil { await responder.callCount() == 1 }
 
         let oldGeneration = coordinator.sessionGeneration
         coordinator.settings.model = "replacement-model"
         #expect(coordinator.sessionGeneration == oldGeneration + 1)
         coordinator.enqueue(job(coordinator, sourceID: "new", sequence: 2))
-        await waitUntil { await responder.callCount() == 2 }
+        try await waitUntil { await responder.callCount() == 2 }
         await responder.releaseHeldCall(sourceID: "old", output: output("stale"))
         await responder.releaseHeldCall(sourceID: "new", output: output("current"))
-        await waitUntil { results.count == 1 }
+        try await waitUntil { results.count == 1 }
 
         #expect(results.map(\.sourceID) == ["new"])
     }
 
-    @Test func cancelSourceRejectsLateResultButAllowsOtherSource() async {
-        let responder = HeldCorrectionResponder()
+    @Test func cancelSourceRejectsLateResultButAllowsOtherSource() async throws {
+        let responder = HeldCorrectionResponder(steps: [.held, .held])
         let coordinator = makeCoordinator(responder: responder)
         coordinator.beginSession()
         var results: [CorrectionResult] = []
         coordinator.onResult = { results.append($0) }
         coordinator.enqueue(job(coordinator, sourceID: "cancelled", sequence: 1))
         coordinator.enqueue(job(coordinator, sourceID: "kept", sequence: 2))
-        await waitUntil { await responder.callCount() == 2 }
+        try await waitUntil { await responder.callCount() == 2 }
 
         coordinator.cancel(sourceID: "cancelled")
         await responder.releaseHeldCall(sourceID: "cancelled", output: output("stale"))
         await responder.releaseHeldCall(sourceID: "kept", output: output("current"))
-        await waitUntil { results.count == 1 }
+        try await waitUntil { results.count == 1 }
 
         #expect(results.map(\.sourceID) == ["kept"])
     }
 
-    @Test func cancellationIgnoringResponderStillNeverExceedsTwoRealCalls() async {
-        let responder = HeldCorrectionResponder()
+    @Test func cancellationIgnoringResponderStillNeverExceedsTwoRealCalls() async throws {
+        let responder = HeldCorrectionResponder(steps: [.held, .held])
         let coordinator = makeCoordinator(responder: responder)
         coordinator.beginSession()
         coordinator.enqueue(job(coordinator, sourceID: "a", sequence: 1))
         coordinator.enqueue(job(coordinator, sourceID: "b", sequence: 2))
-        await waitUntil { await responder.callCount() == 2 }
+        try await waitUntil { await responder.callCount() == 2 }
 
         coordinator.cancel(sourceID: "a")
         coordinator.enqueue(job(coordinator, sourceID: "c", sequence: 3))
@@ -355,8 +358,97 @@ import Testing
         #expect(await responder.callCount() == 2)
 
         await responder.releaseHeldCall(sourceID: "a", output: output("ignored"))
-        await waitUntil { await responder.callCount() == 3 }
+        try await waitUntil { await responder.callCount() == 3 }
         #expect(await responder.maximumConcurrentCallCount() == 2)
+        await responder.releaseHeldCall(sourceID: "b", output: output("b"))
+    }
+
+    @Test func coordinatorDeinitializesWhileCancellationIgnoringCallIsHeld() async throws {
+        let responder = HeldCorrectionResponder(steps: [.held])
+        var publishedResultCount = 0
+        var coordinator: RealtimeCorrectionCoordinator? = makeCoordinator(responder: responder)
+        weak let weakCoordinator = coordinator
+        coordinator?.beginSession()
+        let generation = coordinator?.sessionGeneration ?? -1
+        coordinator?.onResult = { _ in publishedResultCount += 1 }
+        coordinator?.enqueue(job(sourceID: "held", sequence: 1, generation: generation))
+        try await waitUntil { await responder.callCount() == 1 }
+
+        coordinator?.cancel(sourceID: "held")
+        coordinator?.endSession()
+        coordinator = nil
+        try await waitUntil { weakCoordinator == nil }
+        await responder.releaseHeldCall(sourceID: "held", output: output("late"))
+        try await waitUntil { await responder.activeSourceIDs().isEmpty }
+        #expect(publishedResultCount == 0)
+    }
+
+    @Test func onResultEndingSessionKeepsLifecycleStatusAndDoesNotSendWaitingJob() async throws {
+        let responder = HeldCorrectionResponder(steps: [.success, .success])
+        let coordinator = makeCoordinator(responder: responder)
+        coordinator.beginSession()
+        var callbackCount = 0
+        coordinator.onResult = { _ in
+            callbackCount += 1
+            coordinator.endSession()
+        }
+
+        coordinator.enqueue(job(coordinator, sourceID: "mic", sequence: 1))
+        coordinator.enqueue(job(coordinator, sourceID: "mic", sequence: 2))
+        try await waitUntil { callbackCount == 1 }
+        try? await Task.sleep(for: .milliseconds(30))
+
+        #expect(coordinator.status == .ready)
+        #expect(await responder.callCount() == 1)
+    }
+
+    @Test func onResultProviderChangeKeepsInvalidConfigurationWarning() async throws {
+        let responder = HeldCorrectionResponder(steps: [.success])
+        let coordinator = makeCoordinator(responder: responder)
+        coordinator.beginSession()
+        var callbackCount = 0
+        coordinator.onResult = { _ in
+            callbackCount += 1
+            coordinator.settings.model = ""
+        }
+
+        coordinator.enqueue(job(coordinator, sourceID: "mic", sequence: 1))
+        try await waitUntil { callbackCount == 1 }
+
+        #expect(coordinator.status == .warning("Correction settings are invalid."))
+    }
+
+    @Test func equalTimestampContextUsesEnqueueOrderDespiteReverseCompletion() async throws {
+        let responder = HeldCorrectionResponder(steps: [.held, .held])
+        let coordinator = makeCoordinator(responder: responder)
+        coordinator.beginSession()
+        var resultCount = 0
+        coordinator.onResult = { _ in resultCount += 1 }
+        let timestamp = Date(timeIntervalSince1970: 100)
+
+        coordinator.enqueue(job(coordinator, sourceID: "first", sequence: 1, capturedAt: timestamp))
+        coordinator.enqueue(job(coordinator, sourceID: "second", sequence: 2, capturedAt: timestamp))
+        try await waitUntil { await responder.callCount() == 2 }
+        await responder.releaseHeldCall(sourceID: "second", output: output("second corrected"))
+        await responder.releaseHeldCall(sourceID: "first", output: output("first corrected"))
+        try await waitUntil { resultCount == 2 }
+
+        coordinator.enqueue(job(coordinator, sourceID: "target", sequence: 3, capturedAt: timestamp.addingTimeInterval(1)))
+        try await waitUntil { await responder.callCount() == 3 }
+        let context = await responder.contextEntries(call: 2)
+        #expect(context.map(\.sourceID) == ["first", "second"])
+        await responder.releaseHeldCall(sourceID: "target", output: output("target"))
+    }
+
+    @Test func endSessionKeepsInvalidConfigurationWarning() {
+        var settings = configuredSettings()
+        settings.apiKey = ""
+        let coordinator = makeCoordinator(settings: settings, responder: HeldCorrectionResponder())
+
+        coordinator.beginSession()
+        coordinator.endSession()
+
+        #expect(coordinator.status == .warning("Correction settings are invalid."))
     }
 
     @Test func synchronousInvalidationBeforeDispatchNeverCallsResponder() async {
@@ -398,20 +490,18 @@ import Testing
         invalid.enqueue(job(sourceID: "mic", sequence: 2, generation: invalid.sessionGeneration))
         invalid.fetchModels()
         invalid.testAPI()
-        try? await Task.sleep(for: .milliseconds(30))
-
         #expect(await disabledResponder.totalOperationCount() == 0)
         #expect(await invalidResponder.totalOperationCount() == 0)
         #expect(disabled.status == .disabled)
         #expect(invalid.status == .warning("Correction settings are invalid."))
     }
 
-    @Test func modelFetchAndAPITestIgnoreStaleProviderResults() async {
+    @Test func modelFetchAndAPITestIgnoreStaleProviderResults() async throws {
         let responder = HeldCorrectionResponder()
         let coordinator = makeCoordinator(responder: responder)
         coordinator.fetchModels()
         coordinator.testAPI()
-        await waitUntil { await responder.providerOperationCount() == 2 }
+        try await waitUntil { await responder.providerOperationCount() == 2 }
 
         coordinator.settings.baseURL = "https://replacement.invalid/v1"
         await responder.releaseModelFetch(.success(["stale-model"]))
@@ -422,8 +512,24 @@ import Testing
         #expect(coordinator.apiTestState == .idle)
     }
 
-    @Test func disablingSettingsInvalidatesHeldCorrectionAndProviderOperations() async {
+    @Test func coordinatorDeinitializesWhileCancellationIgnoringProviderOperationsAreHeld() async throws {
         let responder = HeldCorrectionResponder()
+        var coordinator: RealtimeCorrectionCoordinator? = makeCoordinator(responder: responder)
+        weak let weakCoordinator = coordinator
+
+        coordinator?.fetchModels()
+        coordinator?.testAPI()
+        try await waitUntil { await responder.providerOperationCount() == 2 }
+
+        coordinator = nil
+        #expect(weakCoordinator == nil)
+
+        await responder.releaseModelFetch(.success(["late-model"]))
+        await responder.releaseAPITest(.success("late test"))
+    }
+
+    @Test func disablingSettingsInvalidatesHeldCorrectionAndProviderOperations() async throws {
+        let responder = HeldCorrectionResponder(steps: [.held])
         let coordinator = makeCoordinator(responder: responder)
         coordinator.beginSession()
         var results: [CorrectionResult] = []
@@ -431,7 +537,7 @@ import Testing
         coordinator.enqueue(job(coordinator, sourceID: "mic", sequence: 1))
         coordinator.fetchModels()
         coordinator.testAPI()
-        await waitUntil {
+        try await waitUntil {
             let correctionCount = await responder.callCount()
             let operationCount = await responder.providerOperationCount()
             return correctionCount == 1 && operationCount == 2
@@ -449,7 +555,7 @@ import Testing
         #expect(coordinator.apiTestState == .idle)
     }
 
-    @Test func errorsExposeOnlySanitizedClientDetails() async {
+    @Test func errorsExposeOnlySanitizedClientDetails() async throws {
         let responder = HeldCorrectionResponder(
             steps: [.failure(.opaque("DO NOT EXPOSE"))],
             modelResult: .failure(.opaque("MODEL SECRET")),
@@ -461,7 +567,7 @@ import Testing
         coordinator.fetchModels()
         coordinator.testAPI()
 
-        await waitUntil {
+        try await waitUntil {
             coordinator.status == .warning("Correction request failed.")
                 && coordinator.modelFetchState == .failed(nil)
                 && coordinator.apiTestState == .failed("HTTP 503: sanitized provider failure")
@@ -544,15 +650,14 @@ private func output(_ value: String = "corrected") -> CorrectionProviderOutput {
 private func waitUntil(
     timeout: Duration = .seconds(2),
     condition: @escaping @MainActor () async -> Bool
-) async {
+) async throws {
     let clock = ContinuousClock()
     let deadline = clock.now.advanced(by: timeout)
     while !(await condition()) {
         if clock.now >= deadline {
-            Issue.record("Timed out waiting for condition")
-            return
+            throw WaitTimeout()
         }
-        try? await Task.sleep(for: .milliseconds(10))
+        try await Task.sleep(for: .milliseconds(10))
     }
 }
 
@@ -583,10 +688,16 @@ private struct HeldCorrectionResponder: CorrectionResponding {
 
     init(
         steps: [Step] = [],
+        fallbackStep: Step = .success,
         modelResult: Result<[String], Failure>? = nil,
         apiResult: Result<String, Failure>? = nil
     ) {
-        state = State(steps: steps, modelResult: modelResult, apiResult: apiResult)
+        state = State(
+            steps: steps,
+            fallbackStep: fallbackStep,
+            modelResult: modelResult,
+            apiResult: apiResult
+        )
     }
 
     func validate(settings: CorrectionSettings) throws {
@@ -643,6 +754,7 @@ private struct HeldCorrectionResponder: CorrectionResponding {
         }
 
         let steps: [Step]
+        let fallbackStep: Step
         let modelResult: Result<[String], Failure>?
         let apiResult: Result<String, Failure>?
         var calls: [Call] = []
@@ -654,27 +766,41 @@ private struct HeldCorrectionResponder: CorrectionResponding {
         var modelContinuation: CheckedContinuation<[String], Error>?
         var apiContinuation: CheckedContinuation<String, Error>?
 
-        init(steps: [Step], modelResult: Result<[String], Failure>?, apiResult: Result<String, Failure>?) {
+        init(
+            steps: [Step],
+            fallbackStep: Step,
+            modelResult: Result<[String], Failure>?,
+            apiResult: Result<String, Failure>?
+        ) {
             self.steps = steps
+            self.fallbackStep = fallbackStep
             self.modelResult = modelResult
             self.apiResult = apiResult
         }
 
         func correct(prompt: CorrectionPrompt, audioWAVData: Data?) async throws -> CorrectionProviderOutput {
-            let current = Self.currentPayload(prompt.userContent)
+            let current: (sourceID: String, sequence: Int)
+            let contextEntries: [RecordedContextEntry]
+            do {
+                current = try Self.currentPayload(prompt.userContent)
+                contextEntries = try Self.contextEntries(prompt.userContent)
+            } catch {
+                Issue.record("Fake responder could not parse the structured correction prompt")
+                throw error
+            }
             let index = calls.count
             calls.append(.init(
                 sourceID: current.sourceID,
                 sequence: current.sequence,
                 prompt: prompt,
                 audioWAVData: audioWAVData,
-                contextEntries: Self.contextEntries(prompt.userContent)
+                contextEntries: contextEntries
             ))
             activeIndices.insert(index)
             maximumConcurrentCallCount = max(maximumConcurrentCallCount, activeIndices.count)
             defer { activeIndices.remove(index) }
 
-            switch index < steps.count ? steps[index] : .held {
+            switch index < steps.count ? steps[index] : fallbackStep {
             case .held:
                 return try await withCheckedThrowingContinuation { held[index] = $0 }
             case .success:
@@ -750,26 +876,31 @@ private struct HeldCorrectionResponder: CorrectionResponding {
             }
         }
 
-        private static func currentPayload(_ content: String) -> (sourceID: String, sequence: Int) {
-            let payload = jsonPayload(content)
-            let current = payload["current"] as? [String: Any] ?? [:]
-            let sourceID = current["sourceID"] as? String ?? ""
-            let original = current["localOriginal"] as? String ?? "-0"
-            let sequence = Int(original.split(separator: "-").last ?? "0") ?? 0
+        private static func currentPayload(_ content: String) throws -> (sourceID: String, sequence: Int) {
+            let payload = try jsonPayload(content)
+            guard let current = payload["current"] as? [String: Any],
+                  let sourceID = current["sourceID"] as? String,
+                  let original = current["localOriginal"] as? String,
+                  let sequenceText = original.split(separator: "-").last,
+                  let sequence = Int(sequenceText) else {
+                throw PromptParsingFailure()
+            }
             return (sourceID, sequence)
         }
 
-        private static func contextEntries(_ content: String) -> [RecordedContextEntry] {
-            let payload = jsonPayload(content)
-            let context = payload["context"] as? [[String: Any]] ?? []
-            return context.compactMap { value in
+        private static func contextEntries(_ content: String) throws -> [RecordedContextEntry] {
+            let payload = try jsonPayload(content)
+            guard let context = payload["context"] as? [[String: Any]] else {
+                throw PromptParsingFailure()
+            }
+            return try context.map { value in
                 guard let sourceID = value["sourceID"] as? String,
                       let sourceName = value["sourceName"] as? String,
                       let sourceLanguageID = value["sourceLanguageID"] as? String,
                       let targetLanguageID = value["targetLanguageID"] as? String,
                       let original = value["original"] as? String,
                       let translation = value["translation"] as? String else {
-                    return nil
+                    throw PromptParsingFailure()
                 }
                 return RecordedContextEntry(
                     sourceID: sourceID,
@@ -782,12 +913,12 @@ private struct HeldCorrectionResponder: CorrectionResponding {
             }
         }
 
-        private static func jsonPayload(_ content: String) -> [String: Any] {
+        private static func jsonPayload(_ content: String) throws -> [String: Any] {
             guard let start = content.range(of: "<<<CORRECTION_PAYLOAD_JSON>>>\n")?.upperBound,
                   let end = content.range(of: "\n<<<END_CORRECTION_PAYLOAD_JSON>>>", range: start ..< content.endIndex)?.lowerBound,
                   let data = String(content[start ..< end]).data(using: .utf8),
                   let object = try? JSONSerialization.jsonObject(with: data) as? [String: Any] else {
-                return [:]
+                throw PromptParsingFailure()
             }
             return object
         }
@@ -798,6 +929,9 @@ private struct OpaqueFailure: LocalizedError, Sendable {
     let detail: String
     var errorDescription: String? { detail }
 }
+
+private struct PromptParsingFailure: Error {}
+private struct WaitTimeout: Error {}
 
 private enum ImmediateInvalidation: CaseIterable {
     case cancelSource
