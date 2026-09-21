@@ -8,6 +8,11 @@ struct SentenceAudioBuffer {
     private var sampleStartIndex = 0
     private var emittedFrameCount = 0
 
+    init(sampleRate: Int, maximumDuration: TimeInterval) {
+        self.sampleRate = sampleRate
+        self.maximumDuration = maximumDuration
+    }
+
     var frameCount: Int { samples.count - sampleStartIndex }
 
     mutating func append(samples newSamples: [Float]) {
