@@ -62,3 +62,24 @@ jobs:
                 ;;
             esac
           done
+
+      - name: Package branch test app
+        if: github.ref == 'refs/heads/codex/upstream-rebuild-impl'
+        run: |
+          mkdir -p dist
+          ditto -c -k --keepParent \
+            .build/release/Build/Products/Release/v2s.app \
+            dist/v2s-branch-test.app.zip
+          (cd dist && shasum -a 256 v2s-branch-test.app.zip > v2s-branch-test.app.zip.sha256)
+
+      - name: Upload branch test app
+        if: github.ref == 'refs/heads/codex/upstream-rebuild-impl'
+        uses: actions/upload-artifact@v7
+        with:
+          name: v2s-branch-test-${{ github.sha }}
+          path: |
+            dist/v2s-branch-test.app.zip
+            dist/v2s-branch-test.app.zip.sha256
+          if-no-files-found: error
+          retention-days: 3
+          compression-level: 0
