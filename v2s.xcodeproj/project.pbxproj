@@ -62,6 +62,9 @@
 		3E7AA3F968C696892BC8661A /* RealtimeCorrectionCoordinator.swift in Sources */ = {isa = PBXBuildFile; fileRef = 03B7BEF7D7B4C94980869707 /* RealtimeCorrectionCoordinator.swift */; };
 		FF1358CB65A26B07AC097DB5 /* SentenceAudioBuffer.swift in Sources */ = {isa = PBXBuildFile; fileRef = A35DCB26946EE82CF61DCFCC /* SentenceAudioBuffer.swift */; };
 		9D3FDAFB59B453D9E396975D /* CorrectionSettingsSection.swift in Sources */ = {isa = PBXBuildFile; fileRef = D74634F9F5AADEDEE18A0472 /* CorrectionSettingsSection.swift */; };
+		B00000000000000000000100 /* NativeRealtimeSettings.swift in Sources */ = {isa = PBXBuildFile; fileRef = B00000000000000000000103 /* NativeRealtimeSettings.swift */; };
+		B00000000000000000000101 /* RealtimeMediaEvent.swift in Sources */ = {isa = PBXBuildFile; fileRef = B00000000000000000000104 /* RealtimeMediaEvent.swift */; };
+		B00000000000000000000102 /* CaptionEnhancementPolicy.swift in Sources */ = {isa = PBXBuildFile; fileRef = B00000000000000000000105 /* CaptionEnhancementPolicy.swift */; };
 /* End PBXBuildFile section */
 
 /* Begin PBXFileReference section */
@@ -121,6 +124,9 @@
 		03B7BEF7D7B4C94980869707 /* RealtimeCorrectionCoordinator.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = RealtimeCorrectionCoordinator.swift; sourceTree = "<group>"; };
 		A35DCB26946EE82CF61DCFCC /* SentenceAudioBuffer.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = SentenceAudioBuffer.swift; sourceTree = "<group>"; };
 		D74634F9F5AADEDEE18A0472 /* CorrectionSettingsSection.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = CorrectionSettingsSection.swift; sourceTree = "<group>"; };
+		B00000000000000000000103 /* NativeRealtimeSettings.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = NativeRealtimeSettings.swift; sourceTree = "<group>"; };
+		B00000000000000000000104 /* RealtimeMediaEvent.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = RealtimeMediaEvent.swift; sourceTree = "<group>"; };
+		B00000000000000000000105 /* CaptionEnhancementPolicy.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = CaptionEnhancementPolicy.swift; sourceTree = "<group>"; };
 /* End PBXFileReference section */
 
 /* Begin PBXFrameworksBuildPhase section */
@@ -209,6 +215,8 @@
 				A00000000000000000000101 /* AssistantSettings.swift */,
 				FD191B6C8DF276FDA27B4D97 /* CorrectionModels.swift */,
 				2D73DB6A0F666607C43893E6 /* CorrectionSettings.swift */,
+				B00000000000000000000103 /* NativeRealtimeSettings.swift */,
+				B00000000000000000000104 /* RealtimeMediaEvent.swift */,
 				A00000000000000000000034 /* InputSource.swift */,
 				A00000000000000000000035 /* LanguageOption.swift */,
 				A00000000000000000000042 /* ModeConfig.swift */,
@@ -228,6 +236,7 @@
 				A00000000000000000000102 /* AssistantCoordinator.swift */,
 				A00000000000000000000103 /* AssistantPromptBuilder.swift */,
 				DC212F74005DAEAFE1921292 /* CorrectionPromptBuilder.swift */,
+				B00000000000000000000105 /* CaptionEnhancementPolicy.swift */,
 				A00000000000000000000104 /* GlobalHotKeyController.swift */,
 				A00000000000000000000046 /* GlossaryService.swift */,
 				A00000000000000000000105 /* HTTPTransport.swift */,
@@ -406,6 +415,8 @@
 				A00000000000000000000111 /* AssistantSettings.swift in Sources */,
 				DE4392E7C3C484CD5DEBA078 /* CorrectionModels.swift in Sources */,
 				A592C187A4F438683233578C /* CorrectionSettings.swift in Sources */,
+				B00000000000000000000100 /* NativeRealtimeSettings.swift in Sources */,
+				B00000000000000000000101 /* RealtimeMediaEvent.swift in Sources */,
 				A00000000000000000000054 /* InputSource.swift in Sources */,
 				A00000000000000000000055 /* LanguageOption.swift in Sources */,
 				A00000000000000000000063 /* ModeConfig.swift in Sources */,
@@ -418,6 +429,7 @@
 				A00000000000000000000112 /* AssistantCoordinator.swift in Sources */,
 				A00000000000000000000113 /* AssistantPromptBuilder.swift in Sources */,
 				8A9F7430BBB44699390DCF5C /* CorrectionPromptBuilder.swift in Sources */,
+				B00000000000000000000102 /* CaptionEnhancementPolicy.swift in Sources */,
 				A00000000000000000000114 /* GlobalHotKeyController.swift in Sources */,
 				A00000000000000000000067 /* GlossaryService.swift in Sources */,
 				A00000000000000000000115 /* HTTPTransport.swift in Sources */,

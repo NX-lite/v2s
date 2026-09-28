@@ -3,6 +3,27 @@ import Testing
 @testable import v2s
 
 @Suite struct AppSettingsTests {
+    @Test func oldSettingsLeaveNativeRealtimeOff() throws {
+        let settings = try JSONDecoder().decode(
+            AppSettings.self,
+            from: Data(#"{"correction":{"isEnabled":true}}"#.utf8)
+        )
+        #expect(settings.correction.isEnabled)
+        #expect(settings.nativeRealtime == .default)
+    }
+
+    @Test func nativeRealtimeRoundTripContainsNoSecret() throws {
+        var settings = AppSettings.default
+        settings.nativeRealtime.isEnabled = true
+        settings.nativeRealtime.enabledSourceIDs = ["mic-1"]
+        settings.nativeRealtime.credentialReference = "realtime-key-reference"
+        let data = try JSONEncoder().encode(settings)
+        let decoded = try JSONDecoder().decode(AppSettings.self, from: data)
+        #expect(decoded.nativeRealtime.enabledSourceIDs == ["mic-1"])
+        #expect(String(decoding: data, as: UTF8.self).contains("realtime-key-reference"))
+        #expect(!String(decoding: data, as: UTF8.self).contains("test-secret-value"))
+    }
+
     @Test func legacySingleSourceSettingsDecodeIntoMultiSourceFields() throws {
         let json = """
         {
