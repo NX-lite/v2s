@@ -65,6 +65,9 @@
 		B00000000000000000000100 /* NativeRealtimeSettings.swift in Sources */ = {isa = PBXBuildFile; fileRef = B00000000000000000000103 /* NativeRealtimeSettings.swift */; };
 		B00000000000000000000101 /* RealtimeMediaEvent.swift in Sources */ = {isa = PBXBuildFile; fileRef = B00000000000000000000104 /* RealtimeMediaEvent.swift */; };
 		B00000000000000000000102 /* CaptionEnhancementPolicy.swift in Sources */ = {isa = PBXBuildFile; fileRef = B00000000000000000000105 /* CaptionEnhancementPolicy.swift */; };
+		B00000000000000000000106 /* RealtimeCredentialStore.swift in Sources */ = {isa = PBXBuildFile; fileRef = B00000000000000000000107 /* RealtimeCredentialStore.swift */; };
+		B00000000000000000000108 /* RealtimeEndpointResolver.swift in Sources */ = {isa = PBXBuildFile; fileRef = B0000000000000000000010A /* RealtimeEndpointResolver.swift */; };
+		B00000000000000000000109 /* RealtimeWebSocketTransport.swift in Sources */ = {isa = PBXBuildFile; fileRef = B0000000000000000000010B /* RealtimeWebSocketTransport.swift */; };
 /* End PBXBuildFile section */
 
 /* Begin PBXFileReference section */
@@ -127,6 +130,9 @@
 		B00000000000000000000103 /* NativeRealtimeSettings.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = NativeRealtimeSettings.swift; sourceTree = "<group>"; };
 		B00000000000000000000104 /* RealtimeMediaEvent.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = RealtimeMediaEvent.swift; sourceTree = "<group>"; };
 		B00000000000000000000105 /* CaptionEnhancementPolicy.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = CaptionEnhancementPolicy.swift; sourceTree = "<group>"; };
+		B00000000000000000000107 /* RealtimeCredentialStore.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = RealtimeCredentialStore.swift; sourceTree = "<group>"; };
+		B0000000000000000000010A /* RealtimeEndpointResolver.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = RealtimeEndpointResolver.swift; sourceTree = "<group>"; };
+		B0000000000000000000010B /* RealtimeWebSocketTransport.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = RealtimeWebSocketTransport.swift; sourceTree = "<group>"; };
 /* End PBXFileReference section */
 
 /* Begin PBXFrameworksBuildPhase section */
@@ -244,6 +250,9 @@
 				A00000000000000000000041 /* LiveTranscriptionSession.swift */,
 				A00000000000000000000106 /* OpenAIResponsesClient.swift */,
 				03B7BEF7D7B4C94980869707 /* RealtimeCorrectionCoordinator.swift */,
+				B00000000000000000000107 /* RealtimeCredentialStore.swift */,
+				B0000000000000000000010A /* RealtimeEndpointResolver.swift */,
+				B0000000000000000000010B /* RealtimeWebSocketTransport.swift */,
 				A00000000000000000000107 /* ScreenContextProvider.swift */,
 				A35DCB26946EE82CF61DCFCC /* SentenceAudioBuffer.swift */,
 				A00000000000000000000091 /* SentenceBoundaryHeuristics.swift */,
@@ -443,6 +452,9 @@
 				A0000000000000000000005A /* SourceCatalogService.swift in Sources */,
 				A00000000000000000000116 /* OpenAIResponsesClient.swift in Sources */,
 				3E7AA3F968C696892BC8661A /* RealtimeCorrectionCoordinator.swift in Sources */,
+				B00000000000000000000106 /* RealtimeCredentialStore.swift in Sources */,
+				B00000000000000000000108 /* RealtimeEndpointResolver.swift in Sources */,
+				B00000000000000000000109 /* RealtimeWebSocketTransport.swift in Sources */,
 				A00000000000000000000117 /* ScreenContextProvider.swift in Sources */,
 				FF1358CB65A26B07AC097DB5 /* SentenceAudioBuffer.swift in Sources */,
 				A00000000000000000000068 /* SpeedMonitor.swift in Sources */,
