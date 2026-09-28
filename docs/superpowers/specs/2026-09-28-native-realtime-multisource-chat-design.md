@@ -2,7 +2,7 @@
 
 **Date:** 2026-09-28
 
-**Status:** Draft for user review; no implementation authorized by this document
+**Status:** Approved by user on 2026-09-28; implementation authorized
 
 **Branch:** `codex/upstream-rebuild-impl`
 
