@@ -50,4 +50,45 @@ import Testing
         #expect(chunk.generation == utterance.generation)
         #expect(utterance.captionID == captionID)
     }
+
+    @Test func correctedTextRetainsItsCompleteUtteranceAttribution() {
+        let captionID = UUID(uuidString: "E2BD9B61-5B82-46D6-AC72-48C6FE39AA40")!
+        let event = RealtimeProviderEvent.correctedText(
+            sourceAlias: "audio-1",
+            generation: 7,
+            captionID: captionID,
+            utteranceID: "turn-1",
+            text: "corrected"
+        )
+
+        guard case .correctedText(let sourceAlias, let generation, let eventCaptionID, let utteranceID, let text) = event else {
+            Issue.record("Expected a corrected text event")
+            return
+        }
+        #expect(sourceAlias == "audio-1")
+        #expect(generation == 7)
+        #expect(eventCaptionID == captionID)
+        #expect(utteranceID == "turn-1")
+        #expect(text == "corrected")
+    }
+
+    @Test func nonCorrectionProviderEventsRetainSourceAndGeneration() {
+        let suggestion = RealtimeProviderEvent.suggestion(
+            sourceAlias: "audio-1", generation: 7, text: "possible correction"
+        )
+        let expired = RealtimeProviderEvent.expired(sourceAlias: "audio-1", generation: 7)
+        let failure = RealtimeProviderEvent.failure(
+            sourceAlias: "audio-1", generation: 7, .connectionFailed
+        )
+
+        #expect(suggestion == .suggestion(
+            sourceAlias: "audio-1", generation: 7, text: "possible correction"
+        ))
+        #expect(expired == .expired(sourceAlias: "audio-1", generation: 7))
+        #expect(failure == .failure(
+            sourceAlias: "audio-1", generation: 7, .connectionFailed
+        ))
+        let failureAsError: any Error = RealtimeFailureCode.connectionFailed
+        #expect(failureAsError is RealtimeFailureCode)
+    }
 }

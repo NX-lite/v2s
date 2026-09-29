@@ -93,13 +93,55 @@ import Testing
         #expect(try OpenAIXAIRealtimeCodec.parse(.text(#"{"type":"session.created"}"#)) == .sessionCreated)
         #expect(try OpenAIXAIRealtimeCodec.parse(.text(#"{"type":"session.updated"}"#)) == .sessionUpdated)
         #expect(try OpenAIXAIRealtimeCodec.parse(.text(#"{"type":"input_audio_buffer.committed"}"#)) == .audioCommitted)
-        #expect(try OpenAIXAIRealtimeCodec.parse(.text(#"{"type":"response.output_text.delta","delta":"hello"}"#)) == .textDelta("hello"))
-        #expect(try OpenAIXAIRealtimeCodec.parse(.text(#"{"type":"response.text.delta","delta":"world"}"#)) == .textDelta("world"))
-        #expect(try OpenAIXAIRealtimeCodec.parse(.text(#"{"type":"response.output_text.done","text":"hello"}"#)) == .textDone("hello"))
+        #expect(try OpenAIXAIRealtimeCodec.parse(.text(#"{"type":"response.output_text.delta","delta":"hello"}"#)) == .textDelta(responseID: nil, text: "hello"))
+        #expect(try OpenAIXAIRealtimeCodec.parse(.text(#"{"type":"response.text.delta","delta":"world"}"#)) == .textDelta(responseID: nil, text: "world"))
+        #expect(try OpenAIXAIRealtimeCodec.parse(.text(#"{"type":"response.output_text.done","text":"hello"}"#)) == .textDone(responseID: nil, text: "hello"))
         #expect(try OpenAIXAIRealtimeCodec.parse(.text(#"{"type":"response.output_audio.delta","delta":"AQID"}"#)) == .audioOutputDetected)
         #expect(try OpenAIXAIRealtimeCodec.parse(.text(#"{"type":"response.output_audio_transcript.delta","delta":"spoken reply"}"#)) == .audioOutputDetected)
-        #expect(try OpenAIXAIRealtimeCodec.parse(.text(#"{"type":"response.done","response":{"status":"completed"}}"#)) == .responseDone)
+        #expect(try OpenAIXAIRealtimeCodec.parse(.text(#"{"type":"response.done","response":{"status":"completed"}}"#)) == .responseDone(responseID: nil))
         #expect(try OpenAIXAIRealtimeCodec.parse(.text(#"{"type":"rate_limits.updated"}"#)) == .ignored)
+    }
+
+    @Test func parserPreservesBoundedResponseIDsForCorrelation() throws {
+        #expect(try OpenAIXAIRealtimeCodec.parse(.text(
+            #"{"type":"response.created","response":{"id":"resp_created-1"}}"#
+        )) == .responseCreated(id: "resp_created-1"))
+        #expect(try OpenAIXAIRealtimeCodec.parse(.text(
+            #"{"type":"response.output_text.delta","response_id":"resp_created-1","delta":"hello"}"#
+        )) == .textDelta(responseID: "resp_created-1", text: "hello"))
+        #expect(try OpenAIXAIRealtimeCodec.parse(.text(
+            #"{"type":"response.text.done","response_id":"resp_created-1","text":"hello"}"#
+        )) == .textDone(responseID: "resp_created-1", text: "hello"))
+        #expect(try OpenAIXAIRealtimeCodec.parse(.text(
+            #"{"type":"response.done","response":{"id":"resp_created-1","status":"completed"}}"#
+        )) == .responseDone(responseID: "resp_created-1"))
+
+        let maximumID = "resp_" + String(repeating: "a", count: 123)
+        #expect(maximumID.utf8.count == 128)
+        #expect(try OpenAIXAIRealtimeCodec.parse(.text(
+            #"{"type":"response.created","response":{"id":"\#(maximumID)"}}"#
+        )) == .responseCreated(id: maximumID))
+    }
+
+    @Test func parserRejectsMalformedResponseIDsWithoutRetainingThem() {
+        for raw in [
+            #"{"type":"response.created","response":{"id":"private$token"}}"#,
+            #"{"type":"response.text.delta","response_id":"private$token","delta":"hello"}"#,
+            #"{"type":"response.text.done","response_id":"private$token","text":"hello"}"#,
+            #"{"type":"response.done","response":{"id":"private$token"}}"#,
+            #"{"type":"response.created","response":{"id":"réponse"}}"#,
+            #"{"type":"response.created","response":{"id":"\#(String(repeating: "a", count: 129))"}}"#,
+        ] {
+            do {
+                _ = try OpenAIXAIRealtimeCodec.parse(.text(raw))
+                Issue.record("Expected malformed provider response ID to fail")
+            } catch {
+                #expect(error as? RealtimeCodecError == .malformedMessage)
+                #expect(!String(describing: error).contains("private$token"))
+                #expect(!String(describing: error).contains("réponse"))
+                #expect(!String(describing: error).contains("aaaa"))
+            }
+        }
     }
 
     @Test func parserNeverReturnsRawProviderErrorsOrMedia() throws {

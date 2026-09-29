@@ -4,9 +4,10 @@ enum QwenRealtimeCodecEvent: Equatable, Sendable {
     case sessionCreated
     case sessionUpdated
     case audioCommitted
-    case textDelta(String)
-    case textComplete(String)
-    case responseComplete
+    case responseCreated(id: String?)
+    case textDelta(responseID: String?, text: String)
+    case textComplete(responseID: String?, text: String)
+    case responseComplete(responseID: String?)
     case audioOutputDetected
     case providerError
 }
@@ -114,19 +115,27 @@ enum QwenRealtimeCodec {
             return [.sessionUpdated]
         case "input_audio_buffer.committed":
             return [.audioCommitted]
+        case "response.created":
+            return [.responseCreated(id: try nestedResponseID(object))]
         case "response.text.delta":
-            return [.textDelta(try boundedText(object["delta"]))]
+            return [.textDelta(
+                responseID: try responseID(object, key: "response_id"),
+                text: try boundedText(object["delta"])
+            )]
         case "response.text.done":
-            return [.textComplete(try boundedText(object["text"]))]
+            return [.textComplete(
+                responseID: try responseID(object, key: "response_id"),
+                text: try boundedText(object["text"])
+            )]
         case "response.audio.delta", "response.audio.done",
              "response.audio_transcript.delta", "response.audio_transcript.done":
             return [.audioOutputDetected]
         case "response.done":
-            return [.responseComplete]
+            return [.responseComplete(responseID: try nestedResponseID(object))]
         case "error":
             return [.providerError]
         default:
-            // Audio deltas, media, identifiers, and unrecognized events never escape.
+            // Unrecognized provider fields and media never escape.
             return []
         }
     }
@@ -180,6 +189,32 @@ enum QwenRealtimeCodec {
             throw RealtimeCodecError.malformedMessage
         }
         return text
+    }
+
+    private static func nestedResponseID(_ object: [String: Any]) throws -> String? {
+        guard let response = object["response"] else { return nil }
+        guard let response = response as? [String: Any] else {
+            throw RealtimeCodecError.malformedMessage
+        }
+        return try responseID(response, key: "id")
+    }
+
+    private static func responseID(_ object: [String: Any], key: String) throws -> String? {
+        guard let value = object[key] else { return nil }
+        guard let value = value as? String, validResponseID(value) else {
+            throw RealtimeCodecError.malformedMessage
+        }
+        return value
+    }
+
+    private static func validResponseID(_ value: String) -> Bool {
+        let bytes = value.utf8
+        guard !bytes.isEmpty, bytes.count <= 128 else { return false }
+        return bytes.allSatisfy { byte in
+            (byte >= 0x41 && byte <= 0x5A) ||
+                (byte >= 0x61 && byte <= 0x7A) ||
+                (byte >= 0x30 && byte <= 0x39) || byte == 0x5F || byte == 0x2D
+        }
     }
 
     private static func validAlias(_ alias: String) -> Bool {

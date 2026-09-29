@@ -13,9 +13,10 @@ enum OpenAIXAIRealtimeEvent: Equatable, Sendable {
     case sessionCreated
     case sessionUpdated
     case audioCommitted
-    case textDelta(String)
-    case textDone(String?)
-    case responseDone
+    case responseCreated(id: String?)
+    case textDelta(responseID: String?, text: String)
+    case textDone(responseID: String?, text: String?)
+    case responseDone(responseID: String?)
     case audioOutputDetected
     case failure(RealtimeFailureCode)
     case ignored
@@ -135,23 +136,30 @@ enum OpenAIXAIRealtimeCodec {
         case "session.created": return .sessionCreated
         case "session.updated": return .sessionUpdated
         case "input_audio_buffer.committed": return .audioCommitted
+        case "response.created":
+            return .responseCreated(id: try nestedResponseID(object))
         case "response.output_text.delta", "response.text.delta":
-            return .textDelta(try boundedText(object["delta"]))
+            return .textDelta(
+                responseID: try responseID(object, key: "response_id"),
+                text: try boundedText(object["delta"])
+            )
         case "response.output_text.done", "response.text.done":
+            let responseID = try responseID(object, key: "response_id")
             if let value = object["text"] {
-                return .textDone(try boundedText(value))
+                return .textDone(responseID: responseID, text: try boundedText(value))
             }
-            return .textDone(nil)
+            return .textDone(responseID: responseID, text: nil)
         case "response.output_audio.delta", "response.audio.delta",
              "response.output_audio_transcript.delta", "response.output_audio.done":
             return .audioOutputDetected
         case "response.done":
+            let responseID = try nestedResponseID(object)
             if let response = object["response"] as? [String: Any],
                let status = response["status"] as? String,
                status != "completed" {
                 return .failure(.capabilityRejected)
             }
-            return .responseDone
+            return .responseDone(responseID: responseID)
         case "error":
             let code = (object["error"] as? [String: Any])?["code"] as? String ?? ""
             return .failure(allowedFailure(for: code))
@@ -166,6 +174,32 @@ enum OpenAIXAIRealtimeCodec {
             throw RealtimeCodecError.malformedMessage
         }
         return text
+    }
+
+    private static func nestedResponseID(_ object: [String: Any]) throws -> String? {
+        guard let response = object["response"] else { return nil }
+        guard let response = response as? [String: Any] else {
+            throw RealtimeCodecError.malformedMessage
+        }
+        return try responseID(response, key: "id")
+    }
+
+    private static func responseID(_ object: [String: Any], key: String) throws -> String? {
+        guard let value = object[key] else { return nil }
+        guard let value = value as? String, validResponseID(value) else {
+            throw RealtimeCodecError.malformedMessage
+        }
+        return value
+    }
+
+    private static func validResponseID(_ value: String) -> Bool {
+        let bytes = value.utf8
+        guard !bytes.isEmpty, bytes.count <= 128 else { return false }
+        return bytes.allSatisfy { byte in
+            (byte >= 0x41 && byte <= 0x5A) ||
+                (byte >= 0x61 && byte <= 0x7A) ||
+                (byte >= 0x30 && byte <= 0x39) || byte == 0x5F || byte == 0x2D
+        }
     }
 
     private static func allowedFailure(for code: String) -> RealtimeFailureCode {

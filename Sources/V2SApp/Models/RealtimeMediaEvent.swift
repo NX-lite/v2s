@@ -56,7 +56,7 @@ struct RealtimeUtterance: Equatable, Sendable {
     let endMonotonicNanoseconds: UInt64
 }
 
-enum RealtimeFailureCode: String, Equatable, Sendable {
+enum RealtimeFailureCode: String, Error, Equatable, Sendable {
     case invalidConfiguration
     case permissionDenied
     case connectionFailed
@@ -68,10 +68,16 @@ enum RealtimeFailureCode: String, Equatable, Sendable {
 }
 
 enum RealtimeProviderEvent: Equatable, Sendable {
-    case correctedText(utteranceID: String, text: String)
-    case suggestion(text: String)
-    case expired
-    case failure(RealtimeFailureCode)
+    case correctedText(
+        sourceAlias: String,
+        generation: Int,
+        captionID: UUID,
+        utteranceID: String,
+        text: String
+    )
+    case suggestion(sourceAlias: String, generation: Int, text: String)
+    case expired(sourceAlias: String, generation: Int)
+    case failure(sourceAlias: String, generation: Int, RealtimeFailureCode)
 }
 
 protocol RealtimeSessionDriving: Sendable {

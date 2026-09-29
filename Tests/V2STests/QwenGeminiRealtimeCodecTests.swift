@@ -114,9 +114,9 @@ import Testing
 
     @Test func qwenParserReturnsOnlyTextAndAllowlistedControlEvents() throws {
         let delta = try QwenRealtimeCodec.parse(.text(#"{"type":"response.text.delta","delta":"hello","event_id":"secret-id"}"#))
-        #expect(delta == [.textDelta("hello")])
+        #expect(delta == [.textDelta(responseID: nil, text: "hello")])
         let done = try QwenRealtimeCodec.parse(.text(#"{"type":"response.done","response":{"id":"private-response"}}"#))
-        #expect(done == [.responseComplete])
+        #expect(done == [.responseComplete(responseID: "private-response")])
         let audio = try QwenRealtimeCodec.parse(.text(#"{"type":"response.audio.delta","delta":"c2VjcmV0LW1lZGlh"}"#))
         #expect(audio == [.audioOutputDetected])
         let audioTranscript = try QwenRealtimeCodec.parse(.text(#"{"type":"response.audio_transcript.delta","delta":"private transcript"}"#))
@@ -127,6 +127,48 @@ import Testing
         let failure = try QwenRealtimeCodec.parse(.text(#"{"type":"error","error":{"message":"private-key-echo"}}"#))
         #expect(failure == [.providerError])
         #expect(!String(describing: failure).contains("private-key-echo"))
+    }
+
+    @Test func qwenParserPreservesBoundedResponseIDsForCorrelation() throws {
+        #expect(try QwenRealtimeCodec.parse(.text(
+            #"{"type":"response.created","response":{"id":"resp_created-1"}}"#
+        )) == [.responseCreated(id: "resp_created-1")])
+        #expect(try QwenRealtimeCodec.parse(.text(
+            #"{"type":"response.text.delta","response_id":"resp_created-1","delta":"hello"}"#
+        )) == [.textDelta(responseID: "resp_created-1", text: "hello")])
+        #expect(try QwenRealtimeCodec.parse(.text(
+            #"{"type":"response.text.done","response_id":"resp_created-1","text":"hello"}"#
+        )) == [.textComplete(responseID: "resp_created-1", text: "hello")])
+        #expect(try QwenRealtimeCodec.parse(.text(
+            #"{"type":"response.done","response":{"id":"resp_created-1"}}"#
+        )) == [.responseComplete(responseID: "resp_created-1")])
+
+        let maximumID = "resp_" + String(repeating: "a", count: 123)
+        #expect(maximumID.utf8.count == 128)
+        #expect(try QwenRealtimeCodec.parse(.text(
+            #"{"type":"response.text.delta","response_id":"\#(maximumID)","delta":"hello"}"#
+        )) == [.textDelta(responseID: maximumID, text: "hello")])
+    }
+
+    @Test func qwenParserRejectsMalformedResponseIDsWithoutRetainingThem() {
+        for raw in [
+            #"{"type":"response.created","response":{"id":"private$token"}}"#,
+            #"{"type":"response.text.delta","response_id":"private$token","delta":"hello"}"#,
+            #"{"type":"response.text.done","response_id":"private$token","text":"hello"}"#,
+            #"{"type":"response.done","response":{"id":"private$token"}}"#,
+            #"{"type":"response.created","response":{"id":"réponse"}}"#,
+            #"{"type":"response.done","response":{"id":"\#(String(repeating: "a", count: 129))"}}"#,
+        ] {
+            do {
+                _ = try QwenRealtimeCodec.parse(.text(raw))
+                Issue.record("Expected malformed provider response ID to fail")
+            } catch {
+                #expect(error as? RealtimeCodecError == .malformedMessage)
+                #expect(!String(describing: error).contains("private$token"))
+                #expect(!String(describing: error).contains("réponse"))
+                #expect(!String(describing: error).contains("aaaa"))
+            }
+        }
     }
 
     @Test func qwenMalformedPayloadErrorsDoNotRetainPayload() {
