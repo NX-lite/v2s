@@ -1,6 +1,10 @@
 import Foundation
 
 actor NativeRealtimeSessionDriver: RealtimeSessionDriving {
+    private static let maximumAudioChunkBytes = 32_000
+    private static let maximumAudioMailboxBytes = 512_000
+    private static let maximumAudioMailboxChunks = 128
+
     private enum State {
         case stopped
         case connecting
@@ -36,6 +40,9 @@ actor NativeRealtimeSessionDriver: RealtimeSessionDriving {
     private var connectionTask: Task<Void, Never>?
     private var receiveTask: Task<Void, Never>?
     private var setupTimeoutTask: Task<Void, Never>?
+    private var drainTask: Task<Void, Never>?
+    private var audioMailbox: [RealtimeAudioChunk] = []
+    private var audioMailboxBytes = 0
 
     init(
         settings: NativeRealtimeSettings,
@@ -129,13 +136,84 @@ actor NativeRealtimeSessionDriver: RealtimeSessionDriving {
     }
 
     func sendAudioChunk(_ chunk: RealtimeAudioChunk) async throws {
-        _ = chunk
-        throw RealtimeFailureCode.capabilityRejected
+        switch state {
+        case .ready, .awaitingCommitAcknowledgement, .awaitingResponse:
+            break
+        case .stopped, .connecting, .awaitingAcknowledgement, .failed, .expired:
+            throw RealtimeFailureCode.capabilityRejected
+        }
+
+        guard let alias = sourceAlias, let generation = sourceGeneration,
+              chunk.sourceAlias == alias, chunk.generation == generation else {
+            throw RealtimeFailureCode.invalidConfiguration
+        }
+        guard chunk.sampleRate == 16_000,
+              !chunk.pcm16LEData.isEmpty,
+              chunk.pcm16LEData.count.isMultiple(of: 2),
+              chunk.pcm16LEData.count <= Self.maximumAudioChunkBytes else {
+            throw RealtimeFailureCode.capabilityRejected
+        }
+
+        let wouldExceedBytes = audioMailboxBytes + chunk.pcm16LEData.count > Self.maximumAudioMailboxBytes
+        let wouldExceedChunks = audioMailbox.count >= Self.maximumAudioMailboxChunks
+        guard !wouldExceedBytes, !wouldExceedChunks else {
+            clearMailbox()
+            emitFailure(.backpressure, alias: alias, generation: generation)
+            throw RealtimeFailureCode.backpressure
+        }
+
+        audioMailbox.append(chunk)
+        audioMailboxBytes += chunk.pcm16LEData.count
     }
 
     func commit(_ utterance: RealtimeUtterance) async throws {
-        _ = utterance
-        throw RealtimeFailureCode.capabilityRejected
+        guard state == .ready else { throw RealtimeFailureCode.capabilityRejected }
+        guard let alias = sourceAlias, let generation = sourceGeneration,
+              utterance.sourceAlias == alias, utterance.generation == generation,
+              !utterance.utteranceID.isEmpty,
+              utterance.endMonotonicNanoseconds >= utterance.startMonotonicNanoseconds else {
+            throw RealtimeFailureCode.invalidConfiguration
+        }
+
+        var committed: [RealtimeAudioChunk] = []
+        var remainder: [RealtimeAudioChunk] = []
+        var remainderBytes = 0
+        for chunk in audioMailbox {
+            if chunk.capturedAtMonotonicNanoseconds > utterance.endMonotonicNanoseconds {
+                remainder.append(chunk)
+                remainderBytes += chunk.pcm16LEData.count
+            } else if chunk.capturedAtMonotonicNanoseconds >= utterance.startMonotonicNanoseconds {
+                committed.append(chunk)
+            }
+            // Chunks earlier than the utterance window are stale and dropped.
+        }
+        guard !committed.isEmpty else { throw RealtimeFailureCode.invalidConfiguration }
+
+        let operation = operationID
+        let boundary: RealtimeSocketMessage
+        var audioMessages: [RealtimeSocketMessage] = []
+        do {
+            for chunk in committed {
+                audioMessages.append(try audioMessage(for: chunk, alias: alias, generation: generation))
+            }
+            boundary = try commitMessage(for: utterance)
+        } catch let error as RealtimeCodecError {
+            throw mapCommitCodecError(error)
+        }
+
+        audioMailbox = remainder
+        audioMailboxBytes = remainderBytes
+        state = .awaitingCommitAcknowledgement
+
+        let expectsCommitAcknowledgement = settings.profile.provider != .gemini
+        drainTask = Task.detached { [weak self] in
+            await self?.drainCommittedAudio(
+                audioMessages,
+                boundary: boundary,
+                expectsCommitAcknowledgement: expectsCommitAcknowledgement,
+                operation: operation
+            )
+        }
     }
 
     func sendVideoFrame(_ frame: RealtimeVideoFrame) async throws {
@@ -161,6 +239,9 @@ actor NativeRealtimeSessionDriver: RealtimeSessionDriving {
         connectionTask = nil
         receiveTask?.cancel()
         receiveTask = nil
+        drainTask?.cancel()
+        drainTask = nil
+        clearMailbox()
         let oldConnection = connection
         connection = nil
 
@@ -232,6 +313,10 @@ actor NativeRealtimeSessionDriver: RealtimeSessionDriving {
 
     private func receive(_ message: RealtimeSocketMessage, operation: UInt64) async {
         guard operationID == operation else { return }
+        if state == .awaitingCommitAcknowledgement {
+            await receiveDuringCommit(message, operation: operation)
+            return
+        }
         do {
             switch try setupDecision(for: message) {
             case .acknowledged:
@@ -334,6 +419,9 @@ actor NativeRealtimeSessionDriver: RealtimeSessionDriving {
         connectionTask = nil
         receiveTask?.cancel()
         receiveTask = nil
+        drainTask?.cancel()
+        drainTask = nil
+        clearMailbox()
         let oldConnection = connection
         connection = nil
         let continuation = setupContinuation
@@ -355,6 +443,112 @@ actor NativeRealtimeSessionDriver: RealtimeSessionDriving {
             generation: generation,
             code
         ))
+    }
+
+    private func clearMailbox() {
+        audioMailbox.removeAll(keepingCapacity: false)
+        audioMailboxBytes = 0
+    }
+
+    private func drainCommittedAudio(
+        _ audioMessages: [RealtimeSocketMessage],
+        boundary: RealtimeSocketMessage,
+        expectsCommitAcknowledgement: Bool,
+        operation: UInt64
+    ) async {
+        for message in audioMessages + [boundary] {
+            guard operationID == operation,
+                  state == .awaitingCommitAcknowledgement,
+                  let connection else { return }
+            do {
+                try await connection.send(message)
+            } catch {
+                await fail(.connectionFailed, operation: operation)
+                return
+            }
+        }
+        guard operationID == operation,
+              state == .awaitingCommitAcknowledgement else { return }
+        drainTask = nil
+        if !expectsCommitAcknowledgement {
+            // Gemini has no commit acknowledgement; activityEnd completes the turn boundary.
+            state = .ready
+        }
+    }
+
+    private func receiveDuringCommit(
+        _ message: RealtimeSocketMessage,
+        operation: UInt64
+    ) async {
+        do {
+            let committed: Bool
+            switch settings.profile.provider {
+            case .openAI, .xAI:
+                switch try OpenAIXAIRealtimeCodec.parse(message) {
+                case .audioCommitted:
+                    committed = true
+                case .failure(let code):
+                    await fail(code, operation: operation)
+                    return
+                default:
+                    committed = false
+                }
+            case .qwen:
+                let events = try QwenRealtimeCodec.parse(message)
+                if events.contains(where: { $0 == .providerError }) {
+                    await fail(.connectionFailed, operation: operation)
+                    return
+                }
+                committed = events.contains(where: { $0 == .audioCommitted })
+            case .gemini:
+                let events = try GeminiRealtimeCodec.parse(message)
+                if events.contains(where: { $0 == .providerError }) {
+                    await fail(.connectionFailed, operation: operation)
+                    return
+                }
+                committed = false
+            }
+            if committed, state == .awaitingCommitAcknowledgement {
+                state = .ready
+            }
+        } catch {
+            await fail(.malformedResponse, operation: operation)
+        }
+    }
+
+    private func audioMessage(
+        for chunk: RealtimeAudioChunk,
+        alias: String,
+        generation: Int
+    ) throws -> RealtimeSocketMessage {
+        switch settings.profile.provider {
+        case .openAI, .xAI:
+            try OpenAIXAIRealtimeCodec.audioAppend(chunk, sourceAlias: alias, generation: generation)
+        case .qwen:
+            try QwenRealtimeCodec.audio(chunk, sourceAlias: alias, generation: generation)
+        case .gemini:
+            try GeminiRealtimeCodec.audio(chunk, sourceAlias: alias, generation: generation)
+        }
+    }
+
+    private func commitMessage(for utterance: RealtimeUtterance) throws -> RealtimeSocketMessage {
+        switch settings.profile.provider {
+        case .openAI, .xAI:
+            try OpenAIXAIRealtimeCodec.commit()
+        case .qwen:
+            try QwenRealtimeCodec.commit(utterance)
+        case .gemini:
+            try GeminiRealtimeCodec.commit(utterance)
+        }
+    }
+
+    private func mapCommitCodecError(_ error: RealtimeCodecError) -> RealtimeFailureCode {
+        switch error {
+        case .invalidAudio, .oversizedMessage:
+            .capabilityRejected
+        case .unsupportedProfile, .invalidAlias, .malformedMessage, .unsupportedMessage:
+            .invalidConfiguration
+        }
     }
 
     private func isCurrent(_ operation: UInt64, in expectedState: State) -> Bool {

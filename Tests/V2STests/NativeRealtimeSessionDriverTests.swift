@@ -415,6 +415,194 @@ struct NativeRealtimeSessionDriverTests {
         await driver.stop()
         #expect(await connection.sentMessageTypes() == ["session.update"])
     }
+
+    @Test func audioChunkValidationRejectsBadInputBeforeAnySocketSend() async throws {
+        let (driver, connection, recorder, task) = await makeReadyDriver(profile: .openAIMini)
+
+        let wrongAlias = makeChunk(alias: "audio-2", generation: 7, timestamp: 100)
+        await expectFailure(.invalidConfiguration) { try await driver.sendAudioChunk(wrongAlias) }
+        let wrongGeneration = makeChunk(generation: 8, timestamp: 100)
+        await expectFailure(.invalidConfiguration) { try await driver.sendAudioChunk(wrongGeneration) }
+        let wrongRate = makeChunk(generation: 7, timestamp: 100, sampleRate: 8_000)
+        await expectFailure(.capabilityRejected) { try await driver.sendAudioChunk(wrongRate) }
+        let empty = makeChunk(generation: 7, timestamp: 100, bytes: 0)
+        await expectFailure(.capabilityRejected) { try await driver.sendAudioChunk(empty) }
+        let odd = makeChunk(generation: 7, timestamp: 100, bytes: 3)
+        await expectFailure(.capabilityRejected) { try await driver.sendAudioChunk(odd) }
+        let oversized = makeChunk(generation: 7, timestamp: 100, bytes: 32_002)
+        await expectFailure(.capabilityRejected) { try await driver.sendAudioChunk(oversized) }
+
+        #expect(await connection.sentMessageTypes() == ["session.update"])
+        try await driver.sendAudioChunk(makeChunk(generation: 7, timestamp: 100))
+        #expect(await connection.sentMessageTypes() == ["session.update"])
+        #expect(await recorder.outcome() == .succeeded)
+        await task.value
+    }
+
+    @Test func commitDrainsOnlyCommittedIntervalThenSendsBoundary() async throws {
+        let (driver, connection, recorder, task) = await makeReadyDriver(profile: .openAIMini)
+
+        try await driver.sendAudioChunk(makeChunk(generation: 7, timestamp: 100))
+        try await driver.sendAudioChunk(makeChunk(generation: 7, timestamp: 200))
+        try await driver.sendAudioChunk(makeChunk(generation: 7, timestamp: 900))
+
+        try await driver.commit(makeUtterance(generation: 7, start: 0, end: 500))
+        #expect(await connection.waitUntilSentMessageCount(4))
+        #expect(await connection.sentMessageTypes() == [
+            "session.update",
+            "input_audio_buffer.append",
+            "input_audio_buffer.append",
+            "input_audio_buffer.commit",
+        ])
+
+        // A second commit before the acknowledgement must fail without another boundary.
+        await expectFailure(.capabilityRejected) {
+            try await driver.commit(makeUtterance(generation: 7, start: 501, end: 1_000))
+        }
+        #expect(await connection.sentMessageTypes().count == 4)
+
+        await connection.enqueue(.text(#"{"type":"input_audio_buffer.committed"}"#))
+        try await Task.sleep(for: .milliseconds(10))
+
+        // The later chunk stayed queued for the next utterance.
+        try await driver.commit(makeUtterance(generation: 7, start: 501, end: 1_000))
+        #expect(await connection.waitUntilSentMessageCount(6))
+        #expect(await connection.sentMessageTypes() == [
+            "session.update",
+            "input_audio_buffer.append",
+            "input_audio_buffer.append",
+            "input_audio_buffer.commit",
+            "input_audio_buffer.append",
+            "input_audio_buffer.commit",
+        ])
+
+        await driver.stop()
+        #expect(await recorder.outcome() == .succeeded)
+        await task.value
+    }
+
+    @Test func commitWithoutAudioInIntervalIsRejected() async throws {
+        let (driver, connection, recorder, task) = await makeReadyDriver(profile: .openAIMini)
+
+        try await driver.sendAudioChunk(makeChunk(generation: 7, timestamp: 900))
+        await expectFailure(.invalidConfiguration) {
+            try await driver.commit(makeUtterance(generation: 7, start: 0, end: 500))
+        }
+        #expect(await connection.sentMessageTypes() == ["session.update"])
+
+        // A commit whose utterance metadata is invalid is also rejected before sending.
+        await expectFailure(.invalidConfiguration) {
+            try await driver.commit(makeUtterance(alias: "audio-2", generation: 7, start: 800, end: 1_000))
+        }
+        await expectFailure(.invalidConfiguration) {
+            try await driver.commit(makeUtterance(generation: 7, start: 1_000, end: 900))
+        }
+
+        // The queued chunk survives the rejected commits.
+        try await driver.commit(makeUtterance(generation: 7, start: 0, end: 1_000))
+        #expect(await connection.waitUntilSentMessageCount(3))
+        await driver.stop()
+        #expect(await recorder.outcome() == .succeeded)
+        await task.value
+    }
+
+    @Test func mailboxOverflowFailsOnlyThatSourceAndClearsQueuedMedia() async throws {
+        let (driver, connection, recorder, task) = await makeReadyDriver(profile: .openAIMini)
+        let (otherDriver, otherConnection, otherRecorder, otherTask) =
+            await makeReadyDriver(profile: .openAIMini)
+        var eventIterator = await driver.events().makeAsyncIterator()
+
+        for index in 0..<128 {
+            try await driver.sendAudioChunk(
+                makeChunk(generation: 7, timestamp: UInt64(index + 1))
+            )
+        }
+        await expectFailure(.backpressure) {
+            try await driver.sendAudioChunk(makeChunk(generation: 7, timestamp: 999))
+        }
+        let event = await eventIterator.next()
+        #expect(event == .failure(sourceAlias: "audio-1", generation: 7, .backpressure))
+
+        // The overflowing source's mailbox was cleared; nothing was sent.
+        await expectFailure(.invalidConfiguration) {
+            try await driver.commit(makeUtterance(generation: 7, start: 0, end: 1_000))
+        }
+        #expect(await connection.sentMessageTypes() == ["session.update"])
+
+        // The overflow does not affect a second source's driver.
+        try await otherDriver.sendAudioChunk(makeChunk(generation: 7, timestamp: 100))
+        try await otherDriver.commit(makeUtterance(generation: 7, start: 0, end: 500))
+        #expect(await otherConnection.waitUntilSentMessageCount(3))
+
+        // The overflowing source can queue new audio after the failure.
+        try await driver.sendAudioChunk(makeChunk(generation: 7, timestamp: 100))
+        try await driver.commit(makeUtterance(generation: 7, start: 0, end: 500))
+        #expect(await connection.waitUntilSentMessageCount(3))
+
+        await driver.stop()
+        await otherDriver.stop()
+        #expect(await recorder.outcome() == .succeeded)
+        #expect(await otherRecorder.outcome() == .succeeded)
+        await task.value
+        await otherTask.value
+    }
+
+    @Test func mailboxByteLimitOverflowEmitsBackpressure() async throws {
+        let (driver, connection, recorder, task) = await makeReadyDriver(profile: .openAIMini)
+        var eventIterator = await driver.events().makeAsyncIterator()
+
+        // 16 chunks of 32,000 bytes fill the 512,000-byte mailbox exactly.
+        for index in 0..<16 {
+            try await driver.sendAudioChunk(
+                makeChunk(generation: 7, timestamp: UInt64(index + 1), bytes: 32_000)
+            )
+        }
+        await expectFailure(.backpressure) {
+            try await driver.sendAudioChunk(makeChunk(generation: 7, timestamp: 999))
+        }
+        let event = await eventIterator.next()
+        #expect(event == .failure(sourceAlias: "audio-1", generation: 7, .backpressure))
+        #expect(await connection.sentMessageTypes() == ["session.update"])
+        await driver.stop()
+        #expect(await recorder.outcome() == .succeeded)
+        await task.value
+    }
+
+    @Test func geminiCommitSendsAudioAndBoundaryThenReturnsToReady() async throws {
+        let (driver, connection, recorder, task) = await makeReadyDriver(profile: .geminiLive)
+
+        try await driver.sendAudioChunk(makeChunk(generation: 7, timestamp: 100))
+        try await driver.commit(makeUtterance(generation: 7, start: 0, end: 500))
+        #expect(await connection.waitUntilSentMessageCount(3))
+        let types = await connection.sentMessageTypes()
+        #expect(types.count == 3)
+        #expect(types[0] == "setup")
+
+        // Gemini has no commit acknowledgement; the next utterance can commit right away.
+        try await driver.sendAudioChunk(makeChunk(generation: 7, timestamp: 600))
+        try await driver.commit(makeUtterance(generation: 7, start: 501, end: 1_000))
+        #expect(await connection.waitUntilSentMessageCount(5))
+        await driver.stop()
+        #expect(await recorder.outcome() == .succeeded)
+        await task.value
+    }
+
+    @Test func stopClearsMailboxAndRejectsFurtherMedia() async throws {
+        let (driver, connection, recorder, task) = await makeReadyDriver(profile: .openAIMini)
+
+        try await driver.sendAudioChunk(makeChunk(generation: 7, timestamp: 100))
+        await driver.stop()
+
+        await expectFailure(.capabilityRejected) {
+            try await driver.sendAudioChunk(makeChunk(generation: 7, timestamp: 200))
+        }
+        await expectFailure(.capabilityRejected) {
+            try await driver.commit(makeUtterance(generation: 7, start: 0, end: 500))
+        }
+        #expect(await connection.sentMessageTypes() == ["session.update"])
+        #expect(await recorder.waitForOutcome() == .succeeded)
+        await task.value
+    }
 }
 
 private enum StartOutcome: Equatable {
@@ -459,6 +647,77 @@ private func launchStart(
         }
     }
     return (recorder, task)
+}
+
+private func makeReadyDriver(
+    profile: NativeRealtimeProfile
+) async -> (
+    NativeRealtimeSessionDriver,
+    FakeRealtimeWebSocketConnection,
+    StartOutcomeRecorder,
+    Task<Void, Never>
+) {
+    let connection = FakeRealtimeWebSocketConnection()
+    let connector = FakeRealtimeWebSocketConnector(profile: profile, connections: [connection])
+    let driver = NativeRealtimeSessionDriver(
+        settings: settings(profile: profile),
+        credential: "synthetic-key",
+        sourceRole: .applicationAudio,
+        connector: connector,
+        videoEnabled: false,
+        setupTimeout: .seconds(1)
+    )
+    let (recorder, task) = launchStart(driver, alias: "audio-1", generation: 7)
+    _ = await connection.waitUntilSentMessageCount(1)
+    await connection.enqueue(acknowledgement(for: profile))
+    _ = await recorder.waitForOutcome()
+    return (driver, connection, recorder, task)
+}
+
+private func makeChunk(
+    alias: String = "audio-1",
+    generation: Int,
+    timestamp: UInt64,
+    bytes: Int = 320,
+    sampleRate: Int = 16_000
+) -> RealtimeAudioChunk {
+    RealtimeAudioChunk(
+        sourceAlias: alias,
+        generation: generation,
+        capturedAtMonotonicNanoseconds: timestamp,
+        pcm16LEData: Data(repeating: 0, count: bytes),
+        sampleRate: sampleRate
+    )
+}
+
+private func makeUtterance(
+    alias: String = "audio-1",
+    generation: Int,
+    start: UInt64,
+    end: UInt64
+) -> RealtimeUtterance {
+    RealtimeUtterance(
+        sourceAlias: alias,
+        generation: generation,
+        captionID: UUID(),
+        utteranceID: "synthetic-utterance",
+        startMonotonicNanoseconds: start,
+        endMonotonicNanoseconds: end
+    )
+}
+
+private func expectFailure(
+    _ expected: RealtimeFailureCode,
+    _ operation: () async throws -> Void
+) async {
+    do {
+        try await operation()
+        Issue.record("Expected \(expected) but the operation succeeded")
+    } catch let code as RealtimeFailureCode {
+        #expect(code == expected)
+    } catch {
+        Issue.record("Expected \(expected) but got a non-allowlisted error")
+    }
 }
 
 private func settings(profile: NativeRealtimeProfile) -> NativeRealtimeSettings {
