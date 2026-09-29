@@ -39,7 +39,7 @@ import Foundation
         let qwenResponse = try QwenRealtimeCodec.responseCreate()
         precondition(jsonObject(qwenResponse)?["type"] as? String == "response.create")
         let qwenEvents = try QwenRealtimeCodec.parse(.text(#"{"type":"response.text.delta","delta":"hello"}"#))
-        precondition(qwenEvents == [.textDelta("hello")])
+        precondition(qwenEvents == [.textDelta(responseID: nil, text: "hello")])
 
         let geminiSetup = try GeminiRealtimeCodec.setup(sourceAlias: "audio-1", sourceRole: .microphone)
         let setupBody = jsonObject(geminiSetup)?["setup"] as? [String: Any]

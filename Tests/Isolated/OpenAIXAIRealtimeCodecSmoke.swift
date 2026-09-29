@@ -16,6 +16,6 @@ import Foundation
         let event = try OpenAIXAIRealtimeCodec.parse(
             .text(#"{"type":"response.text.delta","delta":"ok"}"#)
         )
-        precondition(event == .textDelta("ok"))
+        precondition(event == .textDelta(responseID: nil, text: "ok"))
     }
 }
