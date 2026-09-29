@@ -3,6 +3,11 @@ import Testing
 @testable import v2s
 
 @Suite struct RealtimeMediaEventTests {
+    @Test func sourceRolesExposeOnlyGenericDescriptions() {
+        #expect(RealtimeAudioSourceRole.microphone.providerLabel == "microphone")
+        #expect(RealtimeAudioSourceRole.applicationAudio.providerLabel == "application audio")
+    }
+
     @Test func aliasesAreEphemeralAndDoNotExposeSourceIDs() {
         let aliases = RealtimeSourceAliases(
             sourceIDs: ["device-stable-id", "bundle.example.app", "device-stable-id"]

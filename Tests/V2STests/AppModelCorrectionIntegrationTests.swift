@@ -5,6 +5,27 @@ import Testing
 
 @MainActor
 @Suite struct AppModelCorrectionIntegrationTests {
+    @Test func unrelatedAppModelPersistencePreservesNativeRealtimeConfiguration() {
+        let settingsURL = makeSettingsURL()
+        defer { try? FileManager.default.removeItem(at: settingsURL) }
+        let store = SettingsStore(fileURL: settingsURL)
+        var settings = AppSettings.default
+        settings.nativeRealtime.isEnabled = true
+        settings.nativeRealtime.enabledSourceIDs = ["mic-1"]
+        settings.nativeRealtime.profile = .qwenOmniFlash
+        settings.nativeRealtime.region = .singapore
+        settings.nativeRealtime.qwenWorkspaceID = "workspace-123"
+        store.save(settings)
+
+        let model = AppModel(
+            settingsStore: store,
+            sourceCatalogService: TestSourceCatalogService(microphones: [microphoneSource])
+        )
+        #expect(model.nativeRealtimeSettings == settings.nativeRealtime)
+        model.glossary = ["hello": "world"]
+        #expect(store.load().nativeRealtime == settings.nativeRealtime)
+    }
+
     @Test func localCaptionDisplaysBeforeCorrectionAndBackfillsByID() async throws {
         let fixture = makeFixture()
         defer { fixture.removeSettingsFile() }

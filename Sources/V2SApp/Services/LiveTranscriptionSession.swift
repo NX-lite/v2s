@@ -21,6 +21,246 @@ private struct UncheckedSendablePCMBuffer: @unchecked Sendable {
     let value: AVAudioPCMBuffer
 }
 
+struct RealtimePCM16AudioChunk: Equatable, Sendable {
+    let sourceToken: UUID
+    let generation: UInt64
+    let captureTimestampNanoseconds: UInt64
+    let sampleRate: Int
+    let frameCount: Int
+    let pcm16LE: Data
+}
+
+enum RealtimePCM16AudioStreamError: Error, Equatable {
+    case backpressureExceeded
+    case sourceSuperseded
+    case invalidAudioChunk
+    case concurrentRead
+}
+
+enum RealtimePCM16AudioOfferResult: Equatable {
+    case enqueued
+    case noConsumer
+    case rejectedSource
+    case rejectedGeneration
+    case backpressureExceeded
+    case invalidAudioChunk
+    case closed
+}
+
+struct RealtimePCM16AudioInput: Sendable {
+    let sourceToken: UUID
+    let generation: UInt64
+
+    private let fanout: RealtimePCM16AudioFanout
+
+    fileprivate init(sourceToken: UUID, generation: UInt64, fanout: RealtimePCM16AudioFanout) {
+        self.sourceToken = sourceToken
+        self.generation = generation
+        self.fanout = fanout
+    }
+
+    func nextChunk() async throws -> RealtimePCM16AudioChunk? {
+        try await fanout.nextChunk()
+    }
+}
+
+/// A per-capture-generation bounded mailbox. Capturing only performs a short lock,
+/// copies one already-normalized chunk, and signals a waiting reader; it never calls
+/// the consumer or performs network work. Audio is terminally rejected on overflow.
+final class RealtimePCM16AudioFanout: @unchecked Sendable {
+    private let lock = NSLock()
+    let maximumBufferedFrames: Int
+    private let maximumBufferedChunks: Int
+
+    private var chunks: [RealtimePCM16AudioChunk] = []
+    private var bufferedFrames = 0
+    private var didCreateInput = false
+    private var isClosed = false
+    private var terminalError: RealtimePCM16AudioStreamError?
+    private var readerIsActive = false
+    private var waitingReader: CheckedContinuation<RealtimePCM16AudioChunk?, Error>?
+
+    let sourceToken: UUID
+    let generation: UInt64
+
+    init(
+        sourceToken: UUID,
+        generation: UInt64,
+        maximumBufferedFrames: Int = 32_000,
+        maximumBufferedChunks: Int = 128
+    ) {
+        self.sourceToken = sourceToken
+        self.generation = generation
+        self.maximumBufferedFrames = max(1, maximumBufferedFrames)
+        self.maximumBufferedChunks = max(1, maximumBufferedChunks)
+    }
+
+    func makeInput() -> RealtimePCM16AudioInput? {
+        lock.lock()
+        defer { lock.unlock() }
+        guard !didCreateInput, !isClosed else { return nil }
+        didCreateInput = true
+        return RealtimePCM16AudioInput(sourceToken: sourceToken, generation: generation, fanout: self)
+    }
+
+    var isActive: Bool {
+        lock.lock()
+        defer { lock.unlock() }
+        return !isClosed && didCreateInput
+    }
+
+    @discardableResult
+    func offer(
+        pcm16LE: Data,
+        frameCount: Int,
+        sourceToken offeredSourceToken: UUID,
+        generation offeredGeneration: UInt64,
+        captureTimestampNanoseconds: UInt64
+    ) -> RealtimePCM16AudioOfferResult {
+        lock.lock()
+        guard !isClosed else {
+            lock.unlock()
+            return .closed
+        }
+        guard offeredSourceToken == sourceToken else {
+            lock.unlock()
+            return .rejectedSource
+        }
+        guard offeredGeneration == generation else {
+            lock.unlock()
+            return .rejectedGeneration
+        }
+        guard didCreateInput else {
+            lock.unlock()
+            return .noConsumer
+        }
+        guard frameCount > 0,
+              frameCount <= Int.max / 2,
+              pcm16LE.count == frameCount * 2 else {
+            isClosed = true
+            terminalError = .invalidAudioChunk
+            chunks.removeAll(keepingCapacity: false)
+            bufferedFrames = 0
+            let waiter = waitingReader
+            waitingReader = nil
+            lock.unlock()
+            waiter?.resume(throwing: RealtimePCM16AudioStreamError.invalidAudioChunk)
+            return .invalidAudioChunk
+        }
+
+        guard frameCount <= maximumBufferedFrames - bufferedFrames,
+              chunks.count < maximumBufferedChunks else {
+            isClosed = true
+            terminalError = .backpressureExceeded
+            chunks.removeAll(keepingCapacity: false)
+            bufferedFrames = 0
+            let waiter = waitingReader
+            waitingReader = nil
+            lock.unlock()
+            waiter?.resume(throwing: RealtimePCM16AudioStreamError.backpressureExceeded)
+            return .backpressureExceeded
+        }
+
+        let chunk = RealtimePCM16AudioChunk(
+            sourceToken: sourceToken,
+            generation: generation,
+            captureTimestampNanoseconds: captureTimestampNanoseconds,
+            sampleRate: 16_000,
+            frameCount: frameCount,
+            pcm16LE: pcm16LE
+        )
+        if let waiter = waitingReader {
+            waitingReader = nil
+            lock.unlock()
+            waiter.resume(returning: chunk)
+        } else {
+            chunks.append(chunk)
+            bufferedFrames += frameCount
+            lock.unlock()
+        }
+        return .enqueued
+    }
+
+    func finish(error: RealtimePCM16AudioStreamError? = nil) {
+        lock.lock()
+        guard !isClosed else {
+            lock.unlock()
+            return
+        }
+        isClosed = true
+        terminalError = error
+        chunks.removeAll(keepingCapacity: false)
+        bufferedFrames = 0
+        let waiter = waitingReader
+        waitingReader = nil
+        lock.unlock()
+
+        if let error {
+            waiter?.resume(throwing: error)
+        } else {
+            waiter?.resume(returning: nil)
+        }
+    }
+
+    fileprivate func nextChunk() async throws -> RealtimePCM16AudioChunk? {
+        guard beginReader() else {
+            throw RealtimePCM16AudioStreamError.concurrentRead
+        }
+        do {
+            let result: RealtimePCM16AudioChunk? = try await withCheckedThrowingContinuation {
+                (continuation: CheckedContinuation<RealtimePCM16AudioChunk?, Error>) in
+                registerReader(continuation)
+            }
+            finishReader()
+            return result
+        } catch {
+            finishReader()
+            throw error
+        }
+    }
+
+    private func beginReader() -> Bool {
+        lock.lock()
+        defer { lock.unlock() }
+        guard !readerIsActive else { return false }
+        readerIsActive = true
+        return true
+    }
+
+    private func registerReader(
+        _ continuation: CheckedContinuation<RealtimePCM16AudioChunk?, Error>
+    ) {
+        lock.lock()
+        let chunk: RealtimePCM16AudioChunk?
+        let error: RealtimePCM16AudioStreamError?
+        if !chunks.isEmpty {
+            chunk = chunks.removeFirst()
+            bufferedFrames -= chunk?.frameCount ?? 0
+            error = nil
+        } else if isClosed {
+            chunk = nil
+            error = terminalError
+        } else {
+            waitingReader = continuation
+            lock.unlock()
+            return
+        }
+        lock.unlock()
+
+        if let error {
+            continuation.resume(throwing: error)
+        } else {
+            continuation.resume(returning: chunk)
+        }
+    }
+
+    private func finishReader() {
+        lock.lock()
+        readerIsActive = false
+        lock.unlock()
+    }
+}
+
 private final class CommittedDeliveryPauseForTesting: @unchecked Sendable {
     let authorizationReached = DispatchSemaphore(value: 0)
     let resumeDelivery = DispatchSemaphore(value: 0)
@@ -234,6 +474,9 @@ final class LiveTranscriptionSession: NSObject, @unchecked Sendable {
 
     private var microphoneCaptureSession: AVCaptureSession?
     private var applicationAudioCapture: ApplicationAudioCapture?
+    /// Recreated for each recognition session so a reader can never cross a restart.
+    private var realtimeAudioFanout: RealtimePCM16AudioFanout?
+    private var realtimeAudioGeneration: UInt64 = 0
 
     private var transcriptHandler: (@MainActor (RecognizedSentence) -> Void)?
     private var partialHandler: (@MainActor (DraftSegment?) -> Void)?
@@ -374,6 +617,7 @@ final class LiveTranscriptionSession: NSObject, @unchecked Sendable {
             }
         } catch {
             await resetCorrectionAudioBufferOnCaptureQueue()
+            await finishRealtimeAudioFanoutOnCaptureQueue()
             throw error
         }
     }
@@ -412,6 +656,8 @@ final class LiveTranscriptionSession: NSObject, @unchecked Sendable {
 
         applicationAudioCapture?.stop()
         applicationAudioCapture = nil
+        realtimeAudioFanout?.finish()
+        realtimeAudioFanout = nil
 
         stopModernSpeechRecognizer()
         resetRecognitionFailureState()
@@ -511,6 +757,24 @@ final class LiveTranscriptionSession: NSObject, @unchecked Sendable {
         await withCheckedContinuation { continuation in
             captureQueue.async { [weak self] in
                 self?.appendCorrectionAudioBuffer(sendableAudioBuffer.value)
+                continuation.resume()
+            }
+        }
+    }
+
+    func makeRealtimePCM16AudioInput() async -> RealtimePCM16AudioInput? {
+        await withCheckedContinuation { continuation in
+            captureQueue.async { [weak self] in
+                continuation.resume(returning: self?.realtimeAudioFanout?.makeInput())
+            }
+        }
+    }
+
+    func appendRealtimePCM16AudioForTesting(_ processingBuffer: AVAudioPCMBuffer) async {
+        let sendableBuffer = UncheckedSendablePCMBuffer(value: processingBuffer)
+        await withCheckedContinuation { continuation in
+            captureQueue.async { [weak self] in
+                self?.publishRealtimePCM16Audio(from: sendableBuffer.value)
                 continuation.resume()
             }
         }
@@ -834,7 +1098,23 @@ final class LiveTranscriptionSession: NSObject, @unchecked Sendable {
                 defer { endCommittedDeliveryStateMutation() }
                 invalidateTranscriptDelivery()
                 resetRecognitionEpoch()
+                self.realtimeAudioFanout?.finish(error: .sourceSuperseded)
+                self.realtimeAudioGeneration &+= 1
+                self.realtimeAudioFanout = RealtimePCM16AudioFanout(
+                    sourceToken: UUID(),
+                    generation: self.realtimeAudioGeneration
+                )
                 continuation.resume(returning: recognitionEpoch)
+            }
+        }
+    }
+
+    private func finishRealtimeAudioFanoutOnCaptureQueue() async {
+        await withCheckedContinuation { continuation in
+            captureQueue.async { [weak self] in
+                self?.realtimeAudioFanout?.finish()
+                self?.realtimeAudioFanout = nil
+                continuation.resume()
             }
         }
     }
@@ -1478,6 +1758,7 @@ final class LiveTranscriptionSession: NSObject, @unchecked Sendable {
 
         let audioLevels = cleanUpSpeechBuffer(processingBuffer)
         boostIfQuiet(buffer: processingBuffer, levels: audioLevels)
+        publishRealtimePCM16Audio(from: processingBuffer)
         appendCorrectionAudioBuffer(processingBuffer)
 
         if let vadEngine {
@@ -1513,6 +1794,51 @@ final class LiveTranscriptionSession: NSObject, @unchecked Sendable {
     private func appendCorrectionAudioBuffer(_ processingBuffer: AVAudioPCMBuffer) {
         guard correctionAudioCaptureEnabled else { return }
         correctionAudioBuffer.append(processingBuffer)
+    }
+
+    private func publishRealtimePCM16Audio(from processingBuffer: AVAudioPCMBuffer) {
+        guard let fanout = realtimeAudioFanout, fanout.isActive else { return }
+        guard processingBuffer.frameLength > 0,
+              processingBuffer.format.commonFormat == .pcmFormatFloat32,
+              processingBuffer.format.sampleRate == 16_000,
+              processingBuffer.format.channelCount == 1,
+              let samples = processingBuffer.floatChannelData?[0] else {
+            fanout.finish(error: .invalidAudioChunk)
+            return
+        }
+
+        let frameCount = Int(processingBuffer.frameLength)
+        guard frameCount <= fanout.maximumBufferedFrames else {
+            fanout.finish(error: .backpressureExceeded)
+            return
+        }
+        var pcm16LE = Data(count: frameCount * 2)
+        pcm16LE.withUnsafeMutableBytes { (destination: UnsafeMutableRawBufferPointer) in
+            guard let bytes = destination.baseAddress?.assumingMemoryBound(to: UInt8.self) else { return }
+            for frame in 0..<frameCount {
+                let input = samples[frame]
+                let sample = input.isFinite ? min(1, max(-1, input)) : 0
+                let value: Int16
+                if sample <= -1 {
+                    value = Int16.min
+                } else if sample >= 1 {
+                    value = Int16.max
+                } else {
+                    value = Int16((sample * Float(Int16.max)).rounded())
+                }
+                let bits = UInt16(bitPattern: value)
+                bytes[frame * 2] = UInt8(truncatingIfNeeded: bits)
+                bytes[frame * 2 + 1] = UInt8(truncatingIfNeeded: bits >> 8)
+            }
+        }
+
+        _ = fanout.offer(
+            pcm16LE: pcm16LE,
+            frameCount: frameCount,
+            sourceToken: fanout.sourceToken,
+            generation: fanout.generation,
+            captureTimestampNanoseconds: DispatchTime.now().uptimeNanoseconds
+        )
     }
 
     private func finishCorrectionAudio(through absoluteTime: TimeInterval? = nil) -> Data? {

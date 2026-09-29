@@ -71,6 +71,158 @@ import Testing
         #expect(RecognizedSentence(text: "Recognized text.").audioWAVData == nil)
     }
 
+    @Test func realtimeInputPublishesRawPCM16LEWithItsSourceAndGeneration() async throws {
+        let session = LiveTranscriptionSession()
+        await session.beginRecognitionSessionForTesting()
+        let input = try #require(await session.makeRealtimePCM16AudioInput())
+        let buffer = try makeMono16KBuffer(samples: [0.5, -0.5, 1, -1])
+
+        await session.appendRealtimePCM16AudioForTesting(buffer)
+        let chunk = try #require(try await input.nextChunk())
+
+        #expect(chunk.sourceToken == input.sourceToken)
+        #expect(chunk.generation == input.generation)
+        #expect(chunk.sampleRate == 16_000)
+        #expect(chunk.frameCount == 4)
+        #expect(chunk.pcm16LE == Data([0x00, 0x40, 0x00, 0xc0, 0xff, 0x7f, 0x00, 0x80]))
+    }
+
+    @Test func realtimeCaptureQueueDoesNotWaitForSlowNetworkConsumer() async throws {
+        let session = LiveTranscriptionSession()
+        await session.beginRecognitionSessionForTesting()
+        let input = try #require(await session.makeRealtimePCM16AudioInput())
+        let buffer = try makeMono16KBuffer(samples: [0.25, -0.25])
+        await session.appendRealtimePCM16AudioForTesting(buffer)
+
+        let networkStarted = DispatchSemaphore(value: 0)
+        let allowNetworkToContinue = RealtimeTestGate()
+        let consumer = Task.detached {
+            let chunk = try await input.nextChunk()
+            networkStarted.signal()
+            await allowNetworkToContinue.wait()
+            return chunk
+        }
+        #expect(await waitForRealtimeTestSemaphore(networkStarted, timeout: 2))
+
+        let captureCompleted = DispatchSemaphore(value: 0)
+        let captureTask = Task.detached {
+            await session.appendRealtimePCM16AudioForTesting(buffer)
+            captureCompleted.signal()
+        }
+        let captureReturnedWithoutNetwork = await waitForRealtimeTestSemaphore(captureCompleted, timeout: 1)
+        await allowNetworkToContinue.open()
+
+        #expect(captureReturnedWithoutNetwork)
+        await captureTask.value
+        _ = try await consumer.value
+        await session.stopAndWait()
+    }
+
+    @Test func realtimeQueueOverflowEndsTheInputInsteadOfDroppingOldAudio() async throws {
+        let sourceToken = UUID()
+        let fanout = RealtimePCM16AudioFanout(
+            sourceToken: sourceToken,
+            generation: 7,
+            maximumBufferedFrames: 4,
+            maximumBufferedChunks: 2
+        )
+        let input = try #require(fanout.makeInput())
+
+        #expect(fanout.offer(
+            pcm16LE: Data(repeating: 0x11, count: 6),
+            frameCount: 3,
+            sourceToken: sourceToken,
+            generation: 7,
+            captureTimestampNanoseconds: 10
+        ) == .enqueued)
+        #expect(fanout.offer(
+            pcm16LE: Data(repeating: 0x22, count: 4),
+            frameCount: 2,
+            sourceToken: sourceToken,
+            generation: 7,
+            captureTimestampNanoseconds: 20
+        ) == .backpressureExceeded)
+
+        var streamError: RealtimePCM16AudioStreamError?
+        do {
+            _ = try await input.nextChunk()
+        } catch let error as RealtimePCM16AudioStreamError {
+            streamError = error
+        }
+        #expect(streamError == .backpressureExceeded)
+        #expect(fanout.offer(
+            pcm16LE: Data([0x33, 0x33]),
+            frameCount: 1,
+            sourceToken: sourceToken,
+            generation: 7,
+            captureTimestampNanoseconds: 30
+        ) == .closed)
+    }
+
+    @Test func realtimeInputRejectsOtherSourcesAndStaleGenerations() async throws {
+        let sourceToken = UUID()
+        let fanout = RealtimePCM16AudioFanout(
+            sourceToken: sourceToken,
+            generation: 12,
+            maximumBufferedFrames: 8,
+            maximumBufferedChunks: 4
+        )
+        let input = try #require(fanout.makeInput())
+
+        #expect(fanout.offer(
+            pcm16LE: Data([0x01, 0x02]),
+            frameCount: 1,
+            sourceToken: UUID(),
+            generation: 12,
+            captureTimestampNanoseconds: 1
+        ) == .rejectedSource)
+        #expect(fanout.offer(
+            pcm16LE: Data([0x03, 0x04]),
+            frameCount: 1,
+            sourceToken: sourceToken,
+            generation: 11,
+            captureTimestampNanoseconds: 2
+        ) == .rejectedGeneration)
+        #expect(fanout.offer(
+            pcm16LE: Data([0x05, 0x06]),
+            frameCount: 1,
+            sourceToken: sourceToken,
+            generation: 12,
+            captureTimestampNanoseconds: 3
+        ) == .enqueued)
+
+        let chunk = try #require(try await input.nextChunk())
+        #expect(chunk.sourceToken == sourceToken)
+        #expect(chunk.generation == 12)
+        #expect(chunk.pcm16LE == Data([0x05, 0x06]))
+    }
+
+    @Test func restartingSessionInvalidatesOldRealtimeInputAndCreatesNewGeneration() async throws {
+        let session = LiveTranscriptionSession()
+        await session.beginRecognitionSessionForTesting()
+        let oldInput = try #require(await session.makeRealtimePCM16AudioInput())
+
+        await session.beginRecognitionSessionForTesting()
+        let newInput = try #require(await session.makeRealtimePCM16AudioInput())
+        #expect(oldInput.sourceToken != newInput.sourceToken)
+        #expect(oldInput.generation < newInput.generation)
+
+        let buffer = try makeMono16KBuffer(samples: [0.125])
+        await session.appendRealtimePCM16AudioForTesting(buffer)
+        let newChunk = try #require(try await newInput.nextChunk())
+        #expect(newChunk.sourceToken == newInput.sourceToken)
+        #expect(newChunk.generation == newInput.generation)
+
+        var oldStreamError: RealtimePCM16AudioStreamError?
+        do {
+            _ = try await oldInput.nextChunk()
+        } catch let error as RealtimePCM16AudioStreamError {
+            oldStreamError = error
+        }
+        #expect(oldStreamError == .sourceSuperseded)
+        await session.stopAndWait()
+    }
+
     @Test func correctionAudioCaptureIsDisabledByDefaultAndDisablingClearsCapturedFrames() async throws {
         let session = LiveTranscriptionSession()
         let buffer = try makeMono16KBuffer(samples: [0.25, -0.25, 0.5])
@@ -548,6 +700,30 @@ import Testing
         return stride(from: 44, to: wav.count - 1, by: 2).map { index in
             Int16(bitPattern: UInt16(wav[index]) | UInt16(wav[index + 1]) << 8)
         }
+    }
+}
+
+private func waitForRealtimeTestSemaphore(_ semaphore: DispatchSemaphore, timeout: TimeInterval) async -> Bool {
+    await withCheckedContinuation { continuation in
+        DispatchQueue.global(qos: .userInitiated).async {
+            continuation.resume(returning: semaphore.wait(timeout: .now() + timeout) == .success)
+        }
+    }
+}
+
+private actor RealtimeTestGate {
+    private var isOpen = false
+    private var continuation: CheckedContinuation<Void, Never>?
+
+    func wait() async {
+        guard !isOpen else { return }
+        await withCheckedContinuation { continuation = $0 }
+    }
+
+    func open() {
+        isOpen = true
+        continuation?.resume()
+        continuation = nil
     }
 }
 

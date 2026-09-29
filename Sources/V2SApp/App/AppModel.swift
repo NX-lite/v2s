@@ -208,6 +208,13 @@ final class AppModel: ObservableObject {
         }
     }
 
+    @Published var nativeRealtimeSettings: NativeRealtimeSettings {
+        didSet {
+            guard oldValue != nativeRealtimeSettings else { return }
+            persistSettings()
+        }
+    }
+
     init(
         settingsStore: SettingsStore,
         sourceCatalogService: any SourceCatalogLoading,
@@ -240,6 +247,7 @@ final class AppModel: ObservableObject {
         self.subtitleMode = settings.subtitleMode
         self.subtitleDisplayMode = settings.subtitleDisplayMode
         self.glossary = settings.glossary
+        self.nativeRealtimeSettings = settings.nativeRealtime
         self.translationHostConfiguration = nil
         AppLocalization.updateEmbeddedBundleLocalizationLanguageID(self.interfaceLanguageID)
 
@@ -1051,7 +1059,8 @@ final class AppModel: ObservableObject {
             subtitleDisplayMode: subtitleDisplayMode,
             glossary: glossary,
             assistant: assistantSettings,
-            correction: correctionSettings ?? correction.settings
+            correction: correctionSettings ?? correction.settings,
+            nativeRealtime: nativeRealtimeSettings
         )
 
         settingsStore.save(settings)

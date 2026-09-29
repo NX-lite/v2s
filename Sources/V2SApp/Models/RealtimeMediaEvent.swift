@@ -29,6 +29,18 @@ struct RealtimeAudioChunk: Equatable, Sendable {
     let sampleRate: Int
 }
 
+enum RealtimeAudioSourceRole: Equatable, Sendable {
+    case microphone
+    case applicationAudio
+
+    var providerLabel: String {
+        switch self {
+        case .microphone: "microphone"
+        case .applicationAudio: "application audio"
+        }
+    }
+}
+
 struct RealtimeVideoFrame: Equatable, Sendable {
     let sourceAlias: String
     let capturedAtMonotonicNanoseconds: UInt64

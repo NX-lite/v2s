@@ -68,6 +68,10 @@
 		B00000000000000000000106 /* RealtimeCredentialStore.swift in Sources */ = {isa = PBXBuildFile; fileRef = B00000000000000000000107 /* RealtimeCredentialStore.swift */; };
 		B00000000000000000000108 /* RealtimeEndpointResolver.swift in Sources */ = {isa = PBXBuildFile; fileRef = B0000000000000000000010A /* RealtimeEndpointResolver.swift */; };
 		B00000000000000000000109 /* RealtimeWebSocketTransport.swift in Sources */ = {isa = PBXBuildFile; fileRef = B0000000000000000000010B /* RealtimeWebSocketTransport.swift */; };
+		B0000000000000000000010C /* OpenAIXAIRealtimeCodec.swift in Sources */ = {isa = PBXBuildFile; fileRef = B0000000000000000000010D /* OpenAIXAIRealtimeCodec.swift */; };
+		B0000000000000000000010E /* QwenGeminiRealtimeCodec.swift in Sources */ = {isa = PBXBuildFile; fileRef = B0000000000000000000010F /* QwenGeminiRealtimeCodec.swift */; };
+		B00000000000000000000110 /* VisualSource.swift in Sources */ = {isa = PBXBuildFile; fileRef = B00000000000000000000111 /* VisualSource.swift */; };
+		B00000000000000000000112 /* VisualSourceCatalog.swift in Sources */ = {isa = PBXBuildFile; fileRef = B00000000000000000000113 /* VisualSourceCatalog.swift */; };
 /* End PBXBuildFile section */
 
 /* Begin PBXFileReference section */
@@ -133,6 +137,10 @@
 		B00000000000000000000107 /* RealtimeCredentialStore.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = RealtimeCredentialStore.swift; sourceTree = "<group>"; };
 		B0000000000000000000010A /* RealtimeEndpointResolver.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = RealtimeEndpointResolver.swift; sourceTree = "<group>"; };
 		B0000000000000000000010B /* RealtimeWebSocketTransport.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = RealtimeWebSocketTransport.swift; sourceTree = "<group>"; };
+		B0000000000000000000010D /* OpenAIXAIRealtimeCodec.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = OpenAIXAIRealtimeCodec.swift; sourceTree = "<group>"; };
+		B0000000000000000000010F /* QwenGeminiRealtimeCodec.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = QwenGeminiRealtimeCodec.swift; sourceTree = "<group>"; };
+		B00000000000000000000111 /* VisualSource.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = VisualSource.swift; sourceTree = "<group>"; };
+		B00000000000000000000113 /* VisualSourceCatalog.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = VisualSourceCatalog.swift; sourceTree = "<group>"; };
 /* End PBXFileReference section */
 
 /* Begin PBXFrameworksBuildPhase section */
@@ -223,6 +231,7 @@
 				2D73DB6A0F666607C43893E6 /* CorrectionSettings.swift */,
 				B00000000000000000000103 /* NativeRealtimeSettings.swift */,
 				B00000000000000000000104 /* RealtimeMediaEvent.swift */,
+				B00000000000000000000111 /* VisualSource.swift */,
 				A00000000000000000000034 /* InputSource.swift */,
 				A00000000000000000000035 /* LanguageOption.swift */,
 				A00000000000000000000042 /* ModeConfig.swift */,
@@ -253,6 +262,9 @@
 				B00000000000000000000107 /* RealtimeCredentialStore.swift */,
 				B0000000000000000000010A /* RealtimeEndpointResolver.swift */,
 				B0000000000000000000010B /* RealtimeWebSocketTransport.swift */,
+				B0000000000000000000010D /* OpenAIXAIRealtimeCodec.swift */,
+				B0000000000000000000010F /* QwenGeminiRealtimeCodec.swift */,
+				B00000000000000000000113 /* VisualSourceCatalog.swift */,
 				A00000000000000000000107 /* ScreenContextProvider.swift */,
 				A35DCB26946EE82CF61DCFCC /* SentenceAudioBuffer.swift */,
 				A00000000000000000000091 /* SentenceBoundaryHeuristics.swift */,
@@ -426,6 +438,7 @@
 				A592C187A4F438683233578C /* CorrectionSettings.swift in Sources */,
 				B00000000000000000000100 /* NativeRealtimeSettings.swift in Sources */,
 				B00000000000000000000101 /* RealtimeMediaEvent.swift in Sources */,
+				B00000000000000000000110 /* VisualSource.swift in Sources */,
 				A00000000000000000000054 /* InputSource.swift in Sources */,
 				A00000000000000000000055 /* LanguageOption.swift in Sources */,
 				A00000000000000000000063 /* ModeConfig.swift in Sources */,
@@ -455,6 +468,9 @@
 				B00000000000000000000106 /* RealtimeCredentialStore.swift in Sources */,
 				B00000000000000000000108 /* RealtimeEndpointResolver.swift in Sources */,
 				B00000000000000000000109 /* RealtimeWebSocketTransport.swift in Sources */,
+				B0000000000000000000010C /* OpenAIXAIRealtimeCodec.swift in Sources */,
+				B0000000000000000000010E /* QwenGeminiRealtimeCodec.swift in Sources */,
+				B00000000000000000000112 /* VisualSourceCatalog.swift in Sources */,
 				A00000000000000000000117 /* ScreenContextProvider.swift in Sources */,
 				FF1358CB65A26B07AC097DB5 /* SentenceAudioBuffer.swift in Sources */,
 				A00000000000000000000068 /* SpeedMonitor.swift in Sources */,
