@@ -72,6 +72,7 @@
 		B0000000000000000000010E /* QwenGeminiRealtimeCodec.swift in Sources */ = {isa = PBXBuildFile; fileRef = B0000000000000000000010F /* QwenGeminiRealtimeCodec.swift */; };
 		B00000000000000000000110 /* VisualSource.swift in Sources */ = {isa = PBXBuildFile; fileRef = B00000000000000000000111 /* VisualSource.swift */; };
 		B00000000000000000000112 /* VisualSourceCatalog.swift in Sources */ = {isa = PBXBuildFile; fileRef = B00000000000000000000113 /* VisualSourceCatalog.swift */; };
+		B00000000000000000000114 /* NativeRealtimeSessionDriver.swift in Sources */ = {isa = PBXBuildFile; fileRef = B00000000000000000000115 /* NativeRealtimeSessionDriver.swift */; };
 /* End PBXBuildFile section */
 
 /* Begin PBXFileReference section */
@@ -141,6 +142,7 @@
 		B0000000000000000000010F /* QwenGeminiRealtimeCodec.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = QwenGeminiRealtimeCodec.swift; sourceTree = "<group>"; };
 		B00000000000000000000111 /* VisualSource.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = VisualSource.swift; sourceTree = "<group>"; };
 		B00000000000000000000113 /* VisualSourceCatalog.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = VisualSourceCatalog.swift; sourceTree = "<group>"; };
+		B00000000000000000000115 /* NativeRealtimeSessionDriver.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = NativeRealtimeSessionDriver.swift; sourceTree = "<group>"; };
 /* End PBXFileReference section */
 
 /* Begin PBXFrameworksBuildPhase section */
@@ -264,6 +266,7 @@
 				B0000000000000000000010B /* RealtimeWebSocketTransport.swift */,
 				B0000000000000000000010D /* OpenAIXAIRealtimeCodec.swift */,
 				B0000000000000000000010F /* QwenGeminiRealtimeCodec.swift */,
+				B00000000000000000000115 /* NativeRealtimeSessionDriver.swift */,
 				B00000000000000000000113 /* VisualSourceCatalog.swift */,
 				A00000000000000000000107 /* ScreenContextProvider.swift */,
 				A35DCB26946EE82CF61DCFCC /* SentenceAudioBuffer.swift */,
@@ -470,6 +473,7 @@
 				B00000000000000000000109 /* RealtimeWebSocketTransport.swift in Sources */,
 				B0000000000000000000010C /* OpenAIXAIRealtimeCodec.swift in Sources */,
 				B0000000000000000000010E /* QwenGeminiRealtimeCodec.swift in Sources */,
+				B00000000000000000000114 /* NativeRealtimeSessionDriver.swift in Sources */,
 				B00000000000000000000112 /* VisualSourceCatalog.swift in Sources */,
 				A00000000000000000000117 /* ScreenContextProvider.swift in Sources */,
 				FF1358CB65A26B07AC097DB5 /* SentenceAudioBuffer.swift in Sources */,
