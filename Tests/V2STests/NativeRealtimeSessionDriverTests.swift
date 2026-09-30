@@ -142,7 +142,9 @@ struct NativeRealtimeSessionDriverTests {
     }
 
     @Test func qwenSendsHeldFrameSuccessfullyBeforeCommitBoundary() async throws {
-        let connection = FakeRealtimeWebSocketConnection(suspendSendType: "input_image_buffer.append")
+        let connection = FakeRealtimeWebSocketConnection(
+            suspendSendTypes: ["input_image_buffer.append", "input_audio_buffer.commit"]
+        )
         let connector = FakeRealtimeWebSocketConnector(profile: .qwenOmniFlash, connections: [connection])
         let driver = NativeRealtimeSessionDriver(
             settings: settings(profile: .qwenOmniFlash),
@@ -157,13 +159,19 @@ struct NativeRealtimeSessionDriverTests {
         await connection.enqueue(acknowledgement(for: .qwenOmniFlash))
         #expect(await recorder.waitForOutcome() == .succeeded)
 
-        try await driver.sendVideoFrame(makeVideoFrame(timestamp: 10))
+        let firstFrame = makeVideoFrame(timestamp: 10, marker: 0x11)
+        let frameDuringImageSend = makeVideoFrame(timestamp: 40, marker: 0x22)
+        let newestPendingFrame = makeVideoFrame(timestamp: 50, marker: 0x33)
+        try await driver.sendVideoFrame(firstFrame)
         try await driver.sendAudioChunk(makeChunk(generation: 7, timestamp: 20))
         try await driver.commit(makeUtterance(generation: 7, start: 0, end: 30))
         #expect(await connection.waitUntilSuspendedMessageTypeStarted("input_image_buffer.append"))
         #expect(!(await connection.sentMessageTypes().contains("input_audio_buffer.commit")))
-        try await driver.sendVideoFrame(makeVideoFrame(timestamp: 40, marker: 0x22))
+        try await driver.sendVideoFrame(frameDuringImageSend)
 
+        await connection.releaseSuspendedSend()
+        #expect(await connection.waitUntilSuspendedMessageTypeStarted("input_audio_buffer.commit"))
+        try await driver.sendVideoFrame(newestPendingFrame)
         await connection.releaseSuspendedSend()
         #expect(await connection.waitUntilSentMessageCount(4))
         #expect(await connection.sentMessageTypes() == [
@@ -172,8 +180,11 @@ struct NativeRealtimeSessionDriverTests {
             "input_image_buffer.append",
             "input_audio_buffer.commit",
         ])
+        let firstTurnMessages = await connection.sentTextMessages()
+        #expect(firstTurnMessages.contains { containsEncodedFrame($0, frame: firstFrame) })
+        #expect(!firstTurnMessages.contains { containsEncodedFrame($0, frame: frameDuringImageSend) })
+        #expect(!firstTurnMessages.contains { containsEncodedFrame($0, frame: newestPendingFrame) })
 
-        try await driver.sendVideoFrame(makeVideoFrame(timestamp: 50, marker: 0x33))
         await connection.enqueue(.text(#"{"type":"input_audio_buffer.committed"}"#))
         #expect(await connection.waitUntilSentMessageType("response.create"))
         await connection.enqueue(.text(#"{"type":"response.created","response":{"id":"resp_video_gate"}}"#))
@@ -182,11 +193,30 @@ struct NativeRealtimeSessionDriverTests {
 
         try await driver.sendAudioChunk(makeChunk(generation: 7, timestamp: 40))
         try await driver.commit(makeUtterance(generation: 7, start: 35, end: 45))
-        #expect(await connection.waitUntilSentMessageCount(7))
+        #expect(await connection.waitUntilSentMessageCount(6))
         let secondTurnTypes = await connection.sentMessageTypes()
         #expect(secondTurnTypes.filter { $0 == "input_image_buffer.append" }.count == 1)
         #expect(secondTurnTypes.filter { $0 == "input_audio_buffer.append" }.count == 2)
         #expect(secondTurnTypes.filter { $0 == "input_audio_buffer.commit" }.count == 2)
+
+        await connection.enqueue(.text(#"{"type":"input_audio_buffer.committed"}"#))
+        #expect(await connection.waitUntilSentMessageCount(7))
+        await connection.enqueue(.text(#"{"type":"response.created","response":{"id":"resp_video_gate_second"}}"#))
+        await connection.enqueue(.text(#"{"type":"response.done","response":{"id":"resp_video_gate_second","status":"completed"}}"#))
+        try await Task.sleep(for: .milliseconds(20))
+
+        try await Task.sleep(for: .milliseconds(1_050))
+        try await driver.sendAudioChunk(makeChunk(generation: 7, timestamp: 60))
+        try await driver.commit(makeUtterance(generation: 7, start: 55, end: 65))
+        #expect(await connection.waitUntilSentFrame(newestPendingFrame))
+        #expect(await connection.waitUntilSentMessageCount(10))
+        let thirdTurnTypes = await connection.sentMessageTypes()
+        #expect(thirdTurnTypes.filter { $0 == "input_image_buffer.append" }.count == 2)
+        #expect(thirdTurnTypes.filter { $0 == "input_audio_buffer.append" }.count == 3)
+        #expect(thirdTurnTypes.filter { $0 == "input_audio_buffer.commit" }.count == 3)
+        let allSentMessages = await connection.sentTextMessages()
+        #expect(allSentMessages.contains { containsEncodedFrame($0, frame: newestPendingFrame) })
+        #expect(!allSentMessages.contains { containsEncodedFrame($0, frame: frameDuringImageSend) })
         await driver.stop()
         await task.value
     }
@@ -1803,7 +1833,7 @@ private struct FakeConnectorError: Error, CustomStringConvertible {
 
 private actor FakeRealtimeWebSocketConnection: RealtimeWebSocketConnection {
     private let suspendSend: Bool
-    private let suspendSendType: String?
+    private let suspendSendTypes: Set<String>
     private var messages: [RealtimeSocketMessage] = []
     private var sentMessages: [RealtimeSocketMessage] = []
     private var sentTypes: [String] = []
@@ -1811,28 +1841,35 @@ private actor FakeRealtimeWebSocketConnection: RealtimeWebSocketConnection {
     private var sendWaiter: CheckedContinuation<Void, Error>?
     private var sendStarted = false
     private var suspendedSendTypeStarted: String?
-    private var didSuspendConfiguredSend = false
+    private var didSuspendConfiguredSendTypes: Set<String> = []
     private var closed = false
     private var closes = 0
 
-    init(suspendSend: Bool = false, suspendSendType: String? = nil) {
+    init(
+        suspendSend: Bool = false,
+        suspendSendType: String? = nil,
+        suspendSendTypes: Set<String> = []
+    ) {
         self.suspendSend = suspendSend
-        self.suspendSendType = suspendSendType
+        var configuredTypes = suspendSendTypes
+        if let suspendSendType { configuredTypes.insert(suspendSendType) }
+        self.suspendSendTypes = configuredTypes
     }
 
     func send(_ message: RealtimeSocketMessage) async throws {
         guard !closed else { throw RealtimeTransportError.closed }
         sendStarted = true
         let messageType = Self.messageType(message)
-        let boundarySendIsSuspended = messageType == suspendSendType && !didSuspendConfiguredSend
-        if boundarySendIsSuspended { didSuspendConfiguredSend = true }
+        let boundarySendIsSuspended = suspendSendTypes.contains(messageType) &&
+            !didSuspendConfiguredSendTypes.contains(messageType)
+        if boundarySendIsSuspended { didSuspendConfiguredSendTypes.insert(messageType) }
         if boundarySendIsSuspended {
             // Model a frame that has reached the wire while its async send call
             // has not yet returned to the actor.
             sentMessages.append(message)
             sentTypes.append(messageType)
         }
-        if suspendSend || messageType == suspendSendType {
+        if suspendSend || boundarySendIsSuspended {
             suspendedSendTypeStarted = messageType
             try await withCheckedThrowingContinuation { sendWaiter = $0 }
         }

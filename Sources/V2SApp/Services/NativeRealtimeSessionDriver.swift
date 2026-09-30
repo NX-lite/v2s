@@ -644,12 +644,16 @@ actor NativeRealtimeSessionDriver: RealtimeSessionDriving {
               state == .awaitingCommitAcknowledgement,
               let frame = videoMailbox,
               let connection else { return }
-        videoMailbox = nil
         if let lastVideoFrameTimestamp,
            frame.capturedAtMonotonicNanoseconds <= lastVideoFrameTimestamp {
+            videoMailbox = nil
             return
         }
+        // A cooldown-blocked frame remains in the one-frame mailbox. The audio
+        // boundary proceeds immediately, and the next eligible Qwen turn may
+        // send whichever frame is newest then.
         guard remainingVideoCooldownNanoseconds() == 0 else { return }
+        videoMailbox = nil
 
         let message: RealtimeSocketMessage
         do {
@@ -716,11 +720,6 @@ actor NativeRealtimeSessionDriver: RealtimeSessionDriving {
         } catch {
             await fail(.connectionFailed, operation: operation)
             return
-        }
-        if settings.profile.provider == .qwen {
-            // A frame that arrived during the boundary send cannot safely bind to
-            // the just-committed Qwen turn, so discard it rather than replay it.
-            videoMailbox = nil
         }
         guard operationID == operation,
               state == .awaitingCommitAcknowledgement else { return }
