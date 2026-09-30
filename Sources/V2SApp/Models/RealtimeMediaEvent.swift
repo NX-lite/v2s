@@ -85,6 +85,7 @@ protocol RealtimeSessionDriving: Sendable {
     func sendAudioChunk(_ chunk: RealtimeAudioChunk) async throws
     func commit(_ utterance: RealtimeUtterance) async throws
     func sendVideoFrame(_ frame: RealtimeVideoFrame) async throws
+    func revokeVideoPermission() async
     func events() async -> AsyncStream<RealtimeProviderEvent>
     func stop() async
 }

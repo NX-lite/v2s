@@ -47,6 +47,150 @@ struct NativeRealtimeSessionDriverTests {
         }
     }
 
+    @Test func videoIsOffByDefaultAndUnavailableBeforeSetupAcknowledgement() async throws {
+        let (defaultOffDriver, defaultOffConnection, _, defaultOffTask) = await makeReadyDriver(
+            profile: .geminiLive
+        )
+        await expectFailure(.capabilityRejected) {
+            try await defaultOffDriver.sendVideoFrame(makeVideoFrame(timestamp: 1_000_000_000))
+        }
+        #expect(await defaultOffConnection.sentMessageTypes() == ["setup"])
+        await defaultOffDriver.stop()
+        await defaultOffTask.value
+
+        let connection = FakeRealtimeWebSocketConnection()
+        let connector = FakeRealtimeWebSocketConnector(profile: .geminiLive, connections: [connection])
+        let driver = NativeRealtimeSessionDriver(
+            settings: settings(profile: .geminiLive),
+            credential: "synthetic-key",
+            sourceRole: .microphone,
+            connector: connector,
+            videoEnabled: true,
+            setupTimeout: .seconds(1)
+        )
+        let (recorder, task) = launchStart(driver, alias: "audio-1", generation: 7)
+        #expect(await connection.waitUntilSentMessageCount(1))
+        await expectFailure(.capabilityRejected) {
+            try await driver.sendVideoFrame(makeVideoFrame(timestamp: 1_000_000_000))
+        }
+        await connection.enqueue(acknowledgement(for: .geminiLive))
+        #expect(await recorder.waitForOutcome() == .succeeded)
+        #expect(await connection.sentMessageTypes() == ["setup"])
+        await driver.stop()
+        await task.value
+    }
+
+    @Test func onlyQwenAndGeminiSendValidatedCompositeFrames() async throws {
+        for profile in NativeRealtimeProfile.allCases {
+            let (driver, connection, _, task) = await makeReadyDriver(profile: profile, videoEnabled: true)
+            let frame = makeVideoFrame(timestamp: 1_000_000_000)
+            if profile.supportsVideo {
+                try await driver.sendAudioChunk(makeChunk(generation: 7, timestamp: 10))
+                try await driver.commit(makeUtterance(generation: 7, start: 0, end: 20))
+                #expect(await connection.waitUntilSentMessageCount(3))
+                try await driver.sendVideoFrame(frame)
+                #expect(await connection.waitUntilSentFrame(frame))
+                let sentTypes = await connection.sentMessageTypes()
+                #expect(sentTypes.contains("input_image_buffer.append") || sentTypes.contains("video"), "sent types: \(sentTypes)")
+                let messages = await connection.sentTextMessages()
+                #expect(messages.contains { containsEncodedFrame($0, frame: frame) })
+                await expectFailure(.capabilityRejected) {
+                    try await driver.sendVideoFrame(RealtimeVideoFrame(
+                        sourceAlias: "audio-1",
+                        capturedAtMonotonicNanoseconds: 2_000_000_000,
+                        jpegData: frame.jpegData
+                    ))
+                }
+            } else {
+                await expectFailure(.capabilityRejected) {
+                    try await driver.sendVideoFrame(frame)
+                }
+            }
+            await driver.stop()
+            await task.value
+        }
+    }
+
+    @Test func qwenHoldsFirstFrameUntilFirstAudioAppend() async throws {
+        let (driver, connection, _, task) = await makeReadyDriver(
+            profile: .qwenOmniFlash,
+            videoEnabled: true
+        )
+        let frame = makeVideoFrame(timestamp: 1_000_000_000)
+        try await driver.sendVideoFrame(frame)
+        #expect(await connection.sentMessageTypes() == ["session.update"])
+
+        try await driver.sendAudioChunk(makeChunk(generation: 7, timestamp: 10))
+        try await driver.commit(makeUtterance(generation: 7, start: 0, end: 20))
+        #expect(await connection.waitUntilSentFrame(frame))
+        let sentTypes = await connection.sentMessageTypes()
+        #expect(sentTypes.firstIndex(of: "input_audio_buffer.append") != nil)
+        #expect(sentTypes.firstIndex(of: "input_image_buffer.append") != nil)
+        #expect(sentTypes.firstIndex(of: "input_audio_buffer.append")! < sentTypes.firstIndex(of: "input_image_buffer.append")!)
+
+        await driver.stop()
+        await task.value
+
+        let (stoppedDriver, stoppedConnection, _, stoppedTask) = await makeReadyDriver(
+            profile: .qwenOmniFlash,
+            videoEnabled: true
+        )
+        try await stoppedDriver.sendVideoFrame(makeVideoFrame(timestamp: 4_000_000_000))
+        await stoppedDriver.stop()
+        try await Task.sleep(for: .milliseconds(20))
+        #expect(await stoppedConnection.sentMessageTypes() == ["session.update"])
+        await stoppedTask.value
+    }
+
+    @Test func videoMailboxKeepsNewestFrameRateLimitsAndRevocationClearsIt() async throws {
+        let connection = FakeRealtimeWebSocketConnection(suspendSendType: "audio")
+        let connector = FakeRealtimeWebSocketConnector(profile: .geminiLive, connections: [connection])
+        let driver = NativeRealtimeSessionDriver(
+            settings: settings(profile: .geminiLive),
+            credential: "synthetic-key",
+            sourceRole: .microphone,
+            connector: connector,
+            videoEnabled: true,
+            setupTimeout: .seconds(1)
+        )
+        let (recorder, task) = launchStart(driver, alias: "audio-1", generation: 7)
+        #expect(await connection.waitUntilSentMessageCount(1))
+        await connection.enqueue(acknowledgement(for: .geminiLive))
+        #expect(await recorder.waitForOutcome() == .succeeded)
+
+        try await driver.sendAudioChunk(makeChunk(generation: 7, timestamp: 10))
+        try await driver.commit(makeUtterance(generation: 7, start: 0, end: 20))
+        #expect(await connection.waitUntilSuspendedMessageTypeStarted("audio"))
+
+        let older = makeVideoFrame(timestamp: 2_000_000_000, marker: 0x11)
+        let newest = makeVideoFrame(timestamp: 2_100_000_000, marker: 0x22)
+        try await driver.sendVideoFrame(older)
+        try await driver.sendVideoFrame(newest)
+        await connection.releaseSuspendedSend()
+        #expect(await connection.waitUntilSentFrame(newest))
+        let afterFirstDrain = await connection.sentTextMessages()
+        #expect(afterFirstDrain.contains { containsEncodedFrame($0, frame: newest) })
+        #expect(!afterFirstDrain.contains { containsEncodedFrame($0, frame: older) })
+
+        let rateLimited = makeVideoFrame(timestamp: 2_500_000_000, marker: 0x33)
+        try await driver.sendVideoFrame(rateLimited)
+        let newestRateLimited = makeVideoFrame(timestamp: 2_700_000_000, marker: 0x44)
+        try await Task.sleep(for: .milliseconds(20))
+        try await driver.sendVideoFrame(newestRateLimited)
+        try await Task.sleep(for: .milliseconds(700))
+        #expect(await connection.sentMessageTypes().filter { $0 == "video" }.count == 1)
+
+        await driver.revokeVideoPermission()
+        try await Task.sleep(for: .milliseconds(1_050))
+        #expect(await connection.sentMessageTypes().filter { $0 == "video" }.count == 1)
+        await expectFailure(.capabilityRejected) {
+            try await driver.sendVideoFrame(makeVideoFrame(timestamp: 3_600_000_000))
+        }
+
+        await driver.stop()
+        await task.value
+    }
+
     @Test func setupErrorIsMappedToAnAllowlistedCodeAndClosesSocket() async {
         let connection = FakeRealtimeWebSocketConnection()
         let connector = FakeRealtimeWebSocketConnector(profile: .openAIMini, connections: [connection])
@@ -1424,7 +1568,8 @@ private func launchStart(
 }
 
 private func makeReadyDriver(
-    profile: NativeRealtimeProfile
+    profile: NativeRealtimeProfile,
+    videoEnabled: Bool = false
 ) async -> (
     NativeRealtimeSessionDriver,
     FakeRealtimeWebSocketConnection,
@@ -1438,7 +1583,7 @@ private func makeReadyDriver(
         credential: "synthetic-key",
         sourceRole: .applicationAudio,
         connector: connector,
-        videoEnabled: false,
+        videoEnabled: videoEnabled,
         setupTimeout: .seconds(1)
     )
     let (recorder, task) = launchStart(driver, alias: "audio-1", generation: 7)
@@ -1462,6 +1607,26 @@ private func makeChunk(
         pcm16LEData: Data(repeating: 0, count: bytes),
         sampleRate: sampleRate
     )
+}
+
+private func makeVideoFrame(
+    timestamp: UInt64,
+    marker: UInt8 = 0x01
+) -> RealtimeVideoFrame {
+    RealtimeVideoFrame(
+        sourceAlias: "visual-composite",
+        capturedAtMonotonicNanoseconds: timestamp,
+        jpegData: Data([0xFF, 0xD8, marker, 0xFF, 0xD9])
+    )
+}
+
+private func containsEncodedFrame(_ text: String, frame: RealtimeVideoFrame) -> Bool {
+    guard let data = text.data(using: .utf8),
+          let object = try? JSONSerialization.jsonObject(with: data) as? [String: Any] else { return false }
+    if object["image"] as? String == frame.jpegData.base64EncodedString() { return true }
+    guard let realtimeInput = object["realtimeInput"] as? [String: Any],
+          let video = realtimeInput["video"] as? [String: Any] else { return false }
+    return video["data"] as? String == frame.jpegData.base64EncodedString()
 }
 
 private func makeUtterance(
@@ -1597,6 +1762,7 @@ private actor FakeRealtimeWebSocketConnection: RealtimeWebSocketConnection {
     private var sendWaiter: CheckedContinuation<Void, Error>?
     private var sendStarted = false
     private var suspendedSendTypeStarted: String?
+    private var didSuspendConfiguredSend = false
     private var closed = false
     private var closes = 0
 
@@ -1609,7 +1775,8 @@ private actor FakeRealtimeWebSocketConnection: RealtimeWebSocketConnection {
         guard !closed else { throw RealtimeTransportError.closed }
         sendStarted = true
         let messageType = Self.messageType(message)
-        let boundarySendIsSuspended = messageType == suspendSendType
+        let boundarySendIsSuspended = messageType == suspendSendType && !didSuspendConfiguredSend
+        if boundarySendIsSuspended { didSuspendConfiguredSend = true }
         if boundarySendIsSuspended {
             // Model a frame that has reached the wire while its async send call
             // has not yet returned to the actor.
@@ -1663,6 +1830,14 @@ private actor FakeRealtimeWebSocketConnection: RealtimeWebSocketConnection {
             guard case .text(let text) = message else { return nil }
             return text
         }
+    }
+
+    func waitUntilSentFrame(_ frame: RealtimeVideoFrame) async -> Bool {
+        for _ in 0..<200 {
+            if sentMessages.contains(where: { Self.containsFrame($0, frame: frame) }) { return true }
+            try? await Task.sleep(for: .milliseconds(10))
+        }
+        return sentMessages.contains(where: { Self.containsFrame($0, frame: frame) })
     }
     func closeCount() -> Int { closes }
 
@@ -1721,8 +1896,14 @@ private actor FakeRealtimeWebSocketConnection: RealtimeWebSocketConnection {
         if let realtimeInput = object["realtimeInput"] as? [String: Any] {
             if realtimeInput["activityStart"] != nil { return "activityStart" }
             if realtimeInput["audio"] != nil { return "audio" }
+            if realtimeInput["video"] != nil { return "video" }
             if realtimeInput["activityEnd"] != nil { return "activityEnd" }
         }
         return "unknown"
+    }
+
+    private static func containsFrame(_ message: RealtimeSocketMessage, frame: RealtimeVideoFrame) -> Bool {
+        guard case .text(let text) = message else { return false }
+        return containsEncodedFrame(text, frame: frame)
     }
 }

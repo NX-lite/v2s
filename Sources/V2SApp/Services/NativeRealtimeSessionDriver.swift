@@ -5,6 +5,7 @@ actor NativeRealtimeSessionDriver: RealtimeSessionDriving {
     private static let maximumAudioMailboxBytes = 512_000
     private static let maximumAudioMailboxChunks = 128
     private static let maximumCorrectionTextLength = 8_192
+    private static let minimumVideoFrameIntervalNanoseconds: UInt64 = 1_000_000_000
 
     private enum State {
         case stopped
@@ -72,8 +73,14 @@ actor NativeRealtimeSessionDriver: RealtimeSessionDriving {
     private var receiveTask: Task<Void, Never>?
     private var setupTimeoutTask: Task<Void, Never>?
     private var drainTask: Task<Void, Never>?
+    private var videoDrainTask: Task<Void, Never>?
     private var audioMailbox: [RealtimeAudioChunk] = []
     private var audioMailboxBytes = 0
+    private var videoMailbox: RealtimeVideoFrame?
+    private var lastVideoFrameTimestamp: UInt64?
+    private var lastVideoSendUptimeNanoseconds: UInt64?
+    private var hasSentAudioAppend = false
+    private var videoPermissionRevoked = false
     private var pendingUtterance: PendingUtterance?
     private var expiredGeneration: Int?
     private var recentResponseIDs: [String] = []
@@ -115,6 +122,10 @@ actor NativeRealtimeSessionDriver: RealtimeSessionDriving {
         }
 
         clearMailbox()
+        clearVideoMailbox()
+        lastVideoFrameTimestamp = nil
+        lastVideoSendUptimeNanoseconds = nil
+        hasSentAudioAppend = false
         pendingUtterance = nil
         recentResponseIDs.removeAll(keepingCapacity: false)
         state = .connecting
@@ -266,9 +277,34 @@ actor NativeRealtimeSessionDriver: RealtimeSessionDriving {
     }
 
     func sendVideoFrame(_ frame: RealtimeVideoFrame) async throws {
-        _ = frame
-        _ = videoEnabled
-        throw RealtimeFailureCode.capabilityRejected
+        guard videoEnabled, !videoPermissionRevoked,
+              settings.profile.supportsVideo,
+              state == .ready || state == .awaitingCommitAcknowledgement || state == .awaitingResponse else {
+            throw RealtimeFailureCode.capabilityRejected
+        }
+        guard frame.sourceAlias == "visual-composite" else {
+            throw RealtimeFailureCode.capabilityRejected
+        }
+        do {
+            switch settings.profile.provider {
+            case .qwen:
+                _ = try QwenRealtimeCodec.frame(frame)
+            case .gemini:
+                _ = try GeminiRealtimeCodec.frame(frame)
+            case .openAI, .xAI:
+                throw RealtimeFailureCode.capabilityRejected
+            }
+        } catch {
+            throw RealtimeFailureCode.capabilityRejected
+        }
+
+        videoMailbox = frame
+        scheduleVideoDrainIfPossible()
+    }
+
+    func revokeVideoPermission() async {
+        videoPermissionRevoked = true
+        clearVideoMailbox()
     }
 
     func events() async -> AsyncStream<RealtimeProviderEvent> {
@@ -290,6 +326,7 @@ actor NativeRealtimeSessionDriver: RealtimeSessionDriving {
         receiveTask = nil
         drainTask?.cancel()
         drainTask = nil
+        clearVideoMailbox()
         clearMailbox()
         pendingUtterance = nil
         let oldConnection = connection
@@ -300,6 +337,7 @@ actor NativeRealtimeSessionDriver: RealtimeSessionDriving {
         }
         sourceAlias = nil
         sourceGeneration = nil
+        hasSentAudioAppend = false
 
         if let oldConnection { await oldConnection.close() }
         pendingContinuation?.resume(throwing: RealtimeFailureCode.connectionFailed)
@@ -483,6 +521,7 @@ actor NativeRealtimeSessionDriver: RealtimeSessionDriving {
         receiveTask = nil
         drainTask?.cancel()
         drainTask = nil
+        clearVideoMailbox()
         clearMailbox()
         pendingUtterance = nil
         let oldConnection = connection
@@ -513,13 +552,112 @@ actor NativeRealtimeSessionDriver: RealtimeSessionDriving {
         audioMailboxBytes = 0
     }
 
+    private func clearVideoMailbox() {
+        videoMailbox = nil
+        videoDrainTask?.cancel()
+        videoDrainTask = nil
+    }
+
+    private func scheduleVideoDrainIfPossible() {
+        guard videoDrainTask == nil, videoMailbox != nil,
+              videoEnabled, !videoPermissionRevoked,
+              settings.profile.supportsVideo,
+              state == .ready || state == .awaitingCommitAcknowledgement || state == .awaitingResponse,
+              settings.profile.provider != .qwen || hasSentAudioAppend else { return }
+
+        let delay = remainingVideoCooldownNanoseconds()
+
+        let operation = operationID
+        videoDrainTask = Task.detached { [weak self] in
+            if delay > 0 {
+                do {
+                    try await Task.sleep(nanoseconds: delay)
+                } catch {
+                    return
+                }
+            }
+            await self?.drainVideoFrame(operation: operation)
+        }
+    }
+
+    private func drainVideoFrame(operation: UInt64) async {
+        guard operationID == operation,
+              videoEnabled, !videoPermissionRevoked,
+              settings.profile.supportsVideo,
+              state == .ready || state == .awaitingCommitAcknowledgement || state == .awaitingResponse,
+              settings.profile.provider != .qwen || hasSentAudioAppend,
+              let frame = videoMailbox,
+              let connection else {
+            videoDrainTask = nil
+            return
+        }
+
+        if let lastVideoFrameTimestamp {
+            guard frame.capturedAtMonotonicNanoseconds > lastVideoFrameTimestamp else {
+                videoMailbox = nil
+                videoDrainTask = nil
+                return
+            }
+        }
+        guard remainingVideoCooldownNanoseconds() == 0 else {
+            videoDrainTask = nil
+            scheduleVideoDrainIfPossible()
+            return
+        }
+
+        let message: RealtimeSocketMessage
+        do {
+            switch settings.profile.provider {
+            case .qwen:
+                message = try QwenRealtimeCodec.frame(frame)
+            case .gemini:
+                message = try GeminiRealtimeCodec.frame(frame)
+            case .openAI, .xAI:
+                videoMailbox = nil
+                videoDrainTask = nil
+                return
+            }
+        } catch {
+            videoMailbox = nil
+            videoDrainTask = nil
+            return
+        }
+
+        videoMailbox = nil
+        do {
+            try await connection.send(message)
+        } catch {
+            videoDrainTask = nil
+            await fail(.connectionFailed, operation: operation)
+            return
+        }
+        guard operationID == operation,
+              state == .ready || state == .awaitingCommitAcknowledgement || state == .awaitingResponse else {
+            videoDrainTask = nil
+            return
+        }
+        lastVideoFrameTimestamp = frame.capturedAtMonotonicNanoseconds
+        lastVideoSendUptimeNanoseconds = DispatchTime.now().uptimeNanoseconds
+        videoDrainTask = nil
+        scheduleVideoDrainIfPossible()
+    }
+
+    private func remainingVideoCooldownNanoseconds() -> UInt64 {
+        guard let lastVideoSendUptimeNanoseconds else { return 0 }
+        let now = DispatchTime.now().uptimeNanoseconds
+        let elapsed = now >= lastVideoSendUptimeNanoseconds ? now - lastVideoSendUptimeNanoseconds : 0
+        return elapsed >= Self.minimumVideoFrameIntervalNanoseconds
+            ? 0
+            : Self.minimumVideoFrameIntervalNanoseconds - elapsed
+    }
+
     private func drainCommittedAudio(
         _ audioMessages: [RealtimeSocketMessage],
         boundary: RealtimeSocketMessage,
         expectsCommitAcknowledgement: Bool,
         operation: UInt64
     ) async {
-        for message in audioMessages {
+        for (index, message) in audioMessages.enumerated() {
             guard operationID == operation,
                   state == .awaitingCommitAcknowledgement,
                   let connection else { return }
@@ -528,6 +666,12 @@ actor NativeRealtimeSessionDriver: RealtimeSessionDriving {
             } catch {
                 await fail(.connectionFailed, operation: operation)
                 return
+            }
+            let isAudioAppend = settings.profile.provider == .qwen ||
+                (settings.profile.provider == .gemini && index > 0)
+            if isAudioAppend {
+                hasSentAudioAppend = true
+                scheduleVideoDrainIfPossible()
             }
         }
         guard operationID == operation,
@@ -861,6 +1005,7 @@ actor NativeRealtimeSessionDriver: RealtimeSessionDriving {
         }
         pendingUtterance = nil
         clearMailbox()
+        clearVideoMailbox()
         setupTimeoutTask?.cancel()
         setupTimeoutTask = nil
         connectionTask?.cancel()
