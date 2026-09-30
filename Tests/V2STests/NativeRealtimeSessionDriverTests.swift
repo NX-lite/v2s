@@ -270,6 +270,106 @@ struct NativeRealtimeSessionDriverTests {
         await task.value
     }
 
+    @Test func geminiMailboxDoesNotReplaceNewerPendingFrameWithOlderCapture() async throws {
+        let (driver, connection, _, task) = await makeReadyDriver(
+            profile: .geminiLive,
+            videoEnabled: true
+        )
+        let first = makeVideoFrame(timestamp: 2_000_000_000, marker: 0x11)
+        let newestPending = makeVideoFrame(timestamp: 2_700_000_000, marker: 0x22)
+        let olderArrival = makeVideoFrame(timestamp: 2_600_000_000, marker: 0x33)
+
+        try await driver.sendVideoFrame(first)
+        #expect(await connection.waitUntilSentFrame(first))
+        try await driver.sendVideoFrame(newestPending)
+        try await driver.sendVideoFrame(olderArrival)
+
+        try await Task.sleep(for: .milliseconds(1_050))
+        #expect(await connection.waitUntilSentFrame(newestPending))
+        let sentMessages = await connection.sentTextMessages()
+        #expect(sentMessages.contains { containsEncodedFrame($0, frame: newestPending) })
+        #expect(!sentMessages.contains { containsEncodedFrame($0, frame: olderArrival) })
+
+        await driver.stop()
+        await task.value
+    }
+
+    @Test func qwenMailboxDoesNotReplaceNewerPendingFrameWithOlderCapture() async throws {
+        let (driver, connection, _, task) = await makeReadyDriver(
+            profile: .qwenOmniFlash,
+            videoEnabled: true
+        )
+        let first = makeVideoFrame(timestamp: 2_000_000_000, marker: 0x11)
+        let newestPending = makeVideoFrame(timestamp: 2_700_000_000, marker: 0x22)
+        let olderArrival = makeVideoFrame(timestamp: 2_600_000_000, marker: 0x33)
+
+        try await driver.sendVideoFrame(first)
+        try await driver.sendAudioChunk(makeChunk(generation: 7, timestamp: 10))
+        try await driver.commit(makeUtterance(generation: 7, start: 0, end: 20))
+        #expect(await connection.waitUntilSentFrame(first))
+        #expect(await connection.waitUntilSentMessageCount(4))
+        await connection.enqueue(.text(#"{"type":"input_audio_buffer.committed"}"#))
+        #expect(await connection.waitUntilSentMessageCount(5))
+        await connection.enqueue(.text(#"{"type":"response.created","response":{"id":"resp_qwen_mailbox"}}"#))
+        await connection.enqueue(.text(#"{"type":"response.done","response":{"id":"resp_qwen_mailbox","status":"completed"}}"#))
+        try await Task.sleep(for: .milliseconds(20))
+
+        try await driver.sendVideoFrame(newestPending)
+        try await driver.sendVideoFrame(olderArrival)
+        try await Task.sleep(for: .milliseconds(1_050))
+        try await driver.sendAudioChunk(makeChunk(generation: 7, timestamp: 40))
+        try await driver.commit(makeUtterance(generation: 7, start: 35, end: 45))
+
+        #expect(await connection.waitUntilSentFrame(newestPending))
+        let sentMessages = await connection.sentTextMessages()
+        #expect(sentMessages.contains { containsEncodedFrame($0, frame: newestPending) })
+        #expect(!sentMessages.contains { containsEncodedFrame($0, frame: olderArrival) })
+
+        await driver.stop()
+        await task.value
+    }
+
+    @Test func videoSendCooldownSurvivesStopAndRestart() async throws {
+        let firstConnection = FakeRealtimeWebSocketConnection()
+        let secondConnection = FakeRealtimeWebSocketConnection()
+        let connector = FakeRealtimeWebSocketConnector(
+            profile: .geminiLive,
+            connections: [firstConnection, secondConnection]
+        )
+        let driver = NativeRealtimeSessionDriver(
+            settings: settings(profile: .geminiLive),
+            credential: "synthetic-key",
+            sourceRole: .applicationAudio,
+            connector: connector,
+            videoEnabled: true,
+            setupTimeout: .seconds(1)
+        )
+        let (firstRecorder, firstStart) = launchStart(driver, alias: "audio-1", generation: 7)
+        #expect(await firstConnection.waitUntilSentMessageCount(1))
+        await firstConnection.enqueue(acknowledgement(for: .geminiLive))
+        #expect(await firstRecorder.waitForOutcome() == .succeeded)
+        let firstFrame = makeVideoFrame(timestamp: 2_000_000_000, marker: 0x11)
+        try await driver.sendVideoFrame(firstFrame)
+        #expect(await firstConnection.waitUntilSentFrame(firstFrame))
+
+        await driver.stop()
+        await firstStart.value
+
+        let secondStart = Task {
+            try await driver.start(sourceAlias: "audio-1", generation: 8)
+        }
+        #expect(await secondConnection.waitUntilSentMessageCount(1))
+        await secondConnection.enqueue(acknowledgement(for: .geminiLive))
+        try await secondStart.value
+        let secondFrame = makeVideoFrame(timestamp: 2_100_000_000, marker: 0x22)
+        try await driver.sendVideoFrame(secondFrame)
+        try await Task.sleep(for: .milliseconds(150))
+        #expect(await secondConnection.sentMessageTypes().filter { $0 == "video" }.isEmpty)
+        #expect(await secondConnection.waitUntilSentFrame(secondFrame))
+
+        await driver.stop()
+    }
+
     @Test func setupErrorIsMappedToAnAllowlistedCodeAndClosesSocket() async {
         let connection = FakeRealtimeWebSocketConnection()
         let connector = FakeRealtimeWebSocketConnector(profile: .openAIMini, connections: [connection])

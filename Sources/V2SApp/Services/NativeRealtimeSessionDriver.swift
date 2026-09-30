@@ -123,7 +123,6 @@ actor NativeRealtimeSessionDriver: RealtimeSessionDriving {
         clearMailbox()
         clearVideoMailbox()
         lastVideoFrameTimestamp = nil
-        lastVideoSendUptimeNanoseconds = nil
         pendingUtterance = nil
         recentResponseIDs.removeAll(keepingCapacity: false)
         state = .connecting
@@ -296,6 +295,14 @@ actor NativeRealtimeSessionDriver: RealtimeSessionDriving {
             throw RealtimeFailureCode.capabilityRejected
         }
 
+        if let lastVideoFrameTimestamp,
+           frame.capturedAtMonotonicNanoseconds <= lastVideoFrameTimestamp {
+            return
+        }
+        if let videoMailbox,
+           frame.capturedAtMonotonicNanoseconds <= videoMailbox.capturedAtMonotonicNanoseconds {
+            return
+        }
         videoMailbox = frame
         scheduleVideoDrainIfPossible()
     }
