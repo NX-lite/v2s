@@ -154,9 +154,8 @@ enum OpenAIXAIRealtimeCodec {
             return .audioOutputDetected
         case "response.done":
             let responseID = try nestedResponseID(object)
-            if let response = object["response"] as? [String: Any],
-               let status = response["status"] as? String,
-               status != "completed" {
+            guard let response = object["response"] as? [String: Any],
+                  response["status"] as? String == "completed" else {
                 return .failure(.capabilityRejected)
             }
             return .responseDone(responseID: responseID)

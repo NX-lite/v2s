@@ -131,7 +131,12 @@ enum QwenRealtimeCodec {
              "response.audio_transcript.delta", "response.audio_transcript.done":
             return [.audioOutputDetected]
         case "response.done":
-            return [.responseComplete(responseID: try nestedResponseID(object))]
+            let responseID = try nestedResponseID(object)
+            guard let response = object["response"] as? [String: Any],
+                  response["status"] as? String == "completed" else {
+                return [.providerError]
+            }
+            return [.responseComplete(responseID: responseID)]
         case "error":
             return [.providerError]
         default:

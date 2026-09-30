@@ -4,6 +4,7 @@ actor NativeRealtimeSessionDriver: RealtimeSessionDriving {
     private static let maximumAudioChunkBytes = 32_000
     private static let maximumAudioMailboxBytes = 512_000
     private static let maximumAudioMailboxChunks = 128
+    private static let maximumCorrectionTextLength = 8_192
 
     private enum State {
         case stopped
@@ -19,7 +20,32 @@ actor NativeRealtimeSessionDriver: RealtimeSessionDriving {
     private enum SetupDecision {
         case acknowledged
         case failed(RealtimeFailureCode)
+        case expired
         case ignored
+    }
+
+    private struct PendingUtterance {
+        let sourceAlias: String
+        let generation: Int
+        let captionID: UUID
+        let utteranceID: String
+        let startMonotonicNanoseconds: UInt64
+        let endMonotonicNanoseconds: UInt64
+        var responseID: String?
+        var didReceiveResponseCreated = false
+        var text = ""
+        var textWasTruncated = false
+
+        mutating func appendText(_ delta: String, limit: Int) {
+            guard !textWasTruncated else { return }
+            let remaining = limit - text.count
+            if delta.count <= remaining {
+                text += delta
+            } else {
+                text += delta.prefix(remaining)
+                textWasTruncated = true
+            }
+        }
     }
 
     private let settings: NativeRealtimeSettings
@@ -43,6 +69,9 @@ actor NativeRealtimeSessionDriver: RealtimeSessionDriving {
     private var drainTask: Task<Void, Never>?
     private var audioMailbox: [RealtimeAudioChunk] = []
     private var audioMailboxBytes = 0
+    private var pendingUtterance: PendingUtterance?
+    private var expiredGeneration: Int?
+    private var recentResponseIDs: [String] = []
 
     init(
         settings: NativeRealtimeSettings,
@@ -73,12 +102,16 @@ actor NativeRealtimeSessionDriver: RealtimeSessionDriving {
 
         guard Self.validAlias(sourceAlias), generation >= 0,
               settings.isEnabled, setupTimeout > .zero,
-              let credential, !credential.isEmpty else {
+              let credential, !credential.isEmpty,
+              expiredGeneration.map({ generation > $0 }) ?? true else {
             state = .failed
             emitFailure(.invalidConfiguration, alias: self.sourceAlias, generation: sourceGeneration)
             throw RealtimeFailureCode.invalidConfiguration
         }
 
+        clearMailbox()
+        pendingUtterance = nil
+        recentResponseIDs.removeAll(keepingCapacity: false)
         state = .connecting
 
         let request: URLRequest
@@ -193,6 +226,9 @@ actor NativeRealtimeSessionDriver: RealtimeSessionDriving {
         let boundary: RealtimeSocketMessage
         var audioMessages: [RealtimeSocketMessage] = []
         do {
+            if settings.profile.provider == .gemini {
+                audioMessages.append(try GeminiRealtimeCodec.activityStart())
+            }
             for chunk in committed {
                 audioMessages.append(try audioMessage(for: chunk, alias: alias, generation: generation))
             }
@@ -203,6 +239,14 @@ actor NativeRealtimeSessionDriver: RealtimeSessionDriving {
 
         audioMailbox = remainder
         audioMailboxBytes = remainderBytes
+        pendingUtterance = PendingUtterance(
+            sourceAlias: alias,
+            generation: generation,
+            captionID: utterance.captionID,
+            utteranceID: utterance.utteranceID,
+            startMonotonicNanoseconds: utterance.startMonotonicNanoseconds,
+            endMonotonicNanoseconds: utterance.endMonotonicNanoseconds
+        )
         state = .awaitingCommitAcknowledgement
 
         let expectsCommitAcknowledgement = settings.profile.provider != .gemini
@@ -242,6 +286,7 @@ actor NativeRealtimeSessionDriver: RealtimeSessionDriving {
         drainTask?.cancel()
         drainTask = nil
         clearMailbox()
+        pendingUtterance = nil
         let oldConnection = connection
         connection = nil
 
@@ -317,6 +362,10 @@ actor NativeRealtimeSessionDriver: RealtimeSessionDriving {
             await receiveDuringCommit(message, operation: operation)
             return
         }
+        if state == .awaitingResponse {
+            await receiveDuringResponse(message, operation: operation)
+            return
+        }
         do {
             switch try setupDecision(for: message) {
             case .acknowledged:
@@ -329,6 +378,8 @@ actor NativeRealtimeSessionDriver: RealtimeSessionDriving {
                 continuation?.resume()
             case .failed(let code):
                 await fail(code, operation: operation)
+            case .expired:
+                await expire(operation: operation)
             case .ignored:
                 break
             }
@@ -363,6 +414,12 @@ actor NativeRealtimeSessionDriver: RealtimeSessionDriving {
             return .ignored
         case .gemini:
             let events = try GeminiRealtimeCodec.parse(message)
+            if events.contains(where: {
+                if case .sessionExpiring = $0 { return true }
+                return false
+            }) {
+                return .expired
+            }
             if events.contains(where: {
                 if case .setupComplete = $0 { return true }
                 return false
@@ -422,6 +479,7 @@ actor NativeRealtimeSessionDriver: RealtimeSessionDriving {
         drainTask?.cancel()
         drainTask = nil
         clearMailbox()
+        pendingUtterance = nil
         let oldConnection = connection
         connection = nil
         let continuation = setupContinuation
@@ -471,8 +529,8 @@ actor NativeRealtimeSessionDriver: RealtimeSessionDriving {
               state == .awaitingCommitAcknowledgement else { return }
         drainTask = nil
         if !expectsCommitAcknowledgement {
-            // Gemini has no commit acknowledgement; activityEnd completes the turn boundary.
-            state = .ready
+            // Gemini has no commit acknowledgement; activityEnd starts its response turn.
+            state = .awaitingResponse
         }
     }
 
@@ -502,6 +560,13 @@ actor NativeRealtimeSessionDriver: RealtimeSessionDriving {
                 committed = events.contains(where: { $0 == .audioCommitted })
             case .gemini:
                 let events = try GeminiRealtimeCodec.parse(message)
+                if events.contains(where: {
+                    if case .sessionExpiring = $0 { return true }
+                    return false
+                }) {
+                    await expire(operation: operation)
+                    return
+                }
                 if events.contains(where: { $0 == .providerError }) {
                     await fail(.connectionFailed, operation: operation)
                     return
@@ -509,11 +574,215 @@ actor NativeRealtimeSessionDriver: RealtimeSessionDriving {
                 committed = false
             }
             if committed, state == .awaitingCommitAcknowledgement {
-                state = .ready
+                do {
+                    let responseRequest: RealtimeSocketMessage
+                    switch settings.profile.provider {
+                    case .openAI, .xAI:
+                        responseRequest = try OpenAIXAIRealtimeCodec.responseCreate(profile: settings.profile)
+                    case .qwen:
+                        responseRequest = try QwenRealtimeCodec.responseCreate()
+                    case .gemini:
+                        return
+                    }
+                    guard let connection else {
+                        await fail(.connectionFailed, operation: operation)
+                        return
+                    }
+                    state = .awaitingResponse
+                    try await connection.send(responseRequest)
+                } catch {
+                    await fail(.connectionFailed, operation: operation)
+                }
             }
         } catch {
             await fail(.malformedResponse, operation: operation)
         }
+    }
+
+    private func receiveDuringResponse(
+        _ message: RealtimeSocketMessage,
+        operation: UInt64
+    ) async {
+        guard var pending = pendingUtterance,
+              pending.sourceAlias == sourceAlias,
+              pending.generation == sourceGeneration else {
+            return
+        }
+        do {
+            switch settings.profile.provider {
+            case .openAI, .xAI:
+                switch try OpenAIXAIRealtimeCodec.parse(message) {
+                case .responseCreated(let responseID):
+                    if pending.didReceiveResponseCreated { return }
+                    if let responseID, recentResponseIDs.contains(responseID) { return }
+                    pending.didReceiveResponseCreated = true
+                    pending.responseID = responseID
+                    pendingUtterance = pending
+                case .textDelta(let responseID, let text):
+                    guard pending.didReceiveResponseCreated,
+                          responseMatches(responseID, pending: pending) else { return }
+                    pending.appendText(text, limit: Self.maximumCorrectionTextLength)
+                    pendingUtterance = pending
+                case .textDone(let responseID, let text):
+                    guard pending.didReceiveResponseCreated,
+                          responseMatches(responseID, pending: pending) else { return }
+                    if let text {
+                        pending.text = String(text.prefix(Self.maximumCorrectionTextLength))
+                        pending.textWasTruncated = text.count > Self.maximumCorrectionTextLength
+                    }
+                    pendingUtterance = pending
+                case .responseDone(let responseID):
+                    guard pending.didReceiveResponseCreated,
+                          responseMatches(responseID, pending: pending) else { return }
+                    finishCorrection(pending, operation: operation)
+                case .audioOutputDetected:
+                    await fail(.capabilityRejected, operation: operation)
+                case .failure(let code):
+                    await fail(code, operation: operation)
+                case .sessionCreated, .sessionUpdated, .audioCommitted, .ignored:
+                    break
+                }
+            case .qwen:
+                let events = try QwenRealtimeCodec.parse(message)
+                for event in events {
+                    switch event {
+                    case .responseCreated(let responseID):
+                        if pending.didReceiveResponseCreated { return }
+                        if let responseID, recentResponseIDs.contains(responseID) { return }
+                        pending.didReceiveResponseCreated = true
+                        pending.responseID = responseID
+                        pendingUtterance = pending
+                    case .textDelta(let responseID, let text):
+                        guard pending.didReceiveResponseCreated,
+                              responseMatches(responseID, pending: pending) else { return }
+                        pending.appendText(text, limit: Self.maximumCorrectionTextLength)
+                        pendingUtterance = pending
+                    case .textComplete(let responseID, let text):
+                        guard pending.didReceiveResponseCreated,
+                              responseMatches(responseID, pending: pending) else { return }
+                        pending.text = String(text.prefix(Self.maximumCorrectionTextLength))
+                        pending.textWasTruncated = text.count > Self.maximumCorrectionTextLength
+                        pendingUtterance = pending
+                    case .responseComplete(let responseID):
+                        guard pending.didReceiveResponseCreated,
+                              responseMatches(responseID, pending: pending) else { return }
+                        finishCorrection(pending, operation: operation)
+                    case .audioOutputDetected:
+                        await fail(.capabilityRejected, operation: operation)
+                        return
+                    case .providerError:
+                        await fail(.capabilityRejected, operation: operation)
+                        return
+                    case .sessionCreated, .sessionUpdated, .audioCommitted:
+                        break
+                    }
+                }
+            case .gemini:
+                let events = try GeminiRealtimeCodec.parse(message)
+                if events.contains(where: {
+                    if case .sessionExpiring = $0 { return true }
+                    return false
+                }) {
+                    await expire(operation: operation)
+                    return
+                }
+                if events.contains(where: { $0 == .providerError }) {
+                    await fail(.connectionFailed, operation: operation)
+                    return
+                }
+                if events.contains(where: { $0 == .interrupted }) {
+                    pendingUtterance = nil
+                    state = .ready
+                    return
+                }
+                for event in events {
+                    if case .outputTranscription(let text) = event {
+                        pending.appendText(text, limit: Self.maximumCorrectionTextLength)
+                    }
+                }
+                pendingUtterance = pending
+                if events.contains(where: { $0 == .turnComplete }) {
+                    finishCorrection(pending, operation: operation)
+                }
+            }
+        } catch {
+            await fail(.malformedResponse, operation: operation)
+        }
+    }
+
+    private func responseMatches(_ responseID: String?, pending: PendingUtterance) -> Bool {
+        guard let expected = pending.responseID else { return responseID == nil }
+        return responseID == expected
+    }
+
+    private func finishCorrection(_ pending: PendingUtterance, operation: UInt64) {
+        guard operationID == operation, state == .awaitingResponse,
+              pendingUtterance?.captionID == pending.captionID else {
+            return
+        }
+        if let responseID = pending.responseID {
+            recentResponseIDs.append(responseID)
+            if recentResponseIDs.count > 16 {
+                recentResponseIDs.removeFirst(recentResponseIDs.count - 16)
+            }
+        }
+        guard !pending.textWasTruncated else {
+            pendingUtterance = nil
+            state = .ready
+            return
+        }
+        let text = pending.text.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !text.isEmpty, !Self.isConversationalAnswer(text) else {
+            pendingUtterance = nil
+            state = .ready
+            return
+        }
+        providerEventContinuation.yield(.correctedText(
+            sourceAlias: pending.sourceAlias,
+            generation: pending.generation,
+            captionID: pending.captionID,
+            utteranceID: pending.utteranceID,
+            text: text
+        ))
+        pendingUtterance = nil
+        state = .ready
+    }
+
+    private func expire(operation: UInt64) async {
+        guard operationID == operation else { return }
+        state = .expired
+        if let sourceGeneration {
+            expiredGeneration = max(expiredGeneration ?? sourceGeneration, sourceGeneration)
+        }
+        pendingUtterance = nil
+        clearMailbox()
+        setupTimeoutTask?.cancel()
+        setupTimeoutTask = nil
+        connectionTask?.cancel()
+        connectionTask = nil
+        receiveTask?.cancel()
+        receiveTask = nil
+        drainTask?.cancel()
+        drainTask = nil
+        let oldConnection = connection
+        connection = nil
+        let continuation = setupContinuation
+        setupContinuation = nil
+        if let sourceAlias, let sourceGeneration {
+            providerEventContinuation.yield(.expired(sourceAlias: sourceAlias, generation: sourceGeneration))
+        }
+        if let oldConnection { await oldConnection.close() }
+        continuation?.resume(throwing: RealtimeFailureCode.sessionExpired)
+    }
+
+    private static func isConversationalAnswer(_ text: String) -> Bool {
+        let normalized = text.trimmingCharacters(in: .whitespacesAndNewlines)
+            .lowercased()
+        let prefixes = [
+            "sure,", "sure.", "here is", "here's", "the corrected transcript is",
+            "the transcript is", "i corrected", "i have corrected", "as an ai",
+        ]
+        return prefixes.contains(where: normalized.hasPrefix) || normalized.contains("\n")
     }
 
     private func audioMessage(

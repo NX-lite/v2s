@@ -115,7 +115,7 @@ import Testing
     @Test func qwenParserReturnsOnlyTextAndAllowlistedControlEvents() throws {
         let delta = try QwenRealtimeCodec.parse(.text(#"{"type":"response.text.delta","delta":"hello","event_id":"secret-id"}"#))
         #expect(delta == [.textDelta(responseID: nil, text: "hello")])
-        let done = try QwenRealtimeCodec.parse(.text(#"{"type":"response.done","response":{"id":"private-response"}}"#))
+        let done = try QwenRealtimeCodec.parse(.text(#"{"type":"response.done","response":{"id":"private-response","status":"completed"}}"#))
         #expect(done == [.responseComplete(responseID: "private-response")])
         let audio = try QwenRealtimeCodec.parse(.text(#"{"type":"response.audio.delta","delta":"c2VjcmV0LW1lZGlh"}"#))
         #expect(audio == [.audioOutputDetected])
@@ -140,7 +140,7 @@ import Testing
             #"{"type":"response.text.done","response_id":"resp_created-1","text":"hello"}"#
         )) == [.textComplete(responseID: "resp_created-1", text: "hello")])
         #expect(try QwenRealtimeCodec.parse(.text(
-            #"{"type":"response.done","response":{"id":"resp_created-1"}}"#
+            #"{"type":"response.done","response":{"id":"resp_created-1","status":"completed"}}"#
         )) == [.responseComplete(responseID: "resp_created-1")])
 
         let maximumID = "resp_" + String(repeating: "a", count: 123)
@@ -148,6 +148,13 @@ import Testing
         #expect(try QwenRealtimeCodec.parse(.text(
             #"{"type":"response.text.delta","response_id":"\#(maximumID)","delta":"hello"}"#
         )) == [.textDelta(responseID: maximumID, text: "hello")])
+    }
+
+    @Test func qwenCancelledResponseIsNotReportedAsCompleted() throws {
+        let events = try QwenRealtimeCodec.parse(.text(
+            #"{"type":"response.done","response":{"id":"resp_cancelled-1","status":"cancelled"}}"#
+        ))
+        #expect(events == [.providerError])
     }
 
     @Test func qwenParserRejectsMalformedResponseIDsWithoutRetainingThem() {
