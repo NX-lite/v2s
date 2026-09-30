@@ -826,8 +826,19 @@ actor NativeRealtimeSessionDriver: RealtimeSessionDriving {
             "i can help", "i can assist", "i'd be happy to", "i would be happy to",
             "let me know if you need", "let me know if i can",
         ]
+        let transcriptMetacommentaryPhrases = [
+            "corrected transcript", "corrected transcription",
+            "transcript is", "transcription is", "transcript would be", "transcription would be",
+            "provide a transcript", "provide the transcript", "provide a transcription",
+            "offer a transcript", "offer the transcript", "offer a transcription",
+        ]
+        let transcriptMention = normalized.contains("transcript") || normalized.contains("transcription")
+        let assistantPreamble = ["certainly", "absolutely", "of course"]
+            .contains(where: normalized.hasPrefix)
         return prefixes.contains(where: normalized.hasPrefix) ||
             embeddedConversationalPhrases.contains(where: normalized.contains) ||
+            transcriptMetacommentaryPhrases.contains(where: normalized.contains) ||
+            (assistantPreamble && transcriptMention) ||
             normalized.contains("\n")
     }
 

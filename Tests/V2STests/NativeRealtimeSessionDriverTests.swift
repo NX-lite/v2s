@@ -662,6 +662,10 @@ struct NativeRealtimeSessionDriverTests {
             "Can I help you with anything else?",
             "I can help with that.",
             "Hello! How can I help you today?",
+            "Certainly, here’s the corrected transcript: hello.",
+            "Absolutely, the transcription is: hello.",
+            "Of course — I can provide the corrected transcript: hello.",
+            "For this audio, I can provide a transcription: hello.",
         ]
         for (index, reply) in replies.enumerated() {
             let timestamp = UInt64(100 + index * 200)
@@ -770,6 +774,34 @@ struct NativeRealtimeSessionDriverTests {
         await connection.enqueue(.text(#"{"type":"response.done","response":{"id":"resp_reply","status":"completed"}}"#))
         try await Task.sleep(for: .milliseconds(20))
         #expect(await events.snapshot().isEmpty)
+        await driver.stop()
+        eventTask.cancel()
+        #expect(await recorder.outcome() == .succeeded)
+        await task.value
+    }
+
+    @Test func ordinarySpokenStatementRemainsEligibleForCorrection() async throws {
+        let (driver, connection, recorder, task) = await makeReadyDriver(profile: .openAIMini)
+        let (events, eventTask) = await recordEvents(from: driver)
+        let utterance = makeUtterance(generation: 7, start: 90, end: 200)
+        try await driver.sendAudioChunk(makeChunk(generation: 7, timestamp: 100))
+        try await driver.commit(utterance)
+        #expect(await connection.waitUntilSentMessageCount(3))
+        await connection.enqueue(.text(#"{"type":"input_audio_buffer.committed"}"#))
+        #expect(await connection.waitUntilSentMessageCount(4))
+        await connection.enqueue(.text(#"{"type":"response.created","response":{"id":"resp_statement"}}"#))
+        await connection.enqueue(.text(#"{"type":"response.output_text.delta","response_id":"resp_statement","delta":"The package arrives tomorrow."}"#))
+        await connection.enqueue(.text(#"{"type":"response.done","response":{"id":"resp_statement","status":"completed"}}"#))
+        #expect(await events.waitForCount(1))
+        #expect(await events.snapshot() == [
+            .correctedText(
+                sourceAlias: "audio-1",
+                generation: 7,
+                captionID: utterance.captionID,
+                utteranceID: utterance.utteranceID,
+                text: "The package arrives tomorrow."
+            ),
+        ])
         await driver.stop()
         eventTask.cancel()
         #expect(await recorder.outcome() == .succeeded)
