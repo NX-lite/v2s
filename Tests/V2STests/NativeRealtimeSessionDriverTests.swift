@@ -86,9 +86,8 @@ struct NativeRealtimeSessionDriverTests {
             let frame = makeVideoFrame(timestamp: 1_000_000_000)
             if profile.supportsVideo {
                 try await driver.sendAudioChunk(makeChunk(generation: 7, timestamp: 10))
-                try await driver.commit(makeUtterance(generation: 7, start: 0, end: 20))
-                #expect(await connection.waitUntilSentMessageCount(3))
                 try await driver.sendVideoFrame(frame)
+                try await driver.commit(makeUtterance(generation: 7, start: 0, end: 20))
                 #expect(await connection.waitUntilSentFrame(frame))
                 let sentTypes = await connection.sentMessageTypes()
                 #expect(sentTypes.contains("input_image_buffer.append") || sentTypes.contains("video"), "sent types: \(sentTypes)")
@@ -140,6 +139,56 @@ struct NativeRealtimeSessionDriverTests {
         try await Task.sleep(for: .milliseconds(20))
         #expect(await stoppedConnection.sentMessageTypes() == ["session.update"])
         await stoppedTask.value
+    }
+
+    @Test func qwenSendsHeldFrameSuccessfullyBeforeCommitBoundary() async throws {
+        let connection = FakeRealtimeWebSocketConnection(suspendSendType: "input_image_buffer.append")
+        let connector = FakeRealtimeWebSocketConnector(profile: .qwenOmniFlash, connections: [connection])
+        let driver = NativeRealtimeSessionDriver(
+            settings: settings(profile: .qwenOmniFlash),
+            credential: "synthetic-key",
+            sourceRole: .microphone,
+            connector: connector,
+            videoEnabled: true,
+            setupTimeout: .seconds(1)
+        )
+        let (recorder, task) = launchStart(driver, alias: "audio-1", generation: 7)
+        #expect(await connection.waitUntilSentMessageCount(1))
+        await connection.enqueue(acknowledgement(for: .qwenOmniFlash))
+        #expect(await recorder.waitForOutcome() == .succeeded)
+
+        try await driver.sendVideoFrame(makeVideoFrame(timestamp: 10))
+        try await driver.sendAudioChunk(makeChunk(generation: 7, timestamp: 20))
+        try await driver.commit(makeUtterance(generation: 7, start: 0, end: 30))
+        #expect(await connection.waitUntilSuspendedMessageTypeStarted("input_image_buffer.append"))
+        #expect(!(await connection.sentMessageTypes().contains("input_audio_buffer.commit")))
+        try await driver.sendVideoFrame(makeVideoFrame(timestamp: 40, marker: 0x22))
+
+        await connection.releaseSuspendedSend()
+        #expect(await connection.waitUntilSentMessageCount(4))
+        #expect(await connection.sentMessageTypes() == [
+            "session.update",
+            "input_audio_buffer.append",
+            "input_image_buffer.append",
+            "input_audio_buffer.commit",
+        ])
+
+        try await driver.sendVideoFrame(makeVideoFrame(timestamp: 50, marker: 0x33))
+        await connection.enqueue(.text(#"{"type":"input_audio_buffer.committed"}"#))
+        #expect(await connection.waitUntilSentMessageType("response.create"))
+        await connection.enqueue(.text(#"{"type":"response.created","response":{"id":"resp_video_gate"}}"#))
+        await connection.enqueue(.text(#"{"type":"response.done","response":{"id":"resp_video_gate","status":"completed"}}"#))
+        try await Task.sleep(for: .milliseconds(10))
+
+        try await driver.sendAudioChunk(makeChunk(generation: 7, timestamp: 40))
+        try await driver.commit(makeUtterance(generation: 7, start: 35, end: 45))
+        #expect(await connection.waitUntilSentMessageCount(7))
+        let secondTurnTypes = await connection.sentMessageTypes()
+        #expect(secondTurnTypes.filter { $0 == "input_image_buffer.append" }.count == 1)
+        #expect(secondTurnTypes.filter { $0 == "input_audio_buffer.append" }.count == 2)
+        #expect(secondTurnTypes.filter { $0 == "input_audio_buffer.commit" }.count == 2)
+        await driver.stop()
+        await task.value
     }
 
     @Test func videoMailboxKeepsNewestFrameRateLimitsAndRevocationClearsIt() async throws {
@@ -1883,6 +1932,14 @@ private actor FakeRealtimeWebSocketConnection: RealtimeWebSocketConnection {
             try? await Task.sleep(for: .milliseconds(10))
         }
         return sentTypes.count >= count
+    }
+
+    func waitUntilSentMessageType(_ type: String) async -> Bool {
+        for _ in 0..<200 {
+            if sentTypes.contains(type) { return true }
+            try? await Task.sleep(for: .milliseconds(10))
+        }
+        return sentTypes.contains(type)
     }
 
     private static func messageType(_ message: RealtimeSocketMessage) -> String {

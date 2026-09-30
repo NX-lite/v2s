@@ -79,7 +79,6 @@ actor NativeRealtimeSessionDriver: RealtimeSessionDriving {
     private var videoMailbox: RealtimeVideoFrame?
     private var lastVideoFrameTimestamp: UInt64?
     private var lastVideoSendUptimeNanoseconds: UInt64?
-    private var hasSentAudioAppend = false
     private var videoPermissionRevoked = false
     private var pendingUtterance: PendingUtterance?
     private var expiredGeneration: Int?
@@ -125,7 +124,6 @@ actor NativeRealtimeSessionDriver: RealtimeSessionDriving {
         clearVideoMailbox()
         lastVideoFrameTimestamp = nil
         lastVideoSendUptimeNanoseconds = nil
-        hasSentAudioAppend = false
         pendingUtterance = nil
         recentResponseIDs.removeAll(keepingCapacity: false)
         state = .connecting
@@ -337,7 +335,6 @@ actor NativeRealtimeSessionDriver: RealtimeSessionDriving {
         }
         sourceAlias = nil
         sourceGeneration = nil
-        hasSentAudioAppend = false
 
         if let oldConnection { await oldConnection.close() }
         pendingContinuation?.resume(throwing: RealtimeFailureCode.connectionFailed)
@@ -562,8 +559,8 @@ actor NativeRealtimeSessionDriver: RealtimeSessionDriving {
         guard videoDrainTask == nil, videoMailbox != nil,
               videoEnabled, !videoPermissionRevoked,
               settings.profile.supportsVideo,
-              state == .ready || state == .awaitingCommitAcknowledgement || state == .awaitingResponse,
-              settings.profile.provider != .qwen || hasSentAudioAppend else { return }
+              settings.profile.provider != .qwen,
+              state == .ready || state == .awaitingCommitAcknowledgement || state == .awaitingResponse else { return }
 
         let delay = remainingVideoCooldownNanoseconds()
 
@@ -585,7 +582,6 @@ actor NativeRealtimeSessionDriver: RealtimeSessionDriving {
               videoEnabled, !videoPermissionRevoked,
               settings.profile.supportsVideo,
               state == .ready || state == .awaitingCommitAcknowledgement || state == .awaitingResponse,
-              settings.profile.provider != .qwen || hasSentAudioAppend,
               let frame = videoMailbox,
               let connection else {
             videoDrainTask = nil
@@ -642,6 +638,36 @@ actor NativeRealtimeSessionDriver: RealtimeSessionDriving {
         scheduleVideoDrainIfPossible()
     }
 
+    private func sendQueuedQwenFrameBeforeCommitBoundary(operation: UInt64) async {
+        guard operationID == operation,
+              settings.profile.provider == .qwen,
+              state == .awaitingCommitAcknowledgement,
+              let frame = videoMailbox,
+              let connection else { return }
+        videoMailbox = nil
+        if let lastVideoFrameTimestamp,
+           frame.capturedAtMonotonicNanoseconds <= lastVideoFrameTimestamp {
+            return
+        }
+        guard remainingVideoCooldownNanoseconds() == 0 else { return }
+
+        let message: RealtimeSocketMessage
+        do {
+            message = try QwenRealtimeCodec.frame(frame)
+        } catch {
+            return
+        }
+        do {
+            try await connection.send(message)
+        } catch {
+            await fail(.connectionFailed, operation: operation)
+            return
+        }
+        guard operationID == operation, state == .awaitingCommitAcknowledgement else { return }
+        lastVideoFrameTimestamp = frame.capturedAtMonotonicNanoseconds
+        lastVideoSendUptimeNanoseconds = DispatchTime.now().uptimeNanoseconds
+    }
+
     private func remainingVideoCooldownNanoseconds() -> UInt64 {
         guard let lastVideoSendUptimeNanoseconds else { return 0 }
         let now = DispatchTime.now().uptimeNanoseconds
@@ -657,6 +683,7 @@ actor NativeRealtimeSessionDriver: RealtimeSessionDriving {
         expectsCommitAcknowledgement: Bool,
         operation: UInt64
     ) async {
+        var didAttemptQwenFrameForCommit = false
         for (index, message) in audioMessages.enumerated() {
             guard operationID == operation,
                   state == .awaitingCommitAcknowledgement,
@@ -670,8 +697,12 @@ actor NativeRealtimeSessionDriver: RealtimeSessionDriving {
             let isAudioAppend = settings.profile.provider == .qwen ||
                 (settings.profile.provider == .gemini && index > 0)
             if isAudioAppend {
-                hasSentAudioAppend = true
-                scheduleVideoDrainIfPossible()
+                if settings.profile.provider == .qwen, !didAttemptQwenFrameForCommit {
+                    didAttemptQwenFrameForCommit = true
+                    await sendQueuedQwenFrameBeforeCommitBoundary(operation: operation)
+                } else if settings.profile.provider != .qwen {
+                    scheduleVideoDrainIfPossible()
+                }
             }
         }
         guard operationID == operation,
@@ -685,6 +716,11 @@ actor NativeRealtimeSessionDriver: RealtimeSessionDriving {
         } catch {
             await fail(.connectionFailed, operation: operation)
             return
+        }
+        if settings.profile.provider == .qwen {
+            // A frame that arrived during the boundary send cannot safely bind to
+            // the just-committed Qwen turn, so discard it rather than replay it.
+            videoMailbox = nil
         }
         guard operationID == operation,
               state == .awaitingCommitAcknowledgement else { return }
