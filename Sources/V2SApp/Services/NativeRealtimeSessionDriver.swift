@@ -32,6 +32,7 @@ actor NativeRealtimeSessionDriver: RealtimeSessionDriving {
         let startMonotonicNanoseconds: UInt64
         let endMonotonicNanoseconds: UInt64
         var responseID: String?
+        var commitBoundaryFlushed = false
         var didReceiveResponseCreated = false
         var text = ""
         var textWasTruncated = false
@@ -514,7 +515,7 @@ actor NativeRealtimeSessionDriver: RealtimeSessionDriving {
         expectsCommitAcknowledgement: Bool,
         operation: UInt64
     ) async {
-        for message in audioMessages + [boundary] {
+        for message in audioMessages {
             guard operationID == operation,
                   state == .awaitingCommitAcknowledgement,
                   let connection else { return }
@@ -526,7 +527,19 @@ actor NativeRealtimeSessionDriver: RealtimeSessionDriving {
             }
         }
         guard operationID == operation,
+              state == .awaitingCommitAcknowledgement,
+              let connection else { return }
+        do {
+            try await connection.send(boundary)
+        } catch {
+            await fail(.connectionFailed, operation: operation)
+            return
+        }
+        guard operationID == operation,
               state == .awaitingCommitAcknowledgement else { return }
+        guard var pending = pendingUtterance else { return }
+        pending.commitBoundaryFlushed = true
+        pendingUtterance = pending
         drainTask = nil
         if !expectsCommitAcknowledgement {
             // Gemini has no commit acknowledgement; activityEnd starts its response turn.
@@ -573,7 +586,8 @@ actor NativeRealtimeSessionDriver: RealtimeSessionDriving {
                 }
                 committed = false
             }
-            if committed, state == .awaitingCommitAcknowledgement {
+            if committed, state == .awaitingCommitAcknowledgement,
+               pendingUtterance?.commitBoundaryFlushed == true {
                 do {
                     let responseRequest: RealtimeSocketMessage
                     switch settings.profile.provider {
@@ -781,6 +795,9 @@ actor NativeRealtimeSessionDriver: RealtimeSessionDriving {
         let prefixes = [
             "sure,", "sure.", "here is", "here's", "the corrected transcript is",
             "the transcript is", "i corrected", "i have corrected", "as an ai",
+            "can i help", "can i assist", "i can help", "i can assist",
+            "i'd be happy to", "i would be happy to", "how can i help",
+            "how can i assist", "let me know if you need", "let me know if i can",
         ]
         return prefixes.contains(where: normalized.hasPrefix) || normalized.contains("\n")
     }
