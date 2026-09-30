@@ -35,6 +35,7 @@ actor NativeRealtimeSessionDriver: RealtimeSessionDriving {
         var commitBoundarySendStarted = false
         var commitBoundaryFlushed = false
         var didReceiveCommitAcknowledgement = false
+        var didReceiveGeminiTurnComplete = false
         var didReceiveResponseCreated = false
         var text = ""
         var textWasTruncated = false
@@ -549,6 +550,9 @@ actor NativeRealtimeSessionDriver: RealtimeSessionDriving {
         if !expectsCommitAcknowledgement {
             // Gemini has no commit acknowledgement; activityEnd starts its response turn.
             state = .awaitingResponse
+            if pending.didReceiveGeminiTurnComplete {
+                finishCorrection(pending, operation: operation)
+            }
         } else if pending.didReceiveCommitAcknowledgement {
             await sendResponseForCommitAcknowledgement(operation: operation)
         }
@@ -560,6 +564,8 @@ actor NativeRealtimeSessionDriver: RealtimeSessionDriving {
     ) async {
         do {
             let committed: Bool
+            var geminiTranscriptions: [String] = []
+            var geminiTurnComplete = false
             switch settings.profile.provider {
             case .openAI, .xAI:
                 switch try OpenAIXAIRealtimeCodec.parse(message) {
@@ -591,7 +597,23 @@ actor NativeRealtimeSessionDriver: RealtimeSessionDriving {
                     await fail(.connectionFailed, operation: operation)
                     return
                 }
+                geminiTranscriptions = events.compactMap { event in
+                    if case .outputTranscription(let text) = event { return text }
+                    return nil
+                }
+                geminiTurnComplete = events.contains(where: { $0 == .turnComplete })
                 committed = false
+            }
+            if settings.profile.provider == .gemini,
+               var pending = pendingUtterance,
+               pending.commitBoundarySendStarted,
+               !pending.commitBoundaryFlushed {
+                for text in geminiTranscriptions {
+                    pending.appendText(text, limit: Self.maximumCorrectionTextLength)
+                }
+                if geminiTurnComplete { pending.didReceiveGeminiTurnComplete = true }
+                pendingUtterance = pending
+                return
             }
             if committed, state == .awaitingCommitAcknowledgement,
                var pending = pendingUtterance,
@@ -650,16 +672,28 @@ actor NativeRealtimeSessionDriver: RealtimeSessionDriving {
                 switch try OpenAIXAIRealtimeCodec.parse(message) {
                 case .responseCreated(let responseID):
                     if pending.didReceiveResponseCreated { return }
-                    if let responseID, recentResponseIDs.contains(responseID) { return }
+                    guard let responseID else {
+                        await fail(.malformedResponse, operation: operation)
+                        return
+                    }
+                    if recentResponseIDs.contains(responseID) { return }
                     pending.didReceiveResponseCreated = true
                     pending.responseID = responseID
                     pendingUtterance = pending
                 case .textDelta(let responseID, let text):
+                    guard responseID != nil else {
+                        await fail(.malformedResponse, operation: operation)
+                        return
+                    }
                     guard pending.didReceiveResponseCreated,
                           responseMatches(responseID, pending: pending) else { return }
                     pending.appendText(text, limit: Self.maximumCorrectionTextLength)
                     pendingUtterance = pending
                 case .textDone(let responseID, let text):
+                    guard responseID != nil else {
+                        await fail(.malformedResponse, operation: operation)
+                        return
+                    }
                     guard pending.didReceiveResponseCreated,
                           responseMatches(responseID, pending: pending) else { return }
                     if let text {
@@ -668,6 +702,10 @@ actor NativeRealtimeSessionDriver: RealtimeSessionDriving {
                     }
                     pendingUtterance = pending
                 case .responseDone(let responseID):
+                    guard responseID != nil else {
+                        await fail(.malformedResponse, operation: operation)
+                        return
+                    }
                     guard pending.didReceiveResponseCreated,
                           responseMatches(responseID, pending: pending) else { return }
                     finishCorrection(pending, operation: operation)
@@ -684,22 +722,38 @@ actor NativeRealtimeSessionDriver: RealtimeSessionDriving {
                     switch event {
                     case .responseCreated(let responseID):
                         if pending.didReceiveResponseCreated { return }
-                        if let responseID, recentResponseIDs.contains(responseID) { return }
+                        guard let responseID else {
+                            await fail(.malformedResponse, operation: operation)
+                            return
+                        }
+                        if recentResponseIDs.contains(responseID) { return }
                         pending.didReceiveResponseCreated = true
                         pending.responseID = responseID
                         pendingUtterance = pending
                     case .textDelta(let responseID, let text):
+                        guard responseID != nil else {
+                            await fail(.malformedResponse, operation: operation)
+                            return
+                        }
                         guard pending.didReceiveResponseCreated,
                               responseMatches(responseID, pending: pending) else { return }
                         pending.appendText(text, limit: Self.maximumCorrectionTextLength)
                         pendingUtterance = pending
                     case .textComplete(let responseID, let text):
+                        guard responseID != nil else {
+                            await fail(.malformedResponse, operation: operation)
+                            return
+                        }
                         guard pending.didReceiveResponseCreated,
                               responseMatches(responseID, pending: pending) else { return }
                         pending.text = String(text.prefix(Self.maximumCorrectionTextLength))
                         pending.textWasTruncated = text.count > Self.maximumCorrectionTextLength
                         pendingUtterance = pending
                     case .responseComplete(let responseID):
+                        guard responseID != nil else {
+                            await fail(.malformedResponse, operation: operation)
+                            return
+                        }
                         guard pending.didReceiveResponseCreated,
                               responseMatches(responseID, pending: pending) else { return }
                         finishCorrection(pending, operation: operation)
@@ -747,7 +801,7 @@ actor NativeRealtimeSessionDriver: RealtimeSessionDriving {
     }
 
     private func responseMatches(_ responseID: String?, pending: PendingUtterance) -> Bool {
-        guard let expected = pending.responseID else { return responseID == nil }
+        guard let expected = pending.responseID, let responseID else { return false }
         return responseID == expected
     }
 
@@ -814,6 +868,7 @@ actor NativeRealtimeSessionDriver: RealtimeSessionDriving {
     private static func isConversationalAnswer(_ text: String) -> Bool {
         let normalized = text.trimmingCharacters(in: .whitespacesAndNewlines)
             .lowercased()
+        let lines = normalized.split(whereSeparator: \.isNewline).map(String.init)
         let prefixes = [
             "sure,", "sure.", "here is", "here's", "the corrected transcript is",
             "the transcript is", "i corrected", "i have corrected", "as an ai",
@@ -835,11 +890,13 @@ actor NativeRealtimeSessionDriver: RealtimeSessionDriving {
         let transcriptMention = normalized.contains("transcript") || normalized.contains("transcription")
         let assistantPreamble = ["certainly", "absolutely", "of course"]
             .contains(where: normalized.hasPrefix)
-        return prefixes.contains(where: normalized.hasPrefix) ||
-            embeddedConversationalPhrases.contains(where: normalized.contains) ||
-            transcriptMetacommentaryPhrases.contains(where: normalized.contains) ||
-            (assistantPreamble && transcriptMention) ||
-            normalized.contains("\n")
+        return lines.contains { line in
+            prefixes.contains(where: line.hasPrefix) ||
+                embeddedConversationalPhrases.contains(where: line.contains) ||
+                transcriptMetacommentaryPhrases.contains(where: line.contains) ||
+                ((["certainly", "absolutely", "of course"].contains(where: line.hasPrefix)) &&
+                    (line.contains("transcript") || line.contains("transcription")))
+        } || (assistantPreamble && transcriptMention)
     }
 
     private func audioMessage(

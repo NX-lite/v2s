@@ -790,7 +790,7 @@ struct NativeRealtimeSessionDriverTests {
         await connection.enqueue(.text(#"{"type":"input_audio_buffer.committed"}"#))
         #expect(await connection.waitUntilSentMessageCount(4))
         await connection.enqueue(.text(#"{"type":"response.created","response":{"id":"resp_statement"}}"#))
-        await connection.enqueue(.text(#"{"type":"response.output_text.delta","response_id":"resp_statement","delta":"The package arrives tomorrow."}"#))
+        await connection.enqueue(.text(#"{"type":"response.output_text.delta","response_id":"resp_statement","delta":"The package arrives\ntomorrow."}"#))
         await connection.enqueue(.text(#"{"type":"response.done","response":{"id":"resp_statement","status":"completed"}}"#))
         #expect(await events.waitForCount(1))
         #expect(await events.snapshot() == [
@@ -799,7 +799,7 @@ struct NativeRealtimeSessionDriverTests {
                 generation: 7,
                 captionID: utterance.captionID,
                 utteranceID: utterance.utteranceID,
-                text: "The package arrives tomorrow."
+                text: "The package arrives\ntomorrow."
             ),
         ])
         await driver.stop()
@@ -989,6 +989,152 @@ struct NativeRealtimeSessionDriverTests {
         eventTask.cancel()
         #expect(await recorder.outcome() == .succeeded)
         await task.value
+    }
+
+    @Test func geminiTurnCompleteDuringActivityEndSendIsDeferredUntilSendSucceeds() async throws {
+        let connection = FakeRealtimeWebSocketConnection(suspendSendType: "activityEnd")
+        let connector = FakeRealtimeWebSocketConnector(profile: .geminiLive, connections: [connection])
+        let driver = NativeRealtimeSessionDriver(
+            settings: settings(profile: .geminiLive),
+            credential: "synthetic-key",
+            sourceRole: .microphone,
+            connector: connector,
+            setupTimeout: .seconds(1)
+        )
+        let (recorder, task) = launchStart(driver, alias: "audio-1", generation: 7)
+        #expect(await connection.waitUntilSentMessageCount(1))
+        await connection.enqueue(.text(#"{"setupComplete":{}}"#))
+        #expect(await recorder.waitForOutcome() == .succeeded)
+        await task.value
+        let (events, eventTask) = await recordEvents(from: driver)
+
+        let utterance = makeUtterance(generation: 7, start: 90, end: 200)
+        try await driver.sendAudioChunk(makeChunk(generation: 7, timestamp: 100))
+        try await driver.commit(utterance)
+        #expect(await connection.waitUntilSuspendedMessageTypeStarted("activityEnd"))
+        await connection.enqueue(.text(#"{"serverContent":{"outputTranscription":{"text":"turn left"},"turnComplete":true}}"#))
+        try await Task.sleep(for: .milliseconds(20))
+        #expect(await events.snapshot().isEmpty)
+
+        await connection.releaseSuspendedSend()
+        #expect(await events.waitForCount(1))
+        #expect(await events.snapshot() == [
+            .correctedText(
+                sourceAlias: "audio-1",
+                generation: 7,
+                captionID: utterance.captionID,
+                utteranceID: utterance.utteranceID,
+                text: "turn left"
+            ),
+        ])
+        await driver.stop()
+        eventTask.cancel()
+        #expect(await recorder.outcome() == .succeeded)
+    }
+
+    @Test func geminiStopDuringActivityEndSendDiscardsDeferredTurn() async throws {
+        let connection = FakeRealtimeWebSocketConnection(suspendSendType: "activityEnd")
+        let connector = FakeRealtimeWebSocketConnector(profile: .geminiLive, connections: [connection])
+        let driver = NativeRealtimeSessionDriver(
+            settings: settings(profile: .geminiLive),
+            credential: "synthetic-key",
+            sourceRole: .microphone,
+            connector: connector,
+            setupTimeout: .seconds(1)
+        )
+        let (recorder, task) = launchStart(driver, alias: "audio-1", generation: 7)
+        #expect(await connection.waitUntilSentMessageCount(1))
+        await connection.enqueue(.text(#"{"setupComplete":{}}"#))
+        #expect(await recorder.waitForOutcome() == .succeeded)
+        await task.value
+        let (events, eventTask) = await recordEvents(from: driver)
+        try await driver.sendAudioChunk(makeChunk(generation: 7, timestamp: 100))
+        try await driver.commit(makeUtterance(generation: 7, start: 90, end: 200))
+        #expect(await connection.waitUntilSuspendedMessageTypeStarted("activityEnd"))
+        await connection.enqueue(.text(#"{"serverContent":{"outputTranscription":{"text":"must be discarded"},"turnComplete":true}}"#))
+        try await Task.sleep(for: .milliseconds(20))
+        #expect(await events.snapshot().isEmpty)
+
+        await driver.stop()
+        try await Task.sleep(for: .milliseconds(20))
+        #expect(await events.snapshot().isEmpty)
+        eventTask.cancel()
+    }
+
+    @Test func geminiActivityEndSendFailureDiscardsDeferredTurn() async throws {
+        let connection = FakeRealtimeWebSocketConnection(suspendSendType: "activityEnd")
+        let connector = FakeRealtimeWebSocketConnector(profile: .geminiLive, connections: [connection])
+        let driver = NativeRealtimeSessionDriver(
+            settings: settings(profile: .geminiLive),
+            credential: "synthetic-key",
+            sourceRole: .microphone,
+            connector: connector,
+            setupTimeout: .seconds(1)
+        )
+        let (recorder, task) = launchStart(driver, alias: "audio-1", generation: 7)
+        #expect(await connection.waitUntilSentMessageCount(1))
+        await connection.enqueue(.text(#"{"setupComplete":{}}"#))
+        #expect(await recorder.waitForOutcome() == .succeeded)
+        await task.value
+        let (events, eventTask) = await recordEvents(from: driver)
+        try await driver.sendAudioChunk(makeChunk(generation: 7, timestamp: 100))
+        try await driver.commit(makeUtterance(generation: 7, start: 90, end: 200))
+        #expect(await connection.waitUntilSuspendedMessageTypeStarted("activityEnd"))
+        await connection.enqueue(.text(#"{"serverContent":{"outputTranscription":{"text":"must be discarded"},"turnComplete":true}}"#))
+        try await Task.sleep(for: .milliseconds(20))
+        #expect(await events.snapshot().isEmpty)
+
+        await connection.failSuspendedSend()
+        #expect(await events.waitForCount(1))
+        #expect(await events.snapshot() == [
+            .failure(sourceAlias: "audio-1", generation: 7, .connectionFailed),
+        ])
+        eventTask.cancel()
+        #expect(await recorder.outcome() == .succeeded)
+        await task.value
+    }
+
+    @Test func textOnlyProvidersRejectResponsesWithoutCorrelationIDs() async throws {
+        enum MissingIDCase {
+            case created, textDelta, responseDone
+        }
+
+        for profile in [NativeRealtimeProfile.openAIMini, .xAIVoice, .qwenOmniFlash] {
+            for missingIDCase in [MissingIDCase.created, .textDelta, .responseDone] {
+                let (driver, connection, recorder, task) = await makeReadyDriver(profile: profile)
+                let (events, eventTask) = await recordEvents(from: driver)
+                let responseID = "resp_id_\(profile.provider.rawValue)"
+                let deltaType = profile.provider == .qwen ? "response.text.delta" : "response.output_text.delta"
+                try await driver.sendAudioChunk(makeChunk(generation: 7, timestamp: 100))
+                try await driver.commit(makeUtterance(generation: 7, start: 90, end: 200))
+                #expect(await connection.waitUntilSentMessageCount(3))
+                await connection.enqueue(.text(#"{"type":"input_audio_buffer.committed"}"#))
+                #expect(await connection.waitUntilSentMessageCount(4))
+
+                switch missingIDCase {
+                case .created:
+                    await connection.enqueue(.text(#"{"type":"response.created","response":{}}"#))
+                    await connection.enqueue(.text(#"{"type":"\#(deltaType)","delta":"unattributed text"}"#))
+                    await connection.enqueue(.text(#"{"type":"response.done","response":{"status":"completed"}}"#))
+                case .textDelta:
+                    await connection.enqueue(.text(#"{"type":"response.created","response":{"id":"\#(responseID)"}}"#))
+                    await connection.enqueue(.text(#"{"type":"\#(deltaType)","delta":"unattributed text"}"#))
+                case .responseDone:
+                    await connection.enqueue(.text(#"{"type":"response.created","response":{"id":"\#(responseID)"}}"#))
+                    await connection.enqueue(.text(#"{"type":"\#(deltaType)","response_id":"\#(responseID)","delta":"text before unattributed completion"}"#))
+                    await connection.enqueue(.text(#"{"type":"response.done","response":{"status":"completed"}}"#))
+                }
+
+                #expect(await events.waitForCount(1))
+                #expect(await events.snapshot() == [
+                    .failure(sourceAlias: "audio-1", generation: 7, .malformedResponse),
+                ])
+                await driver.stop()
+                eventTask.cancel()
+                #expect(await recorder.outcome() == .succeeded)
+                await task.value
+            }
+        }
     }
 
     @Test func geminiGoAwayExpiresGenerationAndRejectsSameGenerationRestart() async throws {
@@ -1479,6 +1625,12 @@ private actor FakeRealtimeWebSocketConnection: RealtimeWebSocketConnection {
         guard let sendWaiter else { return }
         self.sendWaiter = nil
         sendWaiter.resume()
+    }
+
+    func failSuspendedSend() {
+        guard let sendWaiter else { return }
+        self.sendWaiter = nil
+        sendWaiter.resume(throwing: RealtimeTransportError.closed)
     }
 
     func waitUntilClosed() async -> Bool {
