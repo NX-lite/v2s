@@ -36,6 +36,7 @@ actor NativeRealtimeSessionDriver: RealtimeSessionDriving {
         var commitBoundaryFlushed = false
         var didReceiveCommitAcknowledgement = false
         var didReceiveGeminiTurnComplete = false
+        var didReceiveGeminiInterruption = false
         var didReceiveResponseCreated = false
         var text = ""
         var textWasTruncated = false
@@ -549,9 +550,14 @@ actor NativeRealtimeSessionDriver: RealtimeSessionDriving {
         drainTask = nil
         if !expectsCommitAcknowledgement {
             // Gemini has no commit acknowledgement; activityEnd starts its response turn.
-            state = .awaitingResponse
-            if pending.didReceiveGeminiTurnComplete {
-                finishCorrection(pending, operation: operation)
+            if pending.didReceiveGeminiInterruption {
+                pendingUtterance = nil
+                state = .ready
+            } else {
+                state = .awaitingResponse
+                if pending.didReceiveGeminiTurnComplete {
+                    finishCorrection(pending, operation: operation)
+                }
             }
         } else if pending.didReceiveCommitAcknowledgement {
             await sendResponseForCommitAcknowledgement(operation: operation)
@@ -566,6 +572,7 @@ actor NativeRealtimeSessionDriver: RealtimeSessionDriving {
             let committed: Bool
             var geminiTranscriptions: [String] = []
             var geminiTurnComplete = false
+            var geminiInterrupted = false
             switch settings.profile.provider {
             case .openAI, .xAI:
                 switch try OpenAIXAIRealtimeCodec.parse(message) {
@@ -602,16 +609,24 @@ actor NativeRealtimeSessionDriver: RealtimeSessionDriving {
                     return nil
                 }
                 geminiTurnComplete = events.contains(where: { $0 == .turnComplete })
+                geminiInterrupted = events.contains(where: { $0 == .interrupted })
                 committed = false
             }
             if settings.profile.provider == .gemini,
                var pending = pendingUtterance,
                pending.commitBoundarySendStarted,
                !pending.commitBoundaryFlushed {
-                for text in geminiTranscriptions {
-                    pending.appendText(text, limit: Self.maximumCorrectionTextLength)
+                if geminiInterrupted {
+                    pending.didReceiveGeminiInterruption = true
+                    pending.didReceiveGeminiTurnComplete = false
+                    pending.text = ""
+                    pending.textWasTruncated = false
+                } else if !pending.didReceiveGeminiInterruption {
+                    for text in geminiTranscriptions {
+                        pending.appendText(text, limit: Self.maximumCorrectionTextLength)
+                    }
+                    if geminiTurnComplete { pending.didReceiveGeminiTurnComplete = true }
                 }
-                if geminiTurnComplete { pending.didReceiveGeminiTurnComplete = true }
                 pendingUtterance = pending
                 return
             }

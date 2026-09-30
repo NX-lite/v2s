@@ -1032,6 +1032,67 @@ struct NativeRealtimeSessionDriverTests {
         #expect(await recorder.outcome() == .succeeded)
     }
 
+    @Test func geminiInterruptedTurnWithTurnCompleteCannotCorrectDuringActivityEndSend() async throws {
+        let connection = FakeRealtimeWebSocketConnection(suspendSendType: "activityEnd")
+        let connector = FakeRealtimeWebSocketConnector(profile: .geminiLive, connections: [connection])
+        let driver = NativeRealtimeSessionDriver(
+            settings: settings(profile: .geminiLive),
+            credential: "synthetic-key",
+            sourceRole: .microphone,
+            connector: connector,
+            setupTimeout: .seconds(1)
+        )
+        let (recorder, task) = launchStart(driver, alias: "audio-1", generation: 7)
+        #expect(await connection.waitUntilSentMessageCount(1))
+        await connection.enqueue(.text(#"{"setupComplete":{}}"#))
+        #expect(await recorder.waitForOutcome() == .succeeded)
+        await task.value
+        let (events, eventTask) = await recordEvents(from: driver)
+        try await driver.sendAudioChunk(makeChunk(generation: 7, timestamp: 100))
+        try await driver.commit(makeUtterance(generation: 7, start: 90, end: 200))
+        #expect(await connection.waitUntilSuspendedMessageTypeStarted("activityEnd"))
+        await connection.enqueue(.text(#"{"serverContent":{"outputTranscription":{"text":"cancelled words"},"interrupted":true,"turnComplete":true}}"#))
+        try await Task.sleep(for: .milliseconds(20))
+        #expect(await events.snapshot().isEmpty)
+
+        await connection.releaseSuspendedSend()
+        try await Task.sleep(for: .milliseconds(30))
+        #expect(await events.snapshot().isEmpty)
+        await driver.stop()
+        eventTask.cancel()
+    }
+
+    @Test func geminiInterruptedTurnIgnoresLaterTurnCompleteDuringActivityEndSend() async throws {
+        let connection = FakeRealtimeWebSocketConnection(suspendSendType: "activityEnd")
+        let connector = FakeRealtimeWebSocketConnector(profile: .geminiLive, connections: [connection])
+        let driver = NativeRealtimeSessionDriver(
+            settings: settings(profile: .geminiLive),
+            credential: "synthetic-key",
+            sourceRole: .microphone,
+            connector: connector,
+            setupTimeout: .seconds(1)
+        )
+        let (recorder, task) = launchStart(driver, alias: "audio-1", generation: 7)
+        #expect(await connection.waitUntilSentMessageCount(1))
+        await connection.enqueue(.text(#"{"setupComplete":{}}"#))
+        #expect(await recorder.waitForOutcome() == .succeeded)
+        await task.value
+        let (events, eventTask) = await recordEvents(from: driver)
+        try await driver.sendAudioChunk(makeChunk(generation: 7, timestamp: 100))
+        try await driver.commit(makeUtterance(generation: 7, start: 90, end: 200))
+        #expect(await connection.waitUntilSuspendedMessageTypeStarted("activityEnd"))
+        await connection.enqueue(.text(#"{"serverContent":{"outputTranscription":{"text":"cancelled words"},"interrupted":true}}"#))
+        await connection.enqueue(.text(#"{"serverContent":{"outputTranscription":{"text":"late words"},"turnComplete":true}}"#))
+        try await Task.sleep(for: .milliseconds(20))
+        #expect(await events.snapshot().isEmpty)
+
+        await connection.releaseSuspendedSend()
+        try await Task.sleep(for: .milliseconds(30))
+        #expect(await events.snapshot().isEmpty)
+        await driver.stop()
+        eventTask.cancel()
+    }
+
     @Test func geminiStopDuringActivityEndSendDiscardsDeferredTurn() async throws {
         let connection = FakeRealtimeWebSocketConnection(suspendSendType: "activityEnd")
         let connector = FakeRealtimeWebSocketConnector(profile: .geminiLive, connections: [connection])
