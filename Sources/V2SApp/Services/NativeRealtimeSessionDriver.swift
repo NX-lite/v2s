@@ -32,7 +32,9 @@ actor NativeRealtimeSessionDriver: RealtimeSessionDriving {
         let startMonotonicNanoseconds: UInt64
         let endMonotonicNanoseconds: UInt64
         var responseID: String?
+        var commitBoundarySendStarted = false
         var commitBoundaryFlushed = false
+        var didReceiveCommitAcknowledgement = false
         var didReceiveResponseCreated = false
         var text = ""
         var textWasTruncated = false
@@ -528,7 +530,10 @@ actor NativeRealtimeSessionDriver: RealtimeSessionDriving {
         }
         guard operationID == operation,
               state == .awaitingCommitAcknowledgement,
-              let connection else { return }
+              let connection,
+              var pending = pendingUtterance else { return }
+        pending.commitBoundarySendStarted = true
+        pendingUtterance = pending
         do {
             try await connection.send(boundary)
         } catch {
@@ -544,6 +549,8 @@ actor NativeRealtimeSessionDriver: RealtimeSessionDriving {
         if !expectsCommitAcknowledgement {
             // Gemini has no commit acknowledgement; activityEnd starts its response turn.
             state = .awaitingResponse
+        } else if pending.didReceiveCommitAcknowledgement {
+            await sendResponseForCommitAcknowledgement(operation: operation)
         }
     }
 
@@ -587,29 +594,44 @@ actor NativeRealtimeSessionDriver: RealtimeSessionDriving {
                 committed = false
             }
             if committed, state == .awaitingCommitAcknowledgement,
-               pendingUtterance?.commitBoundaryFlushed == true {
-                do {
-                    let responseRequest: RealtimeSocketMessage
-                    switch settings.profile.provider {
-                    case .openAI, .xAI:
-                        responseRequest = try OpenAIXAIRealtimeCodec.responseCreate(profile: settings.profile)
-                    case .qwen:
-                        responseRequest = try QwenRealtimeCodec.responseCreate()
-                    case .gemini:
-                        return
-                    }
-                    guard let connection else {
-                        await fail(.connectionFailed, operation: operation)
-                        return
-                    }
-                    state = .awaitingResponse
-                    try await connection.send(responseRequest)
-                } catch {
-                    await fail(.connectionFailed, operation: operation)
+               var pending = pendingUtterance,
+               pending.commitBoundarySendStarted,
+               !pending.didReceiveCommitAcknowledgement {
+                pending.didReceiveCommitAcknowledgement = true
+                pendingUtterance = pending
+                if pending.commitBoundaryFlushed {
+                    await sendResponseForCommitAcknowledgement(operation: operation)
                 }
             }
         } catch {
             await fail(.malformedResponse, operation: operation)
+        }
+    }
+
+    private func sendResponseForCommitAcknowledgement(operation: UInt64) async {
+        guard operationID == operation,
+              state == .awaitingCommitAcknowledgement,
+              let pending = pendingUtterance,
+              pending.commitBoundaryFlushed,
+              pending.didReceiveCommitAcknowledgement else { return }
+        do {
+            let responseRequest: RealtimeSocketMessage
+            switch settings.profile.provider {
+            case .openAI, .xAI:
+                responseRequest = try OpenAIXAIRealtimeCodec.responseCreate(profile: settings.profile)
+            case .qwen:
+                responseRequest = try QwenRealtimeCodec.responseCreate()
+            case .gemini:
+                return
+            }
+            guard let connection else {
+                await fail(.connectionFailed, operation: operation)
+                return
+            }
+            state = .awaitingResponse
+            try await connection.send(responseRequest)
+        } catch {
+            await fail(.connectionFailed, operation: operation)
         }
     }
 
@@ -799,7 +821,14 @@ actor NativeRealtimeSessionDriver: RealtimeSessionDriving {
             "i'd be happy to", "i would be happy to", "how can i help",
             "how can i assist", "let me know if you need", "let me know if i can",
         ]
-        return prefixes.contains(where: normalized.hasPrefix) || normalized.contains("\n")
+        let embeddedConversationalPhrases = [
+            "how can i help", "how can i assist", "can i help", "can i assist",
+            "i can help", "i can assist", "i'd be happy to", "i would be happy to",
+            "let me know if you need", "let me know if i can",
+        ]
+        return prefixes.contains(where: normalized.hasPrefix) ||
+            embeddedConversationalPhrases.contains(where: normalized.contains) ||
+            normalized.contains("\n")
     }
 
     private func audioMessage(

@@ -518,7 +518,7 @@ struct NativeRealtimeSessionDriverTests {
         #expect(response["output_modalities"] as? [String] == ["text"])
 
         await connection.enqueue(.text(#"{"type":"response.created","response":{"id":"resp_turn-42"}}"#))
-        await connection.enqueue(.text(#"{"type":"response.output_text.delta","response_id":"resp_turn-42","delta":"hello"}"#))
+        await connection.enqueue(.text(#"{"type":"response.output_text.delta","response_id":"resp_turn-42","delta":"Where is the next station?"}"#))
         try await Task.sleep(for: .milliseconds(10))
         #expect(await events.snapshot().isEmpty)
 
@@ -530,7 +530,7 @@ struct NativeRealtimeSessionDriverTests {
                 generation: 7,
                 captionID: captionID,
                 utteranceID: "turn-42",
-                text: "hello"
+                text: "Where is the next station?"
             ),
         ])
 
@@ -661,6 +661,7 @@ struct NativeRealtimeSessionDriverTests {
         let replies = [
             "Can I help you with anything else?",
             "I can help with that.",
+            "Hello! How can I help you today?",
         ]
         for (index, reply) in replies.enumerated() {
             let timestamp = UInt64(100 + index * 200)
@@ -704,29 +705,75 @@ struct NativeRealtimeSessionDriverTests {
         #expect(await recorder.waitForOutcome() == .succeeded)
         await task.value
 
+        // An ACK before this utterance's boundary send starts is stale and ignored.
+        await connection.enqueue(.text(#"{"type":"input_audio_buffer.committed"}"#))
+        try await Task.sleep(for: .milliseconds(20))
+        #expect(await connection.sentMessageTypes() == ["session.update"])
+
         try await driver.sendAudioChunk(makeChunk(generation: 7, timestamp: 100))
         try await driver.commit(makeUtterance(generation: 7, start: 90, end: 200))
         #expect(await connection.waitUntilSuspendedMessageTypeStarted("input_audio_buffer.commit"))
         #expect(await connection.sentMessageTypes() == [
-            "session.update", "input_audio_buffer.append",
+            "session.update", "input_audio_buffer.append", "input_audio_buffer.commit",
         ])
 
-        // A stale ACK re-enters the actor while the boundary send is suspended.
+        // The boundary is on wire, but send() has not returned to the actor yet.
         await connection.enqueue(.text(#"{"type":"input_audio_buffer.committed"}"#))
         try await Task.sleep(for: .milliseconds(20))
         #expect(await connection.sentMessageTypes() == [
-            "session.update", "input_audio_buffer.append",
+            "session.update", "input_audio_buffer.append", "input_audio_buffer.commit",
         ])
 
         await connection.releaseSuspendedSend()
         #expect(await connection.waitUntilSentMessageCount(3))
-        #expect(await connection.sentMessageTypes().last == "input_audio_buffer.commit")
-        // The provider's valid post-boundary ACK starts exactly one text response.
-        await connection.enqueue(.text(#"{"type":"input_audio_buffer.committed"}"#))
         #expect(await connection.waitUntilSentMessageCount(4))
         #expect(await connection.sentMessageTypes().last == "response.create")
 
         await driver.stop()
+    }
+
+    @Test func completedResponseWithAudioContentFailsEveryTextOnlyProvider() async throws {
+        for profile in [NativeRealtimeProfile.openAIMini, .xAIVoice, .qwenOmniFlash] {
+            let (driver, connection, recorder, task) = await makeReadyDriver(profile: profile)
+            let (events, eventTask) = await recordEvents(from: driver)
+            let responseID = "resp_audio_\(profile.provider.rawValue)"
+            try await driver.sendAudioChunk(makeChunk(generation: 7, timestamp: 100))
+            try await driver.commit(makeUtterance(generation: 7, start: 90, end: 200))
+            #expect(await connection.waitUntilSentMessageCount(3))
+            await connection.enqueue(.text(#"{"type":"input_audio_buffer.committed"}"#))
+            #expect(await connection.waitUntilSentMessageCount(4))
+            await connection.enqueue(.text(#"{"type":"response.created","response":{"id":"\#(responseID)"}}"#))
+            await connection.enqueue(.text(#"{"type":"response.output_text.delta","response_id":"\#(responseID)","delta":"must not apply"}"#))
+            await connection.enqueue(.text(#"{"type":"response.done","response":{"id":"\#(responseID)","status":"completed","output":[{"type":"message","content":[{"type":"audio","data":"AQID"}]}]}}"#))
+            #expect(await events.waitForCount(1))
+            #expect(await events.snapshot() == [
+                .failure(sourceAlias: "audio-1", generation: 7, .capabilityRejected),
+            ])
+
+            eventTask.cancel()
+            await driver.stop()
+            #expect(await recorder.outcome() == .succeeded)
+            await task.value
+        }
+    }
+
+    @Test func embeddedConversationalAnswerCannotOverwriteCaption() async throws {
+        let (driver, connection, recorder, task) = await makeReadyDriver(profile: .openAIMini)
+        let (events, eventTask) = await recordEvents(from: driver)
+        try await driver.sendAudioChunk(makeChunk(generation: 7, timestamp: 100))
+        try await driver.commit(makeUtterance(generation: 7, start: 90, end: 200))
+        #expect(await connection.waitUntilSentMessageCount(3))
+        await connection.enqueue(.text(#"{"type":"input_audio_buffer.committed"}"#))
+        #expect(await connection.waitUntilSentMessageCount(4))
+        await connection.enqueue(.text(#"{"type":"response.created","response":{"id":"resp_reply"}}"#))
+        await connection.enqueue(.text(#"{"type":"response.output_text.delta","response_id":"resp_reply","delta":"Hello! How can I help you today?"}"#))
+        await connection.enqueue(.text(#"{"type":"response.done","response":{"id":"resp_reply","status":"completed"}}"#))
+        try await Task.sleep(for: .milliseconds(20))
+        #expect(await events.snapshot().isEmpty)
+        await driver.stop()
+        eventTask.cancel()
+        #expect(await recorder.outcome() == .succeeded)
+        await task.value
     }
 
     @Test func cancelledQwenResponseCannotCorrectCaption() async throws {
@@ -1323,13 +1370,22 @@ private actor FakeRealtimeWebSocketConnection: RealtimeWebSocketConnection {
         guard !closed else { throw RealtimeTransportError.closed }
         sendStarted = true
         let messageType = Self.messageType(message)
+        let boundarySendIsSuspended = messageType == suspendSendType
+        if boundarySendIsSuspended {
+            // Model a frame that has reached the wire while its async send call
+            // has not yet returned to the actor.
+            sentMessages.append(message)
+            sentTypes.append(messageType)
+        }
         if suspendSend || messageType == suspendSendType {
             suspendedSendTypeStarted = messageType
             try await withCheckedThrowingContinuation { sendWaiter = $0 }
         }
         guard !closed else { throw RealtimeTransportError.closed }
-        sentMessages.append(message)
-        sentTypes.append(messageType)
+        if !boundarySendIsSuspended {
+            sentMessages.append(message)
+            sentTypes.append(messageType)
+        }
     }
 
     func receive() async throws -> RealtimeSocketMessage {

@@ -136,6 +136,9 @@ enum QwenRealtimeCodec {
                   response["status"] as? String == "completed" else {
                 return [.providerError]
             }
+            guard !RealtimeResponseMetadata.containsAudioOutput(response) else {
+                return [.audioOutputDetected]
+            }
             return [.responseComplete(responseID: responseID)]
         case "error":
             return [.providerError]

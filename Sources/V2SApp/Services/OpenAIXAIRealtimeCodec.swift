@@ -158,6 +158,9 @@ enum OpenAIXAIRealtimeCodec {
                   response["status"] as? String == "completed" else {
                 return .failure(.capabilityRejected)
             }
+            guard !RealtimeResponseMetadata.containsAudioOutput(response) else {
+                return .failure(.capabilityRejected)
+            }
             return .responseDone(responseID: responseID)
         case "error":
             let code = (object["error"] as? [String: Any])?["code"] as? String ?? ""
@@ -242,5 +245,48 @@ enum OpenAIXAIRealtimeCodec {
             return false
         }
         return alias == "audio-\(number)"
+    }
+}
+
+/// Inspects only bounded response structure; payload/media values are never retained.
+enum RealtimeResponseMetadata {
+    static func containsAudioOutput(_ response: [String: Any]) -> Bool {
+        let modalityKeys = ["modalities", "output_modalities", "response_modalities"]
+        for key in modalityKeys {
+            if let value = response[key], containsAudioLabel(value) { return true }
+        }
+
+        guard let output = response["output"] else { return false }
+        var pending: [Any] = [output]
+        var visited = 0
+        while let value = pending.popLast() {
+            visited += 1
+            guard visited <= 4_096 else { return true }
+            if let object = value as? [String: Any] {
+                for (key, child) in object {
+                    let normalizedKey = key.lowercased()
+                    if normalizedKey == "type" || normalizedKey == "modality" || normalizedKey == "mime_type" {
+                        if containsAudioLabel(child) { return true }
+                    }
+                    if normalizedKey == "audio" || normalizedKey == "output_audio" {
+                        return true
+                    }
+                    if child is [String: Any] || child is [Any] { pending.append(child) }
+                }
+            } else if let array = value as? [Any] {
+                pending.append(contentsOf: array)
+            }
+        }
+        return false
+    }
+
+    private static func containsAudioLabel(_ value: Any) -> Bool {
+        if let values = value as? [Any] {
+            return values.contains(where: containsAudioLabel)
+        }
+        guard let label = value as? String else { return false }
+        let normalized = label.lowercased()
+        return normalized == "audio" || normalized == "output_audio" ||
+            normalized.contains("audio/") || normalized.contains("_audio")
     }
 }
