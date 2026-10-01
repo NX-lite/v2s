@@ -62,6 +62,26 @@ struct RealtimePCM16AudioInput: Sendable {
     func nextChunk() async throws -> RealtimePCM16AudioChunk? {
         try await fanout.nextChunk()
     }
+
+    func finish(error: RealtimePCM16AudioStreamError? = nil) {
+        fanout.finish(error: error)
+    }
+
+    func waitUntilFinished() async -> RealtimePCM16AudioStreamError? {
+        await fanout.waitUntilFinished()
+    }
+
+    func isSameCapture(as other: RealtimePCM16AudioInput) -> Bool {
+        fanout === other.fanout
+    }
+
+    var isConsumed: Bool {
+        fanout.isConsumed
+    }
+
+    var terminationError: RealtimePCM16AudioStreamError? {
+        fanout.terminationError
+    }
 }
 
 /// A per-capture-generation bounded mailbox. Capturing only performs a short lock,
@@ -75,10 +95,12 @@ final class RealtimePCM16AudioFanout: @unchecked Sendable {
     private var chunks: [RealtimePCM16AudioChunk] = []
     private var bufferedFrames = 0
     private var didCreateInput = false
+    private var didFinishInput = false
     private var isClosed = false
     private var terminalError: RealtimePCM16AudioStreamError?
     private var readerIsActive = false
     private var waitingReader: CheckedContinuation<RealtimePCM16AudioChunk?, Error>?
+    private var finishWaiters: [UUID: CheckedContinuation<RealtimePCM16AudioStreamError?, Never>] = [:]
 
     let sourceToken: UUID
     let generation: UInt64
@@ -107,6 +129,37 @@ final class RealtimePCM16AudioFanout: @unchecked Sendable {
         lock.lock()
         defer { lock.unlock() }
         return !isClosed && didCreateInput
+    }
+
+    var isConsumed: Bool {
+        lock.lock()
+        defer { lock.unlock() }
+        return didFinishInput
+    }
+
+    var terminationError: RealtimePCM16AudioStreamError? {
+        lock.lock()
+        defer { lock.unlock() }
+        return terminalError
+    }
+
+    func waitUntilFinished() async -> RealtimePCM16AudioStreamError? {
+        let waiterID = UUID()
+        return await withTaskCancellationHandler {
+            await withCheckedContinuation { (continuation: CheckedContinuation<RealtimePCM16AudioStreamError?, Never>) in
+                lock.lock()
+                guard !isClosed, !Task.isCancelled else {
+                    let error = terminalError
+                    lock.unlock()
+                    continuation.resume(returning: error)
+                    return
+                }
+                finishWaiters[waiterID] = continuation
+                lock.unlock()
+            }
+        } onCancel: {
+            self.cancelFinishWaiter(waiterID)
+        }
     }
 
     @discardableResult
@@ -143,8 +196,11 @@ final class RealtimePCM16AudioFanout: @unchecked Sendable {
             bufferedFrames = 0
             let waiter = waitingReader
             waitingReader = nil
+            let finishWaiters = Array(self.finishWaiters.values)
+            self.finishWaiters.removeAll()
             lock.unlock()
             waiter?.resume(throwing: RealtimePCM16AudioStreamError.invalidAudioChunk)
+            finishWaiters.forEach { $0.resume(returning: .invalidAudioChunk) }
             return .invalidAudioChunk
         }
 
@@ -156,8 +212,11 @@ final class RealtimePCM16AudioFanout: @unchecked Sendable {
             bufferedFrames = 0
             let waiter = waitingReader
             waitingReader = nil
+            let finishWaiters = Array(self.finishWaiters.values)
+            self.finishWaiters.removeAll()
             lock.unlock()
             waiter?.resume(throwing: RealtimePCM16AudioStreamError.backpressureExceeded)
+            finishWaiters.forEach { $0.resume(returning: .backpressureExceeded) }
             return .backpressureExceeded
         }
 
@@ -183,8 +242,13 @@ final class RealtimePCM16AudioFanout: @unchecked Sendable {
 
     func finish(error: RealtimePCM16AudioStreamError? = nil) {
         lock.lock()
+        didFinishInput = true
+        let finishWaiters = Array(self.finishWaiters.values)
+        self.finishWaiters.removeAll()
         guard !isClosed else {
+            let finishError = terminalError
             lock.unlock()
+            finishWaiters.forEach { $0.resume(returning: finishError) }
             return
         }
         isClosed = true
@@ -200,6 +264,14 @@ final class RealtimePCM16AudioFanout: @unchecked Sendable {
         } else {
             waiter?.resume(returning: nil)
         }
+        finishWaiters.forEach { $0.resume(returning: error) }
+    }
+
+    private func cancelFinishWaiter(_ waiterID: UUID) {
+        lock.lock()
+        let waiter = finishWaiters.removeValue(forKey: waiterID)
+        lock.unlock()
+        waiter?.resume(returning: nil)
     }
 
     fileprivate func nextChunk() async throws -> RealtimePCM16AudioChunk? {
