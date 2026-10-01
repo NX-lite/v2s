@@ -32,6 +32,7 @@ private enum AppBuildInfo {
 final class AppModel: ObservableObject {
     private let settingsStore: SettingsStore
     private let sourceCatalogService: any SourceCatalogLoading
+    private let nativeRealtimeSessionCoordinator: NativeRealtimeSessionCoordinator
     let assistant: AssistantCoordinator
     let correction: RealtimeCorrectionCoordinator
     private var assistantSettingsCancellable: AnyCancellable?
@@ -46,6 +47,13 @@ final class AppModel: ObservableObject {
     private var liveTranscriptionSessionsBySourceID: [String: LiveTranscriptionSession] = [:]
     private var correctionSessionIsActive = false
     private var sessionLifecycleGeneration: Int = 0
+    private var nativeRealtimeDisclosureAcknowledgedForNextSession = false
+    private var nativeRealtimeInputsBySourceID: [String: RealtimePCM16AudioInput] = [:]
+    private var nativeRealtimeRevokingSourceIDs = Set<String>()
+    private var nativeRealtimeSourceStartupGenerations: [String: Int] = [:]
+    private var nativeRealtimeStartupTask: Task<[NativeRealtimeStartedSource], Never>?
+    private var nativeRealtimeStartupGeneration: Int = 0
+    private var nativeRealtimeSettingsGeneration: Int = 0
     // Sources whose capture actually started. A multi-source session tolerates inputs
     // that fail to open, so this can be a subset of `selectedSources` while running.
     private var activeSources: [InputSource] = []
@@ -98,6 +106,7 @@ final class AppModel: ObservableObject {
     @Published private(set) var microphoneSources: [InputSource] = []
     @Published private(set) var sessionState: SessionState = .idle
     @Published private(set) var statusMessage = ""
+    @Published private(set) var nativeRealtimeSourceStatuses: [String: String] = [:]
     @Published private(set) var overlayState: OverlayPreviewState?
     @Published private(set) var languageResourceStatuses: [LanguageResourceStatus] = []
     @Published private(set) var speechLanguageOptions = LanguageCatalog.speechInput
@@ -212,6 +221,12 @@ final class AppModel: ObservableObject {
         didSet {
             guard oldValue != nativeRealtimeSettings else { return }
             persistSettings()
+            nativeRealtimeSettingsGeneration &+= 1
+            // A disclosure acknowledgement describes the configuration the user
+            // just reviewed. Do not carry it across any native configuration edit
+            // while the app is idle or a session is still preparing.
+            nativeRealtimeDisclosureAcknowledgedForNextSession = false
+            nativeRealtimeSettingsDidChange(oldValue)
         }
     }
 
@@ -219,13 +234,17 @@ final class AppModel: ObservableObject {
         settingsStore: SettingsStore,
         sourceCatalogService: any SourceCatalogLoading,
         assistant: AssistantCoordinator? = nil,
-        correction: RealtimeCorrectionCoordinator? = nil
+        correction: RealtimeCorrectionCoordinator? = nil,
+        nativeRealtimeSessionCoordinator: NativeRealtimeSessionCoordinator? = nil,
+        refreshLanguageCatalogs: Bool = true
     ) {
         let settings = settingsStore.load()
         self.settingsStore = settingsStore
         self.sourceCatalogService = sourceCatalogService
         self.assistant = assistant ?? AssistantCoordinator(settings: settings.assistant)
         self.correction = correction ?? RealtimeCorrectionCoordinator(settings: settings.correction)
+        self.nativeRealtimeSessionCoordinator = nativeRealtimeSessionCoordinator
+            ?? NativeRealtimeSessionCoordinator()
         self.previousCorrectionSettings = self.correction.settings
 
         self.selectedSourceID = settings.selectedSourceID
@@ -268,7 +287,9 @@ final class AppModel: ObservableObject {
             persistSettings()
         }
         refreshSources()
-        refreshSupportedLanguageOptions()
+        if refreshLanguageCatalogs {
+            refreshSupportedLanguageOptions()
+        }
 
         assistantSettingsCancellable = self.assistant.$settings
             .dropFirst()
@@ -297,6 +318,12 @@ final class AppModel: ObservableObject {
     }
 
     isolated deinit {
+        nativeRealtimeStartupTask?.cancel()
+        for input in nativeRealtimeInputsBySourceID.values {
+            input.finish(error: .sourceSuperseded)
+        }
+        let nativeCoordinator = nativeRealtimeSessionCoordinator
+        Task { await nativeCoordinator.stop() }
         correction.onResult = nil
         if correctionSessionIsActive {
             correction.endSession()
@@ -661,11 +688,18 @@ final class AppModel: ObservableObject {
     }
 
     func startSession() async {
+        let nativeRealtimeDisclosureAuthorized = nativeRealtimeDisclosureAcknowledgedForNextSession
+        let nativeRealtimeDisclosureSettingsGeneration = nativeRealtimeSettingsGeneration
+        nativeRealtimeDisclosureAcknowledgedForNextSession = false
+        nativeRealtimeSourceStatuses.removeAll()
+        nativeRealtimeRevokingSourceIDs.removeAll()
+        nativeRealtimeSourceStartupGenerations.removeAll()
         sessionLifecycleGeneration &+= 1
         let lifecycleGeneration = sessionLifecycleGeneration
         assistant.resetForNewSession()
         // Finish releasing any earlier capture resources before opening replacements.
         endCorrectionSessionAndClearLiveAudio()
+        await nativeRealtimeSessionCoordinator.stop()
         await stopLiveTranscriptionSessionsAndWait()
         guard sessionLifecycleGeneration == lifecycleGeneration else {
             return
@@ -879,6 +913,13 @@ final class AppModel: ObservableObject {
                 )
                 overlayHistoryScrollOffset = 0
             }
+            await startNativeRealtimeSources(
+                sessions: startedSessions,
+                sources: startedSources,
+                lifecycleGeneration: lifecycleGeneration,
+                disclosureAuthorized: nativeRealtimeDisclosureAuthorized,
+                disclosureSettingsGeneration: nativeRealtimeDisclosureSettingsGeneration
+            )
             return
         }
 
@@ -1075,10 +1116,28 @@ final class AppModel: ObservableObject {
         )
 
         for (sourceID, session) in liveTranscriptionSessionsBySourceID {
-            let wasEnabled = previous.isEnabled(for: sourceID)
-            let isEnabled = settings.isEnabled(for: sourceID)
-            if wasEnabled != isEnabled {
-                session.setCorrectionAudioCaptureEnabled(isEnabled)
+            let previousMode = CaptionEnhancementPolicy.mode(
+                for: sourceID,
+                correction: previous,
+                nativeRealtime: nativeRealtimeSettings
+            )
+            let currentMode = CaptionEnhancementPolicy.mode(
+                for: sourceID,
+                correction: settings,
+                nativeRealtime: nativeRealtimeSettings
+            )
+            if previousMode != currentMode {
+                if previousMode == .sentenceCorrection && currentMode != .sentenceCorrection {
+                    correction.cancel(sourceID: sourceID)
+                    invalidatePendingCorrectionAudio(for: sourceID)
+                }
+                if currentMode == .sentenceCorrection, !correctionSessionIsActive {
+                    beginCorrectionSession()
+                }
+                session.setCorrectionAudioCaptureEnabled(
+                    currentMode == .sentenceCorrection
+                        && !nativeRealtimeRevokingSourceIDs.contains(sourceID)
+                )
             }
         }
 
@@ -1127,6 +1186,7 @@ final class AppModel: ObservableObject {
     }
 
     private func endCorrectionSessionAndClearLiveAudio() {
+        stopNativeRealtimeSessions()
         correction.endSession()
         correctionSessionIsActive = false
         invalidateProviderAudioTransitions()
@@ -1137,12 +1197,276 @@ final class AppModel: ObservableObject {
         liveTranscriptionSessionsBySourceID.removeAll()
     }
 
+    /// The settings UI must call this only after showing the current session's
+    /// recipients, native source count, and cost disclosure. Authorization is consumed
+    /// by the next capture start and is never persisted.
+    func acknowledgeNativeRealtimeDisclosureForNextSession() {
+        nativeRealtimeDisclosureAcknowledgedForNextSession = true
+    }
+
+    private func nativeRealtimeSettingsDidChange(_ previous: NativeRealtimeSettings) {
+        guard sessionState == .running else { return }
+        for source in activeSources {
+            guard let session = liveTranscriptionSessionsBySourceID[source.id] else { continue }
+            let previousMode = CaptionEnhancementPolicy.mode(
+                for: source.id,
+                correction: correction.settings,
+                nativeRealtime: previous
+            )
+            let currentMode = CaptionEnhancementPolicy.mode(
+                for: source.id,
+                correction: correction.settings,
+                nativeRealtime: nativeRealtimeSettings
+            )
+            // Configuration edits to an active native source revoke it too. A new
+            // session, with a fresh disclosure acknowledgement, is required to apply
+            // the new provider, profile, or credential.
+            let nativeConfigurationChanged = (
+                previous.profile != nativeRealtimeSettings.profile
+                    || previous.region != nativeRealtimeSettings.region
+                    || previous.credentialReference != nativeRealtimeSettings.credentialReference
+                    || previous.qwenWorkspaceID != nativeRealtimeSettings.qwenWorkspaceID
+            ) && (previousMode == .nativeRealtime || currentMode == .nativeRealtime)
+            guard previousMode != currentMode || nativeConfigurationChanged else { continue }
+
+            // Revoke PCM synchronously, before the actor can stop its driver. Until
+            // that stop completes, a source cannot enter legacy correction either.
+            nativeRealtimeSourceStartupGenerations[source.id, default: 0] &+= 1
+            let sourceStartupGeneration = nativeRealtimeSourceStartupGenerations[source.id, default: 0]
+            nativeRealtimeRevokingSourceIDs.insert(source.id)
+            correction.cancel(sourceID: source.id)
+            invalidatePendingCorrectionAudio(for: source.id)
+            if let input = nativeRealtimeInputsBySourceID.removeValue(forKey: source.id) {
+                input.finish(error: .sourceSuperseded)
+            }
+            session.setCorrectionAudioCaptureEnabled(false)
+
+            let sourceID = source.id
+            let lifecycleGeneration = sessionLifecycleGeneration
+            let coordinator = nativeRealtimeSessionCoordinator
+            Task { [weak self] in
+                await coordinator.removeSource(sourceID: sourceID)
+                guard let self,
+                      self.sessionLifecycleGeneration == lifecycleGeneration,
+                      self.nativeRealtimeSourceStartupGenerations[sourceID, default: 0]
+                        == sourceStartupGeneration,
+                      self.activeSources.contains(where: { $0.id == sourceID }),
+                      self.liveTranscriptionSessionsBySourceID[sourceID] === session else { return }
+                self.nativeRealtimeRevokingSourceIDs.remove(sourceID)
+                let mode = CaptionEnhancementPolicy.mode(
+                    for: sourceID,
+                    correction: self.correction.settings,
+                    nativeRealtime: self.nativeRealtimeSettings
+                )
+                if mode == .sentenceCorrection, !self.correctionSessionIsActive {
+                    self.beginCorrectionSession()
+                }
+                session.setCorrectionAudioCaptureEnabled(mode == .sentenceCorrection)
+            }
+        }
+    }
+
+    private func recordNativeRealtimeFailure(
+        _ code: RealtimeFailureCode,
+        sourceID: String
+    ) {
+        guard let source = activeSources.first(where: { $0.id == sourceID }) else { return }
+        guard CaptionEnhancementPolicy.mode(
+            for: sourceID,
+            correction: correction.settings,
+            nativeRealtime: nativeRealtimeSettings
+        ) == .nativeRealtime else { return }
+        let message: String
+        if code == .invalidConfiguration {
+            message = localized(.nativeRealtimeCredentialUnavailableFormat, source.name)
+        } else {
+            message = localized(.nativeRealtimeUnavailableFormat, source.name)
+        }
+        nativeRealtimeSourceStatuses[sourceID] = message
+        if sessionState == .running {
+            setStatus(.custom(message))
+        }
+    }
+
+    private func stopNativeRealtimeSessions() {
+        nativeRealtimeDisclosureAcknowledgedForNextSession = false
+        nativeRealtimeStartupGeneration &+= 1
+        nativeRealtimeStartupTask?.cancel()
+        nativeRealtimeStartupTask = nil
+        nativeRealtimeInputsBySourceID.values.forEach {
+            $0.finish(error: .sourceSuperseded)
+        }
+        nativeRealtimeInputsBySourceID.removeAll()
+        nativeRealtimeRevokingSourceIDs.removeAll()
+        let coordinator = nativeRealtimeSessionCoordinator
+        Task { await coordinator.stop() }
+    }
+
+    private func startNativeRealtimeSources(
+        sessions: [LiveTranscriptionSession],
+        sources: [InputSource],
+        lifecycleGeneration: Int,
+        disclosureAuthorized: Bool,
+        disclosureSettingsGeneration: Int
+    ) async {
+        let settingsSnapshot = nativeRealtimeSettings
+        guard disclosureAuthorized,
+              settingsSnapshot.isEnabled,
+              nativeRealtimeSettingsGeneration == disclosureSettingsGeneration else { return }
+
+        // Bind every source to the generation at the start of this operation.
+        // A settings/profile change during an await must invalidate the entire
+        // pending batch, not let a later source adopt the newer generation
+        // while still using this batch's stale disclosure/settings snapshot.
+        var initialSourceStartupGenerations: [String: Int] = [:]
+        for source in sources {
+            initialSourceStartupGenerations[source.id] =
+                nativeRealtimeSourceStartupGenerations[source.id, default: 0]
+        }
+
+        var captures: [NativeRealtimeCaptureSource] = []
+        for (session, source) in zip(sessions, sources) {
+            guard sessionLifecycleGeneration == lifecycleGeneration else {
+                captures.forEach { $0.input.finish(error: .sourceSuperseded) }
+                return
+            }
+            guard CaptionEnhancementPolicy.mode(
+                for: source.id,
+                correction: correction.settings,
+                nativeRealtime: settingsSnapshot
+            ) == .nativeRealtime else {
+                continue
+            }
+            let sourceStartupGeneration = initialSourceStartupGenerations[source.id, default: 0]
+
+            correction.cancel(sourceID: source.id)
+            invalidatePendingCorrectionAudio(for: source.id)
+            await session.resetCorrectionAudioCapture(enabled: false)
+            guard isCurrentNativeRealtimeSourceStart(
+                sourceID: source.id,
+                sourceStartupGeneration: sourceStartupGeneration,
+                lifecycleGeneration: lifecycleGeneration,
+                disclosureSettingsGeneration: disclosureSettingsGeneration
+            ) else { continue }
+            guard let input = await session.makeRealtimePCM16AudioInput() else {
+                continue
+            }
+            guard isCurrentNativeRealtimeSourceStart(
+                sourceID: source.id,
+                sourceStartupGeneration: sourceStartupGeneration,
+                lifecycleGeneration: lifecycleGeneration,
+                disclosureSettingsGeneration: disclosureSettingsGeneration
+            ) else {
+                input.finish(error: .sourceSuperseded)
+                continue
+            }
+            let role: RealtimeAudioSourceRole
+            switch source.category {
+            case .microphone: role = .microphone
+            case .application: role = .applicationAudio
+            }
+            let capture = NativeRealtimeCaptureSource(
+                sourceID: source.id,
+                role: role,
+                input: input
+            )
+            captures.append(capture)
+            nativeRealtimeInputsBySourceID[source.id] = input
+        }
+
+        guard sessionLifecycleGeneration == lifecycleGeneration else {
+            captures.forEach { $0.input.finish(error: .sourceSuperseded) }
+            return
+        }
+        guard captures.isEmpty == false else { return }
+
+        nativeRealtimeStartupGeneration &+= 1
+        let startupGeneration = nativeRealtimeStartupGeneration
+        let sourceStartupGenerations = Dictionary(uniqueKeysWithValues: captures.map {
+            ($0.sourceID, initialSourceStartupGenerations[$0.sourceID, default: 0])
+        })
+        await nativeRealtimeSessionCoordinator.setSourceFailureHandler { [weak self] sourceID, code in
+            Task { @MainActor [weak self] in
+                guard let self,
+                      let expectedSourceGeneration = sourceStartupGenerations[sourceID],
+                      self.sessionLifecycleGeneration == lifecycleGeneration,
+                      self.nativeRealtimeStartupGeneration == startupGeneration,
+                      self.nativeRealtimeSourceStartupGenerations[sourceID, default: 0]
+                        == expectedSourceGeneration,
+                      !self.nativeRealtimeRevokingSourceIDs.contains(sourceID) else { return }
+                self.recordNativeRealtimeFailure(code, sourceID: sourceID)
+            }
+        }
+        let eligibleCaptures = captures.filter { capture in
+            isCurrentNativeRealtimeSourceStart(
+                sourceID: capture.sourceID,
+                sourceStartupGeneration: sourceStartupGenerations[capture.sourceID, default: -1],
+                lifecycleGeneration: lifecycleGeneration,
+                disclosureSettingsGeneration: disclosureSettingsGeneration
+            )
+                && CaptionEnhancementPolicy.mode(
+                    for: capture.sourceID,
+                    correction: correction.settings,
+                    nativeRealtime: nativeRealtimeSettings
+                ) == .nativeRealtime
+        }
+        let eligibleSourceIDs = Set(eligibleCaptures.map(\.sourceID))
+        for capture in captures where !eligibleSourceIDs.contains(capture.sourceID) {
+            capture.input.finish(error: .sourceSuperseded)
+            if nativeRealtimeInputsBySourceID[capture.sourceID]?.isSameCapture(as: capture.input) == true {
+                nativeRealtimeInputsBySourceID.removeValue(forKey: capture.sourceID)
+            }
+        }
+        guard eligibleCaptures.isEmpty == false,
+              sessionLifecycleGeneration == lifecycleGeneration,
+              nativeRealtimeStartupGeneration == startupGeneration else { return }
+        let coordinator = nativeRealtimeSessionCoordinator
+        let task = Task {
+            await coordinator.start(captures: eligibleCaptures, settings: settingsSnapshot)
+        }
+        nativeRealtimeStartupTask = task
+        let started = await task.value
+        guard nativeRealtimeStartupGeneration == startupGeneration else { return }
+        nativeRealtimeStartupTask = nil
+
+        let startedSourceIDs = Set(started.map(\.sourceID))
+        for capture in captures where !startedSourceIDs.contains(capture.sourceID) {
+            capture.input.finish(error: .sourceSuperseded)
+            if nativeRealtimeInputsBySourceID[capture.sourceID]?.isSameCapture(as: capture.input) == true {
+                nativeRealtimeInputsBySourceID.removeValue(forKey: capture.sourceID)
+            }
+        }
+    }
+
+    private func isCurrentNativeRealtimeSourceStart(
+        sourceID: String,
+        sourceStartupGeneration: Int,
+        lifecycleGeneration: Int,
+        disclosureSettingsGeneration: Int
+    ) -> Bool {
+        sessionLifecycleGeneration == lifecycleGeneration
+            && nativeRealtimeSettingsGeneration == disclosureSettingsGeneration
+            && nativeRealtimeSourceStartupGenerations[sourceID, default: 0] == sourceStartupGeneration
+            && !nativeRealtimeRevokingSourceIDs.contains(sourceID)
+            && CaptionEnhancementPolicy.mode(
+                for: sourceID,
+                correction: correction.settings,
+                nativeRealtime: nativeRealtimeSettings
+            ) == .nativeRealtime
+    }
+
     private func registerCorrectionAudioControl(
         _ session: LiveTranscriptionSession,
         sourceID: String
     ) {
         liveTranscriptionSessionsBySourceID[sourceID] = session
-        session.setCorrectionAudioCaptureEnabled(correction.settings.isEnabled(for: sourceID))
+        session.setCorrectionAudioCaptureEnabled(
+            CaptionEnhancementPolicy.mode(
+                for: sourceID,
+                correction: correction.settings,
+                nativeRealtime: nativeRealtimeSettings
+            ) == .sentenceCorrection
+        )
     }
 
     private func beginProviderAudioTransition() {
@@ -1168,9 +1492,17 @@ final class AppModel: ObservableObject {
                 guard providerAudioTransitionTokensBySourceID[sourceID] == transitionToken else {
                     continue
                 }
-                await session.resetCorrectionAudioCapture(
-                    enabled: correction.settings.isEnabled(for: sourceID)
-                )
+                await session.resetCorrectionAudioCapture(enabled: false)
+                guard providerAudioTransitionTokensBySourceID[sourceID] == transitionToken,
+                      liveTranscriptionSessionsBySourceID[sourceID] === session else {
+                    continue
+                }
+                let captureLegacyCorrectionAudio = CaptionEnhancementPolicy.mode(
+                    for: sourceID,
+                    correction: correction.settings,
+                    nativeRealtime: nativeRealtimeSettings
+                ) == .sentenceCorrection && !nativeRealtimeRevokingSourceIDs.contains(sourceID)
+                session.setCorrectionAudioCaptureEnabled(captureLegacyCorrectionAudio)
             }
 
             for sourceID in sessions.keys
@@ -3027,7 +3359,12 @@ final class AppModel: ObservableObject {
         for caption: QueuedCaption,
         localTranslation: String
     ) {
-        guard correction.settings.isEnabled(for: caption.sourceID) else { return }
+        guard CaptionEnhancementPolicy.mode(
+            for: caption.sourceID,
+            correction: correction.settings,
+            nativeRealtime: nativeRealtimeSettings
+        ) == .sentenceCorrection,
+        !nativeRealtimeRevokingSourceIDs.contains(caption.sourceID) else { return }
         guard submittedCorrectionSourceIDsByCaptionID[caption.id] == nil else { return }
         submittedCorrectionSourceIDsByCaptionID[caption.id] = caption.sourceID
 

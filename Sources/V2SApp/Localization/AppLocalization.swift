@@ -178,6 +178,8 @@ enum AppTextKey: String {
     case isolatedCorrectionContext
     case correctionQueueSkipped
     case invalidCorrectionConfiguration
+    case nativeRealtimeUnavailableFormat
+    case nativeRealtimeCredentialUnavailableFormat
     case correctionProviderFailure
     case correctionAudioFallback
     case correctionPrivacyDisclosure
@@ -641,6 +643,8 @@ enum AppLocalization {
             "isolatedCorrectionContext": "Isolated Context",
             "correctionQueueSkipped": "A correction was skipped because the queue is full.",
             "invalidCorrectionConfiguration": "Real-time correction settings are invalid.",
+            "nativeRealtimeUnavailableFormat": "Native realtime is unavailable for %@. Local captions continue.",
+            "nativeRealtimeCredentialUnavailableFormat": "Native realtime could not start for %@. Check its saved credential. Local captions continue.",
             "correctionProviderFailure": "Real-time correction failed.",
             "correctionAudioFallback": "Audio correction is unavailable; using text translation correction.",
             "correctionPrivacyDisclosure": "While enabled, completed sentence audio, local subtitle text, language metadata, source labels, and corrected context are continuously sent to your configured provider for correction. Screenshots are never included. The API key stays in local settings.",
@@ -850,6 +854,8 @@ enum AppLocalization {
             "isolatedCorrectionContext": "独立上下文",
             "correctionQueueSkipped": "纠错队列已满，已跳过一次纠错。",
             "invalidCorrectionConfiguration": "实时纠错配置无效。",
+            "nativeRealtimeUnavailableFormat": "%@ 的原生实时服务不可用。本地字幕会继续。",
+            "nativeRealtimeCredentialUnavailableFormat": "无法为 %@ 启动原生实时服务。请检查已保存的凭据。本地字幕会继续。",
             "correctionProviderFailure": "实时纠错失败。",
             "correctionAudioFallback": "音频纠错不可用，已改用文本翻译纠错。",
             "correctionPrivacyDisclosure": "启用后，已完成句子的音频、本地字幕文本、语言元数据、来源标签和纠正后的上下文会持续发送给你配置的提供商进行纠错。绝不会包含屏幕截图。API 密钥仅保存在本地设置中。",
@@ -1059,6 +1065,8 @@ enum AppLocalization {
             "isolatedCorrectionContext": "Contexto aislado",
             "correctionQueueSkipped": "Se omitió una corrección porque la cola está llena.",
             "invalidCorrectionConfiguration": "La configuración de corrección en tiempo real no es válida.",
+            "nativeRealtimeUnavailableFormat": "La función nativa en tiempo real no está disponible para %@. Los subtítulos locales continúan.",
+            "nativeRealtimeCredentialUnavailableFormat": "No se pudo iniciar la función nativa en tiempo real para %@. Comprueba la credencial guardada. Los subtítulos locales continúan.",
             "correctionProviderFailure": "La corrección en tiempo real ha fallado.",
             "correctionAudioFallback": "La corrección de audio no está disponible; se usará la corrección de traducción de texto.",
             "correctionPrivacyDisclosure": "Mientras está activada, el audio de las frases completadas, el texto local de los subtítulos, los metadatos de idioma, las etiquetas de origen y el contexto corregido se envían continuamente al proveedor configurado para su corrección. Nunca se incluyen capturas de pantalla. La clave de API permanece en los ajustes locales.",
@@ -1268,6 +1276,8 @@ enum AppLocalization {
             "isolatedCorrectionContext": "Isolierter Kontext",
             "correctionQueueSkipped": "Eine Korrektur wurde übersprungen, weil die Warteschlange voll ist.",
             "invalidCorrectionConfiguration": "Die Einstellungen für die Echtzeitkorrektur sind ungültig.",
+            "nativeRealtimeUnavailableFormat": "Echtzeitkorrektur ist für %@ nicht verfügbar. Lokale Untertitel werden fortgesetzt.",
+            "nativeRealtimeCredentialUnavailableFormat": "Echtzeitkorrektur konnte für %@ nicht gestartet werden. Prüfe die gespeicherten Zugangsdaten. Lokale Untertitel werden fortgesetzt.",
             "correctionProviderFailure": "Die Echtzeitkorrektur ist fehlgeschlagen.",
             "correctionAudioFallback": "Audiokorrektur ist nicht verfügbar; stattdessen wird die Textübersetzung korrigiert.",
             "correctionPrivacyDisclosure": "Wenn aktiviert, werden das Audio abgeschlossener Sätze, lokaler Untertiteltext, Sprachmetadaten, Quellenbezeichnungen und korrigierter Kontext fortlaufend zur Korrektur an den konfigurierten Anbieter gesendet. Screenshots werden niemals einbezogen. Der API-Schlüssel bleibt in den lokalen Einstellungen.",
@@ -1477,6 +1487,8 @@ enum AppLocalization {
             "isolatedCorrectionContext": "独立したコンテキスト",
             "correctionQueueSkipped": "キューがいっぱいのため、補正を1件スキップしました。",
             "invalidCorrectionConfiguration": "リアルタイム補正の設定が無効です。",
+            "nativeRealtimeUnavailableFormat": "%@ ではネイティブリアルタイム機能を利用できません。ローカル字幕は続行されます。",
+            "nativeRealtimeCredentialUnavailableFormat": "%@ でネイティブリアルタイム機能を開始できません。保存済みの認証情報を確認してください。ローカル字幕は続行されます。",
             "correctionProviderFailure": "リアルタイム補正に失敗しました。",
             "correctionAudioFallback": "音声補正を利用できないため、テキスト翻訳補正を使用します。",
             "correctionPrivacyDisclosure": "有効にすると、完了した文の音声、ローカル字幕テキスト、言語メタデータ、ソースラベル、補正済みコンテキストが、補正のため設定済みプロバイダーへ継続的に送信されます。スクリーンショットは一切含まれません。API キーはローカル設定に保存されます。",
@@ -1686,6 +1698,8 @@ enum AppLocalization {
             "isolatedCorrectionContext": "Contexte isolé",
             "correctionQueueSkipped": "Une correction a été ignorée car la file d’attente est pleine.",
             "invalidCorrectionConfiguration": "Les réglages de correction en temps réel ne sont pas valides.",
+            "nativeRealtimeUnavailableFormat": "Le temps réel natif est indisponible pour %@. Les sous-titres locaux continuent.",
+            "nativeRealtimeCredentialUnavailableFormat": "Le temps réel natif n’a pas pu démarrer pour %@. Vérifiez l’identifiant enregistré. Les sous-titres locaux continuent.",
             "correctionProviderFailure": "La correction en temps réel a échoué.",
             "correctionAudioFallback": "La correction audio est indisponible ; la correction de la traduction du texte sera utilisée.",
             "correctionPrivacyDisclosure": "Lorsqu’elle est activée, l’audio des phrases terminées, le texte local des sous-titres, les métadonnées linguistiques, les libellés des sources et le contexte corrigé sont envoyés en continu au fournisseur configuré pour correction. Les captures d’écran ne sont jamais incluses. La clé API reste dans les réglages locaux.",
@@ -1895,6 +1909,8 @@ enum AppLocalization {
             "isolatedCorrectionContext": "격리된 컨텍스트",
             "correctionQueueSkipped": "대기열이 가득 차 교정 하나를 건너뛰었습니다.",
             "invalidCorrectionConfiguration": "실시간 교정 설정이 올바르지 않습니다.",
+            "nativeRealtimeUnavailableFormat": "%@에서 네이티브 실시간 기능을 사용할 수 없습니다. 로컬 자막은 계속됩니다.",
+            "nativeRealtimeCredentialUnavailableFormat": "%@에서 네이티브 실시간 기능을 시작할 수 없습니다. 저장된 인증 정보를 확인하세요. 로컬 자막은 계속됩니다.",
             "correctionProviderFailure": "실시간 교정에 실패했습니다.",
             "correctionAudioFallback": "오디오 교정을 사용할 수 없어 텍스트 번역 교정을 사용합니다.",
             "correctionPrivacyDisclosure": "활성화하면 완료된 문장의 오디오, 로컬 자막 텍스트, 언어 메타데이터, 소스 레이블 및 교정된 문맥이 교정을 위해 설정된 제공업체로 계속 전송됩니다. 스크린샷은 절대 포함되지 않습니다. API 키는 로컬 설정에 보관됩니다.",
@@ -2104,6 +2120,8 @@ enum AppLocalization {
             "isolatedCorrectionContext": "سياق معزول",
             "correctionQueueSkipped": "تم تخطي تصحيح لأن قائمة الانتظار ممتلئة.",
             "invalidCorrectionConfiguration": "إعدادات التصحيح في الوقت الفعلي غير صالحة.",
+            "nativeRealtimeUnavailableFormat": "الوقت الفعلي الأصلي غير متاح لـ %@. ستستمر الترجمة النصية المحلية.",
+            "nativeRealtimeCredentialUnavailableFormat": "تعذر بدء الوقت الفعلي الأصلي لـ %@. تحقق من بيانات الاعتماد المحفوظة. ستستمر الترجمة النصية المحلية.",
             "correctionProviderFailure": "فشل التصحيح في الوقت الفعلي.",
             "correctionAudioFallback": "تصحيح الصوت غير متاح؛ سيُستخدم تصحيح ترجمة النص.",
             "correctionPrivacyDisclosure": "عند التمكين، يُرسل صوت الجمل المكتملة ونص الترجمة المصاحبة المحلي والبيانات الوصفية للغة وتسميات المصادر والسياق المصحح باستمرار إلى الموفّر الذي أعددته للتصحيح. لا تُضمّن لقطات الشاشة مطلقًا. يبقى مفتاح API في الإعدادات المحلية.",
@@ -2313,6 +2331,8 @@ enum AppLocalization {
             "isolatedCorrectionContext": "Contexto isolado",
             "correctionQueueSkipped": "Uma correção foi ignorada porque a fila está cheia.",
             "invalidCorrectionConfiguration": "As configurações de correção em tempo real são inválidas.",
+            "nativeRealtimeUnavailableFormat": "O recurso nativo em tempo real está indisponível para %@. As legendas locais continuam.",
+            "nativeRealtimeCredentialUnavailableFormat": "Não foi possível iniciar o recurso nativo em tempo real para %@. Verifique a credencial salva. As legendas locais continuam.",
             "correctionProviderFailure": "A correção em tempo real falhou.",
             "correctionAudioFallback": "A correção de áudio não está disponível; será usada a correção da tradução de texto.",
             "correctionPrivacyDisclosure": "Quando ativada, o áudio das frases concluídas, o texto local das legendas, os metadados de idioma, os rótulos de origem e o contexto corrigido são enviados continuamente ao provedor configurado para correção. Capturas de tela nunca são incluídas. A chave de API permanece nas configurações locais.",
@@ -2522,6 +2542,8 @@ enum AppLocalization {
             "isolatedCorrectionContext": "Изолированный контекст",
             "correctionQueueSkipped": "Одно исправление пропущено, потому что очередь заполнена.",
             "invalidCorrectionConfiguration": "Параметры исправления в реальном времени недействительны.",
+            "nativeRealtimeUnavailableFormat": "Собственная передача в реальном времени для источника «%@» недоступна. Локальные субтитры продолжают работать.",
+            "nativeRealtimeCredentialUnavailableFormat": "Не удалось запустить собственную передачу в реальном времени для источника «%@». Проверьте сохранённые учётные данные. Локальные субтитры продолжают работать.",
             "correctionProviderFailure": "Не удалось выполнить исправление в реальном времени.",
             "correctionAudioFallback": "Исправление по аудио недоступно; используется исправление перевода текста.",
             "correctionPrivacyDisclosure": "Когда функция включена, аудио завершённых предложений, локальный текст субтитров, языковые метаданные, метки источников и исправленный контекст непрерывно отправляются настроенному поставщику для исправления. Снимки экрана никогда не включаются. Ключ API остаётся в локальных настройках.",

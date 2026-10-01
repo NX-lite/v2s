@@ -35,15 +35,22 @@ actor NativeRealtimeSessionCoordinator {
         let lease: RealtimeReaderLease
     }
 
+    private struct StoppingSource {
+        let generation: Int
+        let task: Task<Void, Never>
+    }
+
     private let credentialStore: RealtimeCredentialStore
     private let driverFactory: DriverFactory
-    private let sourceFailureHandler: SourceFailureHandler
+    private var sourceFailureHandler: SourceFailureHandler
     private var lifecycleGeneration = 0
     private var nextDriverGeneration = 0
     private var runningSources: [String: RunningSource] = [:]
     private var startingSources: [String: StartingSource] = [:]
+    private var stoppingSources: [String: StoppingSource] = [:]
     private var startupCapturesBySourceID: [String: NativeRealtimeCaptureSource] = [:]
     private var removedSourceIDsDuringStartup = Set<String>()
+    private var nextStopGeneration = 0
 
     init(
         credentialStore: RealtimeCredentialStore = RealtimeCredentialStore(),
@@ -61,9 +68,14 @@ actor NativeRealtimeSessionCoordinator {
         self.sourceFailureHandler = sourceFailureHandler
     }
 
+    func setSourceFailureHandler(_ handler: @escaping SourceFailureHandler) {
+        sourceFailureHandler = handler
+    }
+
     /// Replaces the current set with isolated drivers for enabled, successfully captured sources.
     /// A replacement using an already-consumed PCM input is rejected and tears down the old set.
-    /// This coordinator is intentionally not connected to AppModel's production session path yet.
+    /// The caller gates this operation on session-specific disclosure. It streams PCM
+    /// to isolated drivers but does not commit caption intervals on its own.
     func start(
         captures: [NativeRealtimeCaptureSource],
         settings: NativeRealtimeSettings
@@ -112,9 +124,13 @@ actor NativeRealtimeSessionCoordinator {
                 removedSourceIDsDuringStartup.removeAll()
             }
         }
+        // Publish replacement captures first so concurrent removal can tombstone this
+        // startup generation. Then synchronously revoke every running predecessor
+        // before joining an older stop task; an unrelated slow stop must not leave a
+        // previous source able to continue sending audio during replacement.
         let previous = detachAllSources()
-        await stop(previous.running)
-        await stop(previous.starting)
+        scheduleStops(for: previous)
+        await waitForAllStoppingSources()
         guard !Task.isCancelled else {
             await cancelStartup(generation: startupGeneration)
             return []
@@ -297,8 +313,12 @@ actor NativeRealtimeSessionCoordinator {
         }
         let running = runningSources.removeValue(forKey: sourceID)
         let starting = startingSources.removeValue(forKey: sourceID)
-        if let running { await stop([running], streamError: .sourceSuperseded) }
-        if let starting { await stop([starting]) }
+        let stopping = scheduleStop(
+            sourceID: sourceID,
+            running: running,
+            starting: starting
+        )
+        await waitForStoppingSource(sourceID: sourceID, stopping)
     }
 
     func stop() async {
@@ -308,13 +328,23 @@ actor NativeRealtimeSessionCoordinator {
         removedSourceIDsDuringStartup.removeAll()
         startupCaptures.forEach { $0.input.finish(error: .sourceSuperseded) }
         let sources = detachAllSources()
-        await stop(sources.running)
-        await stop(sources.starting)
+        scheduleStops(for: sources)
+        await waitForAllStoppingSources()
     }
 
     func activeSourceIDs() -> [String] {
         runningSources.keys.sorted()
     }
+
+    #if DEBUG
+    func lifecycleGenerationForTesting() -> Int {
+        lifecycleGeneration
+    }
+
+    func startupSourceIDsForTesting() -> [String] {
+        startupCapturesBySourceID.keys.sorted()
+    }
+    #endif
 
     private func inputDidFinish(
         sourceID: String,
@@ -332,13 +362,14 @@ actor NativeRealtimeSessionCoordinator {
             }
             return
         }
-        pending.lease.deactivate()
-        pending.capture.input.finish(error: .sourceSuperseded)
-        await pending.driver.stop()
-        guard lifecycleGeneration == startupGeneration,
-              startupCapturesBySourceID[sourceID]?.input.isSameCapture(as: pending.capture.input) == true,
-              let failure = Self.failureCode(for: error) else { return }
-        sourceFailureHandler(sourceID, failure)
+        let stopping = scheduleStop(sourceID: sourceID, starting: pending)
+        // Report while this startup identity is still current. Waiting for the
+        // shared stop can let start() finish and clear its capture metadata first.
+        // The lease/input have already been revoked synchronously above.
+        if let failure = Self.failureCode(for: error) {
+            sourceFailureHandler(sourceID, failure)
+        }
+        await waitForStoppingSource(sourceID: sourceID, stopping)
     }
 
     private func isAlreadyConsumedCapture(_ capture: NativeRealtimeCaptureSource) -> Bool {
@@ -382,11 +413,76 @@ actor NativeRealtimeSessionCoordinator {
         removedSourceIDsDuringStartup.removeAll()
         captures.forEach { $0.input.finish(error: .sourceSuperseded) }
         let sources = detachAllSources()
-        await stop(sources.running)
-        await stop(sources.starting)
+        scheduleStops(for: sources)
+        await waitForAllStoppingSources()
     }
 
-    private func stop(
+    private func scheduleStops(
+        for sources: (running: [RunningSource], starting: [StartingSource])
+    ) {
+        for source in sources.running {
+            _ = scheduleStop(sourceID: source.capture.sourceID, running: source)
+        }
+        for source in sources.starting {
+            _ = scheduleStop(sourceID: source.capture.sourceID, starting: source)
+        }
+    }
+
+    private func scheduleStop(
+        sourceID: String,
+        running: RunningSource? = nil,
+        starting: StartingSource? = nil
+    ) -> StoppingSource? {
+        if let existing = stoppingSources[sourceID] {
+            return existing
+        }
+        guard running != nil || starting != nil else { return nil }
+
+        // Revocation is synchronous at the coordinator boundary. The shared task
+        // below owns only the potentially slow driver shutdown and reader join.
+        if let running {
+            running.lease.deactivate()
+            running.capture.input.finish(error: .sourceSuperseded)
+            running.reader.cancel()
+        }
+        if let starting {
+            starting.lease.deactivate()
+            starting.capture.input.finish(error: .sourceSuperseded)
+        }
+
+        let generation = nextStopGeneration
+        nextStopGeneration &+= 1
+        let task = Task { [running, starting] in
+            if let running {
+                await Self.stop([running])
+            }
+            if let starting {
+                await Self.stop([starting])
+            }
+        }
+        let stopping = StoppingSource(generation: generation, task: task)
+        stoppingSources[sourceID] = stopping
+        return stopping
+    }
+
+    private func waitForAllStoppingSources() async {
+        let sources = Array(stoppingSources)
+        for (sourceID, stopping) in sources {
+            await waitForStoppingSource(sourceID: sourceID, stopping)
+        }
+    }
+
+    private func waitForStoppingSource(
+        sourceID: String,
+        _ stopping: StoppingSource?
+    ) async {
+        guard let stopping else { return }
+        await stopping.task.value
+        guard stoppingSources[sourceID]?.generation == stopping.generation else { return }
+        stoppingSources.removeValue(forKey: sourceID)
+    }
+
+    private nonisolated static func stop(
         _ sources: [RunningSource],
         streamError: RealtimePCM16AudioStreamError? = .sourceSuperseded
     ) async {
@@ -405,7 +501,7 @@ actor NativeRealtimeSessionCoordinator {
         }
     }
 
-    private func stop(_ sources: [StartingSource]) async {
+    private nonisolated static func stop(_ sources: [StartingSource]) async {
         for source in sources {
             source.lease.deactivate()
             source.capture.input.finish(error: .sourceSuperseded)
