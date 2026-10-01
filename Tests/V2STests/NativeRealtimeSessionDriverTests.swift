@@ -2,6 +2,27 @@ import Foundation
 import Testing
 @testable import v2s
 
+private final class DriverVideoTestClock: @unchecked Sendable {
+    private let lock = NSLock()
+    private var value: UInt64
+
+    init(nowNanoseconds: UInt64) {
+        value = nowNanoseconds
+    }
+
+    func nowNanoseconds() -> UInt64 {
+        lock.lock()
+        defer { lock.unlock() }
+        return value
+    }
+
+    func advance(nanoseconds: UInt64) {
+        lock.lock()
+        defer { lock.unlock() }
+        value += nanoseconds
+    }
+}
+
 @Suite(.serialized)
 struct NativeRealtimeSessionDriverTests {
     @Test func everyProfileWaitsForItsProtocolSpecificSetupAcknowledgement() async throws {
@@ -222,6 +243,7 @@ struct NativeRealtimeSessionDriverTests {
     }
 
     @Test func videoMailboxKeepsNewestFrameRateLimitsAndRevocationClearsIt() async throws {
+        let clock = DriverVideoTestClock(nowNanoseconds: 10_000_000_000)
         let connection = FakeRealtimeWebSocketConnection(suspendSendType: "audio")
         let connector = FakeRealtimeWebSocketConnector(profile: .geminiLive, connections: [connection])
         let driver = NativeRealtimeSessionDriver(
@@ -230,7 +252,8 @@ struct NativeRealtimeSessionDriverTests {
             sourceRole: .microphone,
             connector: connector,
             videoEnabled: true,
-            setupTimeout: .seconds(1)
+            setupTimeout: .seconds(1),
+            videoNowNanoseconds: { clock.nowNanoseconds() }
         )
         let (recorder, task) = launchStart(driver, alias: "audio-1", generation: 7)
         #expect(await connection.waitUntilSentMessageCount(1))
@@ -252,14 +275,18 @@ struct NativeRealtimeSessionDriverTests {
         #expect(!afterFirstDrain.contains { containsEncodedFrame($0, frame: older) })
 
         let rateLimited = makeVideoFrame(timestamp: 2_500_000_000, marker: 0x33)
+        clock.advance(nanoseconds: 400_000_000)
         try await driver.sendVideoFrame(rateLimited)
         let newestRateLimited = makeVideoFrame(timestamp: 2_700_000_000, marker: 0x44)
-        try await Task.sleep(for: .milliseconds(20))
+        clock.advance(nanoseconds: 200_000_000)
         try await driver.sendVideoFrame(newestRateLimited)
-        try await Task.sleep(for: .milliseconds(700))
+        // Even if the CI runner pauses for longer than a second, the controlled
+        // clock has advanced only 600 ms and the queued frame must remain blocked.
+        try await Task.sleep(for: .milliseconds(1_100))
         #expect(await connection.sentMessageTypes().filter { $0 == "video" }.count == 1)
 
         await driver.revokeVideoPermission()
+        clock.advance(nanoseconds: 1_000_000_000)
         try await Task.sleep(for: .milliseconds(1_050))
         #expect(await connection.sentMessageTypes().filter { $0 == "video" }.count == 1)
         await expectFailure(.capabilityRejected) {

@@ -60,6 +60,7 @@ actor NativeRealtimeSessionDriver: RealtimeSessionDriving {
     private let connector: any RealtimeWebSocketConnecting
     private let videoEnabled: Bool
     private let setupTimeout: Duration
+    private let videoNowNanoseconds: @Sendable () -> UInt64
     private let providerEvents: AsyncStream<RealtimeProviderEvent>
     private let providerEventContinuation: AsyncStream<RealtimeProviderEvent>.Continuation
 
@@ -90,7 +91,10 @@ actor NativeRealtimeSessionDriver: RealtimeSessionDriving {
         sourceRole: RealtimeAudioSourceRole,
         connector: any RealtimeWebSocketConnecting = URLSessionRealtimeWebSocketConnector(),
         videoEnabled: Bool = false,
-        setupTimeout: Duration = .seconds(5)
+        setupTimeout: Duration = .seconds(5),
+        videoNowNanoseconds: @escaping @Sendable () -> UInt64 = {
+            DispatchTime.now().uptimeNanoseconds
+        }
     ) {
         self.settings = settings
         self.credential = credential
@@ -98,6 +102,7 @@ actor NativeRealtimeSessionDriver: RealtimeSessionDriving {
         self.connector = connector
         self.videoEnabled = videoEnabled
         self.setupTimeout = setupTimeout
+        self.videoNowNanoseconds = videoNowNanoseconds
         let pair = AsyncStream<RealtimeProviderEvent>.makeStream()
         providerEvents = pair.stream
         providerEventContinuation = pair.continuation
@@ -640,7 +645,7 @@ actor NativeRealtimeSessionDriver: RealtimeSessionDriving {
             return
         }
         lastVideoFrameTimestamp = frame.capturedAtMonotonicNanoseconds
-        lastVideoSendUptimeNanoseconds = DispatchTime.now().uptimeNanoseconds
+        lastVideoSendUptimeNanoseconds = videoNowNanoseconds()
         videoDrainTask = nil
         scheduleVideoDrainIfPossible()
     }
@@ -676,12 +681,12 @@ actor NativeRealtimeSessionDriver: RealtimeSessionDriving {
         }
         guard operationID == operation, state == .awaitingCommitAcknowledgement else { return }
         lastVideoFrameTimestamp = frame.capturedAtMonotonicNanoseconds
-        lastVideoSendUptimeNanoseconds = DispatchTime.now().uptimeNanoseconds
+        lastVideoSendUptimeNanoseconds = videoNowNanoseconds()
     }
 
     private func remainingVideoCooldownNanoseconds() -> UInt64 {
         guard let lastVideoSendUptimeNanoseconds else { return 0 }
-        let now = DispatchTime.now().uptimeNanoseconds
+        let now = videoNowNanoseconds()
         let elapsed = now >= lastVideoSendUptimeNanoseconds ? now - lastVideoSendUptimeNanoseconds : 0
         return elapsed >= Self.minimumVideoFrameIntervalNanoseconds
             ? 0
