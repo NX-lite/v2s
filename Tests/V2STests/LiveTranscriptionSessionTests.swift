@@ -5,6 +5,11 @@ import Speech
 import Testing
 @testable import v2s
 
+private final class WeakNormalizedRepackBuffers {
+    weak var input: AVAudioPCMBuffer?
+    weak var output: AVAudioPCMBuffer?
+}
+
 @Suite struct LiveTranscriptionSessionTests {
     @Test func legacyRecognitionErrorDispositionIgnoresCancellationErrors() {
         #expect(disposition(code: 216) == .ignore)
@@ -293,14 +298,14 @@ import Testing
         #expect(provenance == nil)
     }
 
-    @Test @available(macOS 26.0, *) func modernAnalyzerConversionKeepsLocalPCMWithoutInventingCaptureStart() async throws {
+    @Test @available(macOS 26.0, *) func modernAnalyzerChannelConversionKeepsLocalPCMWithoutInventingCaptureStart() async throws {
         let session = LiveTranscriptionSession()
         await session.beginRecognitionSessionForTesting()
         let convertedFormat = try #require(
             AVAudioFormat(
                 commonFormat: .pcmFormatInt16,
                 sampleRate: 16_000,
-                channels: 1,
+                channels: 2,
                 interleaved: true
             )
         )
@@ -318,6 +323,68 @@ import Testing
         #expect(retainedInput.isInterleaved)
         #expect(retainedInput.bufferStartTime == nil)
         #expect(provenance == nil)
+    }
+
+    @Test @available(macOS 26.0, *) func normalizedMono16kToInt16RepackPreservesCaptureClockAndFrames() async throws {
+        let session = LiveTranscriptionSession()
+        await session.beginRecognitionSessionForTesting()
+        let convertedFormat = try #require(
+            AVAudioFormat(
+                commonFormat: .pcmFormatInt16,
+                sampleRate: 16_000,
+                channels: 1,
+                interleaved: true
+            )
+        )
+        let analyzerStream = await session.installRealModernAnalyzerInputStreamForTesting(analyzerFormat: convertedFormat)
+        let nativeInput = try #require(await session.makeRealtimePCM16AudioInput())
+        await session.appendCapturedAudioBufferForTesting(
+            try makeMono16KBuffer(samples: [0.5, -0.5, 1, -1])
+        )
+
+        var analyzerIterator = analyzerStream.makeAsyncIterator()
+        let analyzerInput = try #require(await analyzerIterator.next())
+        let nativeChunk = try #require(try await nativeInput.nextChunk())
+        let provenance = await session.modernAudioProvenanceForTesting(sampleTimeRange(start: 0, duration: 4))
+        let analyzerPCM16 = try int16PCM16LittleEndianBytes(analyzerInput.buffer)
+
+        #expect(analyzerInput.buffer.frameLength == 4)
+        #expect(analyzerInput.buffer.format.sampleRate == 16_000)
+        #expect(analyzerInput.buffer.format.commonFormat == .pcmFormatInt16)
+        #expect(analyzerInput.buffer.format.isInterleaved)
+        #expect(analyzerInput.bufferStartTime == CMTime(value: 0, timescale: 16_000))
+        #expect(analyzerPCM16.count == 8)
+        #expect(analyzerPCM16 == nativeChunk.pcm16LE)
+        #expect(nativeChunk.frameCount == 4)
+        #expect(nativeChunk.sampleInterval == 0..<4)
+        #expect(provenance?.sampleInterval == 0..<4)
+        #expect(provenance?.sourceToken == nativeInput.sourceToken)
+        #expect(provenance?.captureGeneration == nativeInput.generation)
+    }
+
+    @Test func normalizedPCM16RepackUsesExactNativeQuantizerAndPreservesEveryFrame() throws {
+        let samples: [Float] = [.nan, .infinity, -.infinity, -1.5, -1, -0.5, 0, 0.5, 1, 1.5]
+        let source = try makeMono16KBuffer(samples: samples)
+        let targetFormat = try #require(
+            AVAudioFormat(
+                commonFormat: .pcmFormatInt16,
+                sampleRate: 16_000,
+                channels: 1,
+                interleaved: true
+            )
+        )
+        let repacked = try #require(NormalizedMono16kPCM16Repacker.repack(source, to: targetFormat))
+        let values = try #require(repacked.buffer.int16ChannelData?[0])
+        let actualSamples = Array(UnsafeBufferPointer(start: values, count: Int(repacked.buffer.frameLength)))
+        let expectedSamples: [Int16] = [0, 0, 0, .min, .min, -16_384, 0, 16_384, .max, .max]
+        let expectedBytes = Data(expectedSamples.flatMap { sample in
+            let bits = UInt16(bitPattern: sample)
+            return [UInt8(truncatingIfNeeded: bits), UInt8(truncatingIfNeeded: bits >> 8)]
+        })
+
+        #expect(repacked.buffer.frameLength == AVAudioFrameCount(samples.count))
+        #expect(actualSamples == expectedSamples)
+        #expect(try int16PCM16LittleEndianBytes(repacked.buffer) == expectedBytes)
     }
 
     @Test func modernAnalyzerWithoutMappingStillYieldsLocalPCM() async throws {
@@ -411,8 +478,62 @@ import Testing
         }
     }
 
-    @Test func normalizedSampleIdentityRejectsConvertedBuffersWithMatchingFormatAndLength() {
+    @Test func normalizedRepackProofKeepsExactBuffersAliveForItsLifetime() throws {
+        let weakBuffers = WeakNormalizedRepackBuffers()
+        var proof: NormalizedPCM16RepackProof?
+        do {
+            let source = try makeMono16KBuffer(samples: [0.1, 0.2, 0.3, 0.4])
+            let targetFormat = try #require(
+                AVAudioFormat(
+                    commonFormat: .pcmFormatInt16,
+                    sampleRate: 16_000,
+                    channels: 1,
+                    interleaved: true
+                )
+            )
+            let result = try #require(NormalizedMono16kPCM16Repacker.repack(source, to: targetFormat))
+            weakBuffers.input = source
+            weakBuffers.output = result.buffer
+            proof = result.proof
+        }
+
+        #expect(weakBuffers.input != nil)
+        #expect(weakBuffers.output != nil)
+        let proofStillIdentifiesItsBuffers = NormalizedAudioFrameIdentity.preservesNormalizedSamples(
+            captureInterval: 20..<24,
+            inputSampleRate: 16_000,
+            inputChannelCount: 1,
+            inputFrameCount: 4,
+            outputSampleRate: 16_000,
+            outputChannelCount: 1,
+            outputFrameCount: 4,
+            unchangedBufferObject: false,
+            verifiedRepackProof: proof,
+            inputBuffer: weakBuffers.input,
+            outputBuffer: weakBuffers.output
+        )
+        #expect(proofStillIdentifiesItsBuffers)
+        proof = nil
+        #expect(weakBuffers.input == nil)
+        #expect(weakBuffers.output == nil)
+    }
+
+    @Test func normalizedSampleIdentityAcceptsOnlyItsTypedDirectRepackProof() throws {
         let captureInterval: NormalizedAudioSampleInterval = 20..<24
+        let source = try makeMono16KBuffer(samples: [0.1, 0.2, 0.3, 0.4])
+        let targetFormat = try #require(
+            AVAudioFormat(
+                commonFormat: .pcmFormatInt16,
+                sampleRate: 16_000,
+                channels: 1,
+                interleaved: true
+            )
+        )
+        let repacked = try #require(NormalizedMono16kPCM16Repacker.repack(source, to: targetFormat))
+        let unrelatedConvertedBuffer = try #require(
+            AVAudioPCMBuffer(pcmFormat: targetFormat, frameCapacity: AVAudioFrameCount(4))
+        )
+        unrelatedConvertedBuffer.frameLength = 4
         let unchangedBufferIsValid = NormalizedAudioFrameIdentity.preservesNormalizedSamples(
             captureInterval: captureInterval,
             inputSampleRate: 16_000,
@@ -431,11 +552,27 @@ import Testing
             outputSampleRate: 16_000,
             outputChannelCount: 1,
             outputFrameCount: 4,
-            unchangedBufferObject: false
+            unchangedBufferObject: false,
+            inputBuffer: source,
+            outputBuffer: unrelatedConvertedBuffer
+        )
+        let verifiedRepackIsValid = NormalizedAudioFrameIdentity.preservesNormalizedSamples(
+            captureInterval: captureInterval,
+            inputSampleRate: 16_000,
+            inputChannelCount: 1,
+            inputFrameCount: 4,
+            outputSampleRate: 16_000,
+            outputChannelCount: 1,
+            outputFrameCount: 4,
+            unchangedBufferObject: false,
+            verifiedRepackProof: repacked.proof,
+            inputBuffer: source,
+            outputBuffer: repacked.buffer
         )
 
         #expect(unchangedBufferIsValid)
         #expect(sameShapeConvertedBufferIsValid == false)
+        #expect(verifiedRepackIsValid)
 
         var unprovenMapping = ModernRecognitionSampleMapping(sourceToken: UUID(), captureGeneration: 19)
         let unprovenAppendSucceeded = unprovenMapping.appendBuffer(
@@ -1712,6 +1849,19 @@ import Testing
             channel[index] = sample
         }
         return buffer
+    }
+
+    private func int16PCM16LittleEndianBytes(_ buffer: AVAudioPCMBuffer) throws -> Data {
+        guard buffer.format.commonFormat == .pcmFormatInt16,
+              buffer.format.channelCount == 1,
+              let samples = buffer.int16ChannelData?[0] else {
+            throw TestError.unexpectedAudioBufferFormat
+        }
+        return Data(bytes: samples, count: Int(buffer.frameLength) * MemoryLayout<Int16>.size)
+    }
+
+    private enum TestError: Error {
+        case unexpectedAudioBufferFormat
     }
 
     private func pcm16Samples(from wav: Data) -> [Int16] {

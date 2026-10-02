@@ -122,6 +122,12 @@ enum RealtimeProviderEvent: Equatable, Sendable {
         utteranceID: String,
         text: String
     )
+    case utteranceCompleted(
+        sourceAlias: String,
+        generation: Int,
+        captionID: UUID,
+        utteranceID: String
+    )
     case suggestion(sourceAlias: String, generation: Int, text: String)
     case expired(sourceAlias: String, generation: Int)
     case failure(sourceAlias: String, generation: Int, RealtimeFailureCode)

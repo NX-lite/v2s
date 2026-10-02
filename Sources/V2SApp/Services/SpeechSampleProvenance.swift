@@ -1,4 +1,5 @@
 import Foundation
+import AVFoundation
 import CoreMedia
 import Speech
 
@@ -46,9 +47,18 @@ enum NormalizedAudioFrameIdentity {
         outputSampleRate: Double,
         outputChannelCount: Int,
         outputFrameCount: Int,
-        unchangedBufferObject: Bool
+        unchangedBufferObject: Bool,
+        verifiedRepackProof: NormalizedPCM16RepackProof? = nil,
+        inputBuffer: AVAudioPCMBuffer? = nil,
+        outputBuffer: AVAudioPCMBuffer? = nil
     ) -> Bool {
-        guard unchangedBufferObject,
+        let hasVerifiedIdentity = unchangedBufferObject
+            || verifiedRepackProof?.matches(
+                inputBuffer: inputBuffer,
+                outputBuffer: outputBuffer,
+                frameCount: inputFrameCount
+            ) == true
+        guard hasVerifiedIdentity,
               inputSampleRate.isFinite,
               outputSampleRate.isFinite,
               inputSampleRate == 16_000,
@@ -65,6 +75,109 @@ enum NormalizedAudioFrameIdentity {
             return false
         }
         return true
+    }
+}
+
+/// A proof is created only by the direct Float32-to-Int16 sample repacker below.
+/// It is bound to the exact source/output buffers and frame count, so a different
+/// converted buffer with matching dimensions cannot reuse it.
+struct NormalizedPCM16RepackProof {
+    // Retain the exact buffers so their object identities cannot be recycled while
+    // this proof remains usable.
+    private let inputBuffer: AVAudioPCMBuffer
+    private let outputBuffer: AVAudioPCMBuffer
+    private let frameCount: Int
+
+    fileprivate init(inputBuffer: AVAudioPCMBuffer, outputBuffer: AVAudioPCMBuffer, frameCount: Int) {
+        self.inputBuffer = inputBuffer
+        self.outputBuffer = outputBuffer
+        self.frameCount = frameCount
+    }
+
+    fileprivate func matches(
+        inputBuffer candidateInput: AVAudioPCMBuffer?,
+        outputBuffer candidateOutput: AVAudioPCMBuffer?,
+        frameCount: Int
+    ) -> Bool {
+        guard let candidateInput, let candidateOutput else { return false }
+        return self.inputBuffer === candidateInput
+            && self.outputBuffer === candidateOutput
+            && self.frameCount == frameCount
+    }
+}
+
+struct NormalizedPCM16RepackResult {
+    let buffer: AVAudioPCMBuffer
+    let proof: NormalizedPCM16RepackProof
+
+    fileprivate init(buffer: AVAudioPCMBuffer, proof: NormalizedPCM16RepackProof) {
+        self.buffer = buffer
+        self.proof = proof
+    }
+}
+
+enum Mono16kPCM16SampleConverter {
+    static func quantize(_ input: Float) -> Int16 {
+        let sample = input.isFinite ? min(1, max(-1, input)) : 0
+        if sample <= -1 {
+            return Int16.min
+        }
+        if sample >= 1 {
+            return Int16.max
+        }
+        return Int16((sample * Float(Int16.max)).rounded())
+    }
+
+    static func littleEndianData(from samples: UnsafePointer<Float>, frameCount: Int) -> Data {
+        guard frameCount > 0 else { return Data() }
+        var data = Data(count: frameCount * MemoryLayout<Int16>.size)
+        data.withUnsafeMutableBytes { (destination: UnsafeMutableRawBufferPointer) in
+            guard let bytes = destination.baseAddress?.assumingMemoryBound(to: UInt8.self) else { return }
+            for frame in 0..<frameCount {
+                let bits = UInt16(bitPattern: quantize(samples[frame]))
+                bytes[frame * 2] = UInt8(truncatingIfNeeded: bits)
+                bytes[frame * 2 + 1] = UInt8(truncatingIfNeeded: bits >> 8)
+            }
+        }
+        return data
+    }
+}
+
+enum NormalizedMono16kPCM16Repacker {
+    /// Repackages mono 16-kHz normalized Float32 samples directly into the exact
+    /// mono 16-kHz Int16 target format. It does no resampling or channel conversion.
+    static func repack(
+        _ inputBuffer: AVAudioPCMBuffer,
+        to outputFormat: AVAudioFormat
+    ) -> NormalizedPCM16RepackResult? {
+        guard inputBuffer.frameLength > 0,
+              inputBuffer.format.commonFormat == .pcmFormatFloat32,
+              inputBuffer.format.sampleRate == 16_000,
+              inputBuffer.format.channelCount == 1,
+              let inputSamples = inputBuffer.floatChannelData?[0],
+              outputFormat.commonFormat == .pcmFormatInt16,
+              outputFormat.sampleRate == 16_000,
+              outputFormat.channelCount == 1,
+              let outputBuffer = AVAudioPCMBuffer(
+                pcmFormat: outputFormat,
+                frameCapacity: inputBuffer.frameLength
+              ),
+              let outputSamples = outputBuffer.int16ChannelData?[0] else {
+            return nil
+        }
+
+        outputBuffer.frameLength = inputBuffer.frameLength
+        let frameCount = Int(inputBuffer.frameLength)
+        for frame in 0..<frameCount {
+            outputSamples[frame] = Mono16kPCM16SampleConverter.quantize(inputSamples[frame])
+        }
+
+        let proof = NormalizedPCM16RepackProof(
+            inputBuffer: inputBuffer,
+            outputBuffer: outputBuffer,
+            frameCount: frameCount
+        )
+        return NormalizedPCM16RepackResult(buffer: outputBuffer, proof: proof)
     }
 }
 
@@ -220,6 +333,9 @@ enum ModernAnalyzerInputAppender {
         outputChannelCount: Int,
         outputFrameCount: Int,
         unchangedBufferObject: Bool,
+        verifiedRepackProof: NormalizedPCM16RepackProof? = nil,
+        inputBuffer: AVAudioPCMBuffer? = nil,
+        outputBuffer: AVAudioPCMBuffer? = nil,
         deliver: (CMTime?) -> ModernAnalyzerInputDeliveryOutcome
     ) -> CMTime? {
         let preservesFrameIdentity = captureSampleInterval.map { interval in
@@ -231,7 +347,10 @@ enum ModernAnalyzerInputAppender {
                 outputSampleRate: outputSampleRate,
                 outputChannelCount: outputChannelCount,
                 outputFrameCount: outputFrameCount,
-                unchangedBufferObject: unchangedBufferObject
+                unchangedBufferObject: unchangedBufferObject,
+                verifiedRepackProof: verifiedRepackProof,
+                inputBuffer: inputBuffer,
+                outputBuffer: outputBuffer
             )
         } ?? false
 

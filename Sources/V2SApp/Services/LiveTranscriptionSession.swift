@@ -28,6 +28,11 @@ private struct UncheckedSendablePCMBuffer: @unchecked Sendable {
     let value: AVAudioPCMBuffer
 }
 
+private struct SpeechInputPCMBuffer {
+    let buffer: AVAudioPCMBuffer
+    let verifiedRepackProof: NormalizedPCM16RepackProof?
+}
+
 struct RealtimePCM16AudioChunk: Equatable, Sendable {
     let sourceToken: UUID
     let generation: UInt64
@@ -951,6 +956,32 @@ final class LiveTranscriptionSession: NSObject, @unchecked Sendable {
                         return .terminated
                     }
                 }
+                self.modernAnalyzerInputFinishForTesting = { inputContinuation.finish() }
+                self.modernRecognitionSampleMapping = self.makeModernRecognitionSampleMapping()
+                self.setRecognitionBackend(.speechAnalyzer)
+                continuation.resume(returning: stream)
+            }
+        }
+    }
+
+    @available(macOS 26.0, *)
+    func installRealModernAnalyzerInputStreamForTesting(
+        analyzerFormat: AVAudioFormat,
+        bufferingCapacity: Int = 12
+    ) async -> AsyncStream<AnalyzerInput> {
+        await withCheckedContinuation { continuation in
+            captureQueue.async { [weak self] in
+                let (stream, inputContinuation) = AsyncStream<AnalyzerInput>.makeStream(
+                    bufferingPolicy: .bufferingNewest(max(1, bufferingCapacity))
+                )
+                guard let self else {
+                    inputContinuation.finish()
+                    continuation.resume(returning: stream)
+                    return
+                }
+                self.analyzerInputContinuationState = inputContinuation
+                self.analyzerInputFormat = analyzerFormat
+                self.modernAnalyzerInputYieldForTesting = nil
                 self.modernAnalyzerInputFinishForTesting = { inputContinuation.finish() }
                 self.modernRecognitionSampleMapping = self.makeModernRecognitionSampleMapping()
                 self.setRecognitionBackend(.speechAnalyzer)
@@ -2184,10 +2215,14 @@ final class LiveTranscriptionSession: NSObject, @unchecked Sendable {
             return
         }
 
-        guard let recognizerBuffer = makeRecognizerBuffer(from: processingBuffer, nativeFormat: recognitionRequest.nativeAudioFormat) else {
+        guard let speechInputBuffer = makeRecognizerBuffer(
+            from: processingBuffer,
+            nativeFormat: recognitionRequest.nativeAudioFormat
+        ) else {
             legacyRecognitionSampleMapping?.invalidate()
             return
         }
+        let recognizerBuffer = speechInputBuffer.buffer
 
         guard let captureSampleInterval else {
             legacyRecognitionSampleMapping?.invalidate()
@@ -2203,7 +2238,10 @@ final class LiveTranscriptionSession: NSObject, @unchecked Sendable {
             outputSampleRate: recognizerBuffer.format.sampleRate,
             outputChannelCount: Int(recognizerBuffer.format.channelCount),
             outputFrameCount: Int(recognizerBuffer.frameLength),
-            unchangedBufferObject: processingBuffer === recognizerBuffer
+            unchangedBufferObject: processingBuffer === recognizerBuffer,
+            verifiedRepackProof: speechInputBuffer.verifiedRepackProof,
+            inputBuffer: processingBuffer,
+            outputBuffer: recognizerBuffer
         )
         _ = legacyRecognitionSampleMapping?.append(
             captureInterval: captureSampleInterval,
@@ -2250,25 +2288,7 @@ final class LiveTranscriptionSession: NSObject, @unchecked Sendable {
             return sampleInterval
         }
 
-        var pcm16LE = Data(count: frameCount * 2)
-        pcm16LE.withUnsafeMutableBytes { (destination: UnsafeMutableRawBufferPointer) in
-            guard let bytes = destination.baseAddress?.assumingMemoryBound(to: UInt8.self) else { return }
-            for frame in 0..<frameCount {
-                let input = samples[frame]
-                let sample = input.isFinite ? min(1, max(-1, input)) : 0
-                let value: Int16
-                if sample <= -1 {
-                    value = Int16.min
-                } else if sample >= 1 {
-                    value = Int16.max
-                } else {
-                    value = Int16((sample * Float(Int16.max)).rounded())
-                }
-                let bits = UInt16(bitPattern: value)
-                bytes[frame * 2] = UInt8(truncatingIfNeeded: bits)
-                bytes[frame * 2 + 1] = UInt8(truncatingIfNeeded: bits >> 8)
-            }
-        }
+        let pcm16LE = Mono16kPCM16SampleConverter.littleEndianData(from: samples, frameCount: frameCount)
 
         _ = fanout.offer(
             pcm16LE: pcm16LE,
@@ -2429,10 +2449,11 @@ final class LiveTranscriptionSession: NSObject, @unchecked Sendable {
             return
         }
 
-        guard let analyzerBuffer = makeSpeechAnalyzerBuffer(from: processingBuffer) else {
+        guard let speechInputBuffer = makeSpeechAnalyzerBuffer(from: processingBuffer) else {
             modernRecognitionSampleMapping?.invalidate()
             return
         }
+        let analyzerBuffer = speechInputBuffer.buffer
 
         let deliver: (CMTime?) -> ModernAnalyzerInputDeliveryOutcome
         if let yieldForTesting = modernAnalyzerInputYieldForTesting {
@@ -2468,6 +2489,9 @@ final class LiveTranscriptionSession: NSObject, @unchecked Sendable {
             outputChannelCount: Int(analyzerBuffer.format.channelCount),
             outputFrameCount: Int(analyzerBuffer.frameLength),
             unchangedBufferObject: processingBuffer === analyzerBuffer,
+            verifiedRepackProof: speechInputBuffer.verifiedRepackProof,
+            inputBuffer: processingBuffer,
+            outputBuffer: analyzerBuffer,
             deliver: deliver
         )
     }
@@ -2508,9 +2532,13 @@ final class LiveTranscriptionSession: NSObject, @unchecked Sendable {
     private func makeRecognizerBuffer(
         from processingBuffer: AVAudioPCMBuffer,
         nativeFormat: AVAudioFormat
-    ) -> AVAudioPCMBuffer? {
+    ) -> SpeechInputPCMBuffer? {
         if processingBuffer.format.matches(nativeFormat) {
-            return processingBuffer
+            return SpeechInputPCMBuffer(buffer: processingBuffer, verifiedRepackProof: nil)
+        }
+
+        if let repacked = NormalizedMono16kPCM16Repacker.repack(processingBuffer, to: nativeFormat) {
+            return SpeechInputPCMBuffer(buffer: repacked.buffer, verifiedRepackProof: repacked.proof)
         }
 
         let inputSignature = AudioFormatSignature(processingBuffer.format)
@@ -2526,23 +2554,31 @@ final class LiveTranscriptionSession: NSObject, @unchecked Sendable {
             return nil
         }
 
-        return convertBuffer(
+        guard let convertedBuffer = convertBuffer(
             processingBuffer,
             using: audioConverter,
             to: nativeFormat,
             allocationError: localized(.failedToAllocateSpeechRecognitionAudioBuffer),
             failurePrefix: localized(.failedToConvertCapturedAudioForSpeechRecognition)
-        )
+        ) else { return nil }
+        return SpeechInputPCMBuffer(buffer: convertedBuffer, verifiedRepackProof: nil)
     }
 
-    private func makeSpeechAnalyzerBuffer(from processingBuffer: AVAudioPCMBuffer) -> AVAudioPCMBuffer? {
+    private func makeSpeechAnalyzerBuffer(from processingBuffer: AVAudioPCMBuffer) -> SpeechInputPCMBuffer? {
         guard #available(macOS 26.0, *),
               let analyzerInputFormat else {
-            return processingBuffer
+            return SpeechInputPCMBuffer(buffer: processingBuffer, verifiedRepackProof: nil)
         }
 
         if processingBuffer.format.matches(analyzerInputFormat) {
-            return processingBuffer
+            return SpeechInputPCMBuffer(buffer: processingBuffer, verifiedRepackProof: nil)
+        }
+
+        if let repacked = NormalizedMono16kPCM16Repacker.repack(
+            processingBuffer,
+            to: analyzerInputFormat
+        ) {
+            return SpeechInputPCMBuffer(buffer: repacked.buffer, verifiedRepackProof: repacked.proof)
         }
 
         let inputSignature = AudioFormatSignature(processingBuffer.format)
@@ -2555,13 +2591,14 @@ final class LiveTranscriptionSession: NSObject, @unchecked Sendable {
             return nil
         }
 
-        return convertBuffer(
+        guard let convertedBuffer = convertBuffer(
             processingBuffer,
             using: modernAudioConverter,
             to: analyzerInputFormat,
             allocationError: localized(.failedToAllocateSpeechAnalyzerAudioBuffer),
             failurePrefix: localized(.failedToConvertCapturedAudioForSpeechAnalyzer)
-        )
+        ) else { return nil }
+        return SpeechInputPCMBuffer(buffer: convertedBuffer, verifiedRepackProof: nil)
     }
 
     private func convertBuffer(

@@ -7,6 +7,7 @@ actor NativeRealtimeSessionDriver: RealtimeSessionDriving {
     private static let audioFrameDurationNanoseconds: UInt64 = 62_500
     private static let maximumCorrectionTextLength = 8_192
     private static let minimumVideoFrameIntervalNanoseconds: UInt64 = 1_000_000_000
+    private static let providerEventBufferCapacity = 32
 
     private enum State {
         case stopped
@@ -86,6 +87,14 @@ actor NativeRealtimeSessionDriver: RealtimeSessionDriving {
     private var pendingUtterance: PendingUtterance?
     private var expiredGeneration: Int?
     private var recentResponseIDs: [String] = []
+    private var providerEventDeliveryFailed = false
+    #if DEBUG
+    private var deferredGeminiTerminalWaiterForTesting: CheckedContinuation<Void, Never>?
+    private var terminalEventCountForTesting = 0
+    private var terminalEventWaiterForTesting: (target: Int, continuation: CheckedContinuation<Void, Never>)?
+    private var providerEventBackpressureForTesting = false
+    private var providerEventBackpressureWaiterForTesting: CheckedContinuation<Void, Never>?
+    #endif
 
     init(
         settings: NativeRealtimeSettings,
@@ -105,7 +114,9 @@ actor NativeRealtimeSessionDriver: RealtimeSessionDriving {
         self.videoEnabled = videoEnabled
         self.setupTimeout = setupTimeout
         self.videoNowNanoseconds = videoNowNanoseconds
-        let pair = AsyncStream<RealtimeProviderEvent>.makeStream()
+        let pair = AsyncStream<RealtimeProviderEvent>.makeStream(
+            bufferingPolicy: .bufferingNewest(Self.providerEventBufferCapacity)
+        )
         providerEvents = pair.stream
         providerEventContinuation = pair.continuation
     }
@@ -465,6 +476,41 @@ actor NativeRealtimeSessionDriver: RealtimeSessionDriving {
         providerEvents
     }
 
+    #if DEBUG
+    func waitForDeferredGeminiTerminalForTesting() async {
+        if pendingUtterance?.didReceiveGeminiTurnComplete == true
+            || pendingUtterance?.didReceiveGeminiInterruption == true {
+            return
+        }
+        await withCheckedContinuation { continuation in
+            deferredGeminiTerminalWaiterForTesting = continuation
+        }
+    }
+
+    func waitForTerminalEventCountForTesting(_ count: Int) async {
+        guard terminalEventCountForTesting < count else { return }
+        await withCheckedContinuation { continuation in
+            terminalEventWaiterForTesting = (count, continuation)
+        }
+    }
+
+    func isFailedForTesting() -> Bool {
+        if case .failed = state { return true }
+        return false
+    }
+
+    func hasPendingMediaForTesting() -> Bool {
+        !audioMailbox.isEmpty || videoMailbox != nil
+    }
+
+    func waitForProviderEventBackpressureForTesting() async {
+        guard !providerEventBackpressureForTesting else { return }
+        await withCheckedContinuation { continuation in
+            providerEventBackpressureWaiterForTesting = continuation
+        }
+    }
+    #endif
+
     func stop() async {
         let wasStarting = state == .connecting || state == .awaitingAcknowledgement
         let pendingContinuation = setupContinuation
@@ -497,10 +543,11 @@ actor NativeRealtimeSessionDriver: RealtimeSessionDriving {
     }
 
     private var canBeginSetup: Bool {
+        guard !providerEventDeliveryFailed else { return false }
         switch state {
-        case .stopped, .failed, .expired: true
+        case .stopped, .failed, .expired: return true
         case .connecting, .awaitingAcknowledgement, .ready,
-             .awaitingCommitAcknowledgement, .awaitingResponse: false
+             .awaitingCommitAcknowledgement, .awaitingResponse: return false
         }
     }
 
@@ -693,11 +740,81 @@ actor NativeRealtimeSessionDriver: RealtimeSessionDriving {
         generation: Int?
     ) {
         guard let alias, Self.validAlias(alias), let generation else { return }
-        providerEventContinuation.yield(.failure(
+        _ = yieldProviderEvent(.failure(
             sourceAlias: alias,
             generation: generation,
             code
         ))
+    }
+
+    @discardableResult
+    private func yieldProviderEvent(_ event: RealtimeProviderEvent) -> Bool {
+        switch providerEventContinuation.yield(event) {
+        case .enqueued:
+            return true
+        case .dropped, .terminated:
+            failForProviderEventBackpressure()
+            return false
+        @unknown default:
+            failForProviderEventBackpressure()
+            return false
+        }
+    }
+
+    /// Revoke this driver's state before scheduling connection close or resuming
+    /// setup. A lost event makes its caption/source correlation unreliable.
+    private func failForProviderEventBackpressure() {
+        guard !providerEventDeliveryFailed else { return }
+        // Failure and expiry change lifecycle state before emitting their event.
+        // A loss still poisons the stream: a later generation cannot reuse its
+        // incomplete caption history, even when teardown has already begun.
+        providerEventDeliveryFailed = true
+        #if DEBUG
+        providerEventBackpressureForTesting = true
+        providerEventBackpressureWaiterForTesting?.resume()
+        providerEventBackpressureWaiterForTesting = nil
+        #endif
+        switch state {
+        case .stopped, .failed, .expired:
+            providerEventContinuation.finish()
+            return
+        case .connecting, .awaitingAcknowledgement, .ready,
+             .awaitingCommitAcknowledgement, .awaitingResponse:
+            break
+        }
+
+        operationID &+= 1
+        state = .failed
+        setupTimeoutTask?.cancel()
+        setupTimeoutTask = nil
+        connectionTask?.cancel()
+        connectionTask = nil
+        receiveTask?.cancel()
+        receiveTask = nil
+        drainTask?.cancel()
+        drainTask = nil
+        clearVideoMailbox()
+        clearMailbox()
+        pendingUtterance = nil
+        let oldConnection = connection
+        connection = nil
+        let continuation = setupContinuation
+        setupContinuation = nil
+
+        if let sourceAlias, Self.validAlias(sourceAlias), let sourceGeneration {
+            // This is the one bounded failure indication. Ignore its result so
+            // overflow cannot recursively emit more failures.
+            _ = providerEventContinuation.yield(.failure(
+                sourceAlias: sourceAlias,
+                generation: sourceGeneration,
+                .backpressure
+            ))
+        }
+        providerEventContinuation.finish()
+        continuation?.resume(throwing: RealtimeFailureCode.backpressure)
+        if let oldConnection {
+            Task { await oldConnection.close() }
+        }
     }
 
     private func clearMailbox() {
@@ -886,8 +1003,7 @@ actor NativeRealtimeSessionDriver: RealtimeSessionDriving {
         if !expectsCommitAcknowledgement {
             // Gemini has no commit acknowledgement; activityEnd starts its response turn.
             if pending.didReceiveGeminiInterruption {
-                pendingUtterance = nil
-                state = .ready
+                finishUtterance(pending, operation: operation, correctedText: nil)
             } else {
                 state = .awaitingResponse
                 if pending.didReceiveGeminiTurnComplete {
@@ -963,6 +1079,12 @@ actor NativeRealtimeSessionDriver: RealtimeSessionDriving {
                     if geminiTurnComplete { pending.didReceiveGeminiTurnComplete = true }
                 }
                 pendingUtterance = pending
+                #if DEBUG
+                if pending.didReceiveGeminiTurnComplete || pending.didReceiveGeminiInterruption {
+                    deferredGeminiTerminalWaiterForTesting?.resume()
+                    deferredGeminiTerminalWaiterForTesting = nil
+                }
+                #endif
                 return
             }
             if committed, state == .awaitingCommitAcknowledgement,
@@ -1131,8 +1253,7 @@ actor NativeRealtimeSessionDriver: RealtimeSessionDriving {
                     return
                 }
                 if events.contains(where: { $0 == .interrupted }) {
-                    pendingUtterance = nil
-                    state = .ready
+                    finishUtterance(pending, operation: operation, correctedText: nil)
                     return
                 }
                 for event in events {
@@ -1160,32 +1281,62 @@ actor NativeRealtimeSessionDriver: RealtimeSessionDriving {
               pendingUtterance?.captionID == pending.captionID else {
             return
         }
+        let text = pending.text.trimmingCharacters(in: .whitespacesAndNewlines)
+        let correctedText: String?
+        if pending.textWasTruncated || text.isEmpty || Self.isConversationalAnswer(text) {
+            correctedText = nil
+        } else {
+            correctedText = text
+        }
+        finishUtterance(pending, operation: operation, correctedText: correctedText)
+    }
+
+    private func finishUtterance(
+        _ pending: PendingUtterance,
+        operation: UInt64,
+        correctedText: String?
+    ) {
+        let boundaryIsSafe = state == .awaitingResponse
+            || (state == .awaitingCommitAcknowledgement && pending.commitBoundaryFlushed)
+        guard operationID == operation,
+              boundaryIsSafe,
+              pendingUtterance?.captionID == pending.captionID,
+              pendingUtterance?.sourceAlias == pending.sourceAlias,
+              pendingUtterance?.generation == pending.generation,
+              pendingUtterance?.utteranceID == pending.utteranceID else {
+            return
+        }
         if let responseID = pending.responseID {
             recentResponseIDs.append(responseID)
             if recentResponseIDs.count > 16 {
                 recentResponseIDs.removeFirst(recentResponseIDs.count - 16)
             }
         }
-        guard !pending.textWasTruncated else {
-            pendingUtterance = nil
-            state = .ready
-            return
-        }
-        let text = pending.text.trimmingCharacters(in: .whitespacesAndNewlines)
-        guard !text.isEmpty, !Self.isConversationalAnswer(text) else {
-            pendingUtterance = nil
-            state = .ready
-            return
-        }
-        providerEventContinuation.yield(.correctedText(
+        pendingUtterance = nil
+        state = .ready
+        if let correctedText,
+           !yieldProviderEvent(.correctedText(
             sourceAlias: pending.sourceAlias,
             generation: pending.generation,
             captionID: pending.captionID,
             utteranceID: pending.utteranceID,
-            text: text
+            text: correctedText
+           )) {
+            return
+        }
+        _ = yieldProviderEvent(.utteranceCompleted(
+            sourceAlias: pending.sourceAlias,
+            generation: pending.generation,
+            captionID: pending.captionID,
+            utteranceID: pending.utteranceID
         ))
-        pendingUtterance = nil
-        state = .ready
+        #if DEBUG
+        terminalEventCountForTesting += 1
+        if terminalEventCountForTesting >= terminalEventWaiterForTesting?.target ?? .max {
+            terminalEventWaiterForTesting?.continuation.resume()
+            terminalEventWaiterForTesting = nil
+        }
+        #endif
     }
 
     private func expire(operation: UInt64) async {
@@ -1210,7 +1361,7 @@ actor NativeRealtimeSessionDriver: RealtimeSessionDriving {
         let continuation = setupContinuation
         setupContinuation = nil
         if let sourceAlias, let sourceGeneration {
-            providerEventContinuation.yield(.expired(sourceAlias: sourceAlias, generation: sourceGeneration))
+            _ = yieldProviderEvent(.expired(sourceAlias: sourceAlias, generation: sourceGeneration))
         }
         if let oldConnection { await oldConnection.close() }
         continuation?.resume(throwing: RealtimeFailureCode.sessionExpired)

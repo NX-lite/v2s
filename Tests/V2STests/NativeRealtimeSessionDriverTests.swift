@@ -871,7 +871,7 @@ struct NativeRealtimeSessionDriverTests {
         await connection.enqueue(.text(#"{"type":"response.created","response":{"id":"resp_gap_first"}}"#))
         await connection.enqueue(.text(#"{"type":"response.output_text.delta","response_id":"resp_gap_first","delta":"first"}"#))
         await connection.enqueue(.text(#"{"type":"response.done","response":{"id":"resp_gap_first","status":"completed"}}"#))
-        #expect(await events.waitForCount(1))
+        #expect(await events.waitForCount(2))
 
         try await driver.commit(makeUtterance(generation: 7, start: 187_500, end: 312_500))
         #expect(await connection.waitUntilSentMessageCount(6))
@@ -1127,7 +1127,7 @@ struct NativeRealtimeSessionDriverTests {
         await connection.enqueue(.text(#"{"type":"response.created","response":{"id":"resp_sliced"}}"#))
         await connection.enqueue(.text(#"{"type":"response.output_text.delta","response_id":"resp_sliced","delta":"ready"}"#))
         await connection.enqueue(.text(#"{"type":"response.done","response":{"id":"resp_sliced","status":"completed"}}"#))
-        #expect(await events.waitForCount(1))
+        #expect(await events.waitForCount(2))
 
         try await driver.commit(makeUtterance(generation: 7, start: 312_500, end: 500_000))
         #expect(await connection.waitUntilSentMessageCount(7))
@@ -1182,7 +1182,7 @@ struct NativeRealtimeSessionDriverTests {
         #expect(await events.snapshot().isEmpty)
 
         await connection.enqueue(.text(#"{"type":"response.done","response":{"id":"resp_turn-42","status":"completed"}}"#))
-        #expect(await events.waitForCount(1))
+        #expect(await events.waitForCount(2))
         #expect(await events.snapshot() == [
             .correctedText(
                 sourceAlias: "audio-1",
@@ -1191,6 +1191,259 @@ struct NativeRealtimeSessionDriverTests {
                 utteranceID: "turn-42",
                 text: "Where is the next station?"
             ),
+            .utteranceCompleted(
+                sourceAlias: "audio-1",
+                generation: 7,
+                captionID: captionID,
+                utteranceID: "turn-42"
+            ),
+        ])
+
+        await driver.stop()
+        eventTask.cancel()
+        #expect(await recorder.outcome() == .succeeded)
+        await task.value
+    }
+
+    @Test(arguments: [NativeRealtimeProfile.openAIMini, .geminiLive])
+    func eventLossDuringFailureOrExpiryCannotReuseProviderStream(profile: NativeRealtimeProfile) async throws {
+        let connection = FakeRealtimeWebSocketConnection()
+        let replacement = FakeRealtimeWebSocketConnection()
+        let connector = FakeRealtimeWebSocketConnector(profile: profile, connections: [connection, replacement])
+        let driver = NativeRealtimeSessionDriver(
+            settings: settings(profile: profile),
+            credential: "synthetic-key",
+            sourceRole: .applicationAudio,
+            connector: connector,
+            setupTimeout: .seconds(1)
+        )
+        let (recorder, startTask) = launchStart(driver, alias: "audio-1", generation: 7)
+        #expect(await connection.waitUntilSentMessageCount(1))
+        await connection.enqueue(acknowledgement(for: profile))
+        #expect(await recorder.waitForOutcome() == .succeeded)
+        await startTask.value
+
+        // Retain exactly a full stream of correlated terminal events. The next
+        // failure/expiry notification displaces one even though state is terminal.
+        for turn in 1...32 {
+            let timestamp = UInt64(1_000 + (turn - 1) * 1_000)
+            let utterance = RealtimeUtterance(
+                sourceAlias: "audio-1", generation: 7, captionID: UUID(),
+                utteranceID: "terminal-state-loss-\(turn)",
+                startMonotonicNanoseconds: timestamp,
+                endMonotonicNanoseconds: timestamp + 1_000
+            )
+            try await driver.sendAudioChunk(makeChunk(generation: 7, timestamp: timestamp))
+            try await driver.commit(utterance)
+            if profile == .geminiLive {
+                #expect(await connection.waitUntilSentMessageCount(1 + 3 * turn))
+                await connection.enqueue(.text(#"{"serverContent":{"turnComplete":true}}"#))
+            } else {
+                #expect(await connection.waitUntilSentMessageCount(3 * turn))
+                await connection.enqueue(.text(#"{"type":"input_audio_buffer.committed"}"#))
+                #expect(await connection.waitUntilSentMessageCount(1 + 3 * turn))
+                let responseID = "resp_terminal_state_loss_\(turn)"
+                await connection.enqueue(.text(#"{"type":"response.created","response":{"id":"\#(responseID)"}}"#))
+                await connection.enqueue(.text(#"{"type":"response.done","response":{"id":"\#(responseID)","status":"completed"}}"#))
+            }
+            await driver.waitForTerminalEventCountForTesting(turn)
+        }
+        if profile == .geminiLive {
+            await connection.enqueue(.text(#"{"goAway":{"timeLeft":{"seconds":"12"}}}"#))
+        } else {
+            await connection.enqueue(.text(#"{"type":"error","error":{"code":"rate_limit_exceeded"}}"#))
+        }
+        await connection.waitForClose()
+
+        // A valid new-generation socket would accept setup if restart were allowed.
+        // Reject before dialing: correlation was lost, so this owner needs replacing.
+        await replacement.enqueue(acknowledgement(for: profile))
+        await expectFailure(.connectionFailed) {
+            try await driver.start(sourceAlias: "audio-1", generation: 8)
+        }
+        #expect((await connector.sanitizedRequests()).count == 1)
+        await driver.stop()
+    }
+
+    @Test func slowConsumerOverflowOnCorrectionDoesNotEmitTerminalForThatCaption() async throws {
+        let (driver, connection, recorder, task) = await makeReadyDriver(profile: .openAIMini)
+        var overflowUtterance: RealtimeUtterance?
+
+        for turn in 1...17 {
+            let timestamp = UInt64(1_000 + (turn - 1) * 1_000)
+            let utterance = RealtimeUtterance(
+                sourceAlias: "audio-1",
+                generation: 7,
+                captionID: UUID(),
+                utteranceID: "correction-overflow-\(turn)",
+                startMonotonicNanoseconds: timestamp,
+                endMonotonicNanoseconds: timestamp + 1_000
+            )
+            try await driver.sendAudioChunk(makeChunk(generation: 7, timestamp: timestamp))
+            try await driver.commit(utterance)
+            #expect(await connection.waitUntilSentMessageCount(3 * turn))
+            await connection.enqueue(.text(#"{"type":"input_audio_buffer.committed"}"#))
+            #expect(await connection.waitUntilSentMessageCount(1 + 3 * turn))
+            let responseID = "resp_correction_overflow_\(turn)"
+            await connection.enqueue(.text(#"{"type":"response.created","response":{"id":"\#(responseID)"}}"#))
+            await connection.enqueue(.text(#"{"type":"response.output_text.delta","response_id":"\#(responseID)","delta":"corrected words for turn \#(turn)"}"#))
+            await connection.enqueue(.text(#"{"type":"response.done","response":{"id":"\#(responseID)","status":"completed"}}"#))
+            if turn < 17 {
+                await driver.waitForTerminalEventCountForTesting(turn)
+            } else {
+                overflowUtterance = utterance
+                await driver.waitForProviderEventBackpressureForTesting()
+            }
+        }
+
+        #expect(await driver.isFailedForTesting())
+        await connection.waitForClose()
+        #expect(!(await driver.hasPendingMediaForTesting()))
+
+        let stream = await driver.events()
+        var iterator = stream.makeAsyncIterator()
+        var bufferedEvents: [RealtimeProviderEvent] = []
+        for _ in 0..<33 {
+            guard let event = await iterator.next() else { break }
+            bufferedEvents.append(event)
+        }
+        #expect(bufferedEvents.count == 32)
+        #expect(bufferedEvents.last == .failure(sourceAlias: "audio-1", generation: 7, .backpressure))
+        if let overflowUtterance {
+            #expect(bufferedEvents.contains(.correctedText(
+                sourceAlias: overflowUtterance.sourceAlias,
+                generation: overflowUtterance.generation,
+                captionID: overflowUtterance.captionID,
+                utteranceID: overflowUtterance.utteranceID,
+                text: "corrected words for turn 17"
+            )))
+            #expect(!bufferedEvents.contains(completedEvent(for: overflowUtterance)))
+        }
+
+        await driver.stop()
+        #expect(await recorder.outcome() == .succeeded)
+        await task.value
+    }
+
+    @Test func slowProviderEventConsumerIsBoundedAndFailsOnlyItsDriver() async throws {
+        let (driver, connection, recorder, task) = await makeReadyDriver(
+            profile: .qwenOmniFlash,
+            videoEnabled: true
+        )
+        let (sibling, siblingConnection, siblingRecorder, siblingTask) = await makeReadyDriver(profile: .openAIMini)
+        try await driver.sendVideoFrame(makeVideoFrame(timestamp: 1_000_000_000))
+
+        for index in 0..<33 {
+            let turn = index + 1
+            let timestamp = UInt64(1_000 + index * 1_000)
+            let utterance = RealtimeUtterance(
+                sourceAlias: "audio-1",
+                generation: 7,
+                captionID: UUID(),
+                utteranceID: "overflow-\(turn)",
+                startMonotonicNanoseconds: timestamp,
+                endMonotonicNanoseconds: timestamp + 1_000
+            )
+            if turn == 33 {
+                try await driver.sendAudioChunk(makeChunk(generation: 7, timestamp: timestamp + 2_000))
+            }
+            try await driver.sendAudioChunk(makeChunk(generation: 7, timestamp: timestamp))
+            try await driver.commit(utterance)
+            #expect(await connection.waitUntilSentMessageCount(3 * turn))
+            await connection.enqueue(.text(#"{"type":"input_audio_buffer.committed"}"#))
+            #expect(await connection.waitUntilSentMessageCount(1 + 3 * turn))
+            let responseID = "resp_overflow_\(turn)"
+            await connection.enqueue(.text(#"{"type":"response.created","response":{"id":"\#(responseID)"}}"#))
+            await connection.enqueue(.text(#"{"type":"response.done","response":{"id":"\#(responseID)","status":"completed"}}"#))
+            await driver.waitForTerminalEventCountForTesting(turn)
+        }
+
+        let didFail = await driver.isFailedForTesting()
+        #expect(didFail)
+        if didFail {
+            await connection.waitForClose()
+            #expect(!(await driver.hasPendingMediaForTesting()))
+        }
+
+        let stream = await driver.events()
+        var iterator = stream.makeAsyncIterator()
+        var bufferedEvents: [RealtimeProviderEvent] = []
+        for _ in 0..<33 {
+            guard let event = await iterator.next() else { break }
+            bufferedEvents.append(event)
+        }
+        #expect(bufferedEvents.count == 32)
+        #expect(bufferedEvents.last == .failure(sourceAlias: "audio-1", generation: 7, .backpressure))
+        #expect(bufferedEvents.filter {
+            if case .utteranceCompleted = $0 { return true }
+            return false
+        }.count == 31)
+
+        // A lost event degrades only its owning driver; the sibling can still complete
+        // and delivers its correction before the matching terminal event.
+        let siblingStream = await sibling.events()
+        let siblingUtterance = makeUtterance(generation: 7, start: 100, end: 200)
+        try await sibling.sendAudioChunk(makeChunk(generation: 7, timestamp: 150))
+        try await sibling.commit(siblingUtterance)
+        #expect(await siblingConnection.waitUntilSentMessageCount(3))
+        await siblingConnection.enqueue(.text(#"{"type":"input_audio_buffer.committed"}"#))
+        #expect(await siblingConnection.waitUntilSentMessageCount(4))
+        await siblingConnection.enqueue(.text(#"{"type":"response.created","response":{"id":"resp_sibling"}}"#))
+        await siblingConnection.enqueue(.text(#"{"type":"response.output_text.delta","response_id":"resp_sibling","delta":"healthy caption"}"#))
+        await siblingConnection.enqueue(.text(#"{"type":"response.done","response":{"id":"resp_sibling","status":"completed"}}"#))
+        await sibling.waitForTerminalEventCountForTesting(1)
+        var siblingIterator = siblingStream.makeAsyncIterator()
+        #expect(await siblingIterator.next() == .correctedText(
+            sourceAlias: "audio-1",
+            generation: 7,
+            captionID: siblingUtterance.captionID,
+            utteranceID: siblingUtterance.utteranceID,
+            text: "healthy caption"
+        ))
+        #expect(await siblingIterator.next() == completedEvent(for: siblingUtterance))
+
+        await driver.stop()
+        await sibling.stop()
+        #expect(await recorder.outcome() == .succeeded)
+        #expect(await siblingRecorder.outcome() == .succeeded)
+        await task.value
+        await siblingTask.value
+    }
+
+    @Test func emptyTerminalCompletesOnceAndAllowsTheNextUtterance() async throws {
+        let (driver, connection, recorder, task) = await makeReadyDriver(profile: .openAIMini)
+        let (events, eventTask) = await recordEvents(from: driver)
+        let emptyUtterance = makeUtterance(generation: 7, start: 90, end: 200)
+        try await driver.sendAudioChunk(makeChunk(generation: 7, timestamp: 100))
+        try await driver.commit(emptyUtterance)
+        #expect(await connection.waitUntilSentMessageCount(3))
+        await connection.enqueue(.text(#"{"type":"input_audio_buffer.committed"}"#))
+        #expect(await connection.waitUntilSentMessageCount(4))
+        await connection.enqueue(.text(#"{"type":"response.created","response":{"id":"resp_empty"}}"#))
+        await connection.enqueue(.text(#"{"type":"response.done","response":{"id":"resp_empty","status":"completed"}}"#))
+        #expect(await events.waitForCount(1))
+        #expect(await events.snapshot() == [completedEvent(for: emptyUtterance)])
+
+        let nextUtterance = makeUtterance(generation: 7, start: 290, end: 400)
+        try await driver.sendAudioChunk(makeChunk(generation: 7, timestamp: 300))
+        try await driver.commit(nextUtterance)
+        #expect(await connection.waitUntilSentMessageCount(6))
+        await connection.enqueue(.text(#"{"type":"input_audio_buffer.committed"}"#))
+        #expect(await connection.waitUntilSentMessageCount(7))
+        await connection.enqueue(.text(#"{"type":"response.created","response":{"id":"resp_next"}}"#))
+        await connection.enqueue(.text(#"{"type":"response.output_text.delta","response_id":"resp_next","delta":"next statement"}"#))
+        await connection.enqueue(.text(#"{"type":"response.done","response":{"id":"resp_next","status":"completed"}}"#))
+        #expect(await events.waitForCount(3))
+        #expect(await events.snapshot() == [
+            completedEvent(for: emptyUtterance),
+            .correctedText(
+                sourceAlias: "audio-1",
+                generation: 7,
+                captionID: nextUtterance.captionID,
+                utteranceID: nextUtterance.utteranceID,
+                text: "next statement"
+            ),
+            completedEvent(for: nextUtterance),
         ])
 
         await driver.stop()
@@ -1273,7 +1526,7 @@ struct NativeRealtimeSessionDriverTests {
         await connection.enqueue(.text(#"{"type":"response.created","response":{"id":"resp_previous"}}"#))
         await connection.enqueue(.text(#"{"type":"response.output_text.delta","response_id":"resp_previous","delta":"first caption"}"#))
         await connection.enqueue(.text(#"{"type":"response.done","response":{"id":"resp_previous","status":"completed"}}"#))
-        #expect(await events.waitForCount(1))
+        #expect(await events.waitForCount(2))
 
         let secondUtterance = makeUtterance(generation: 7, start: 290, end: 400)
         try await driver.sendAudioChunk(makeChunk(generation: 7, timestamp: 300))
@@ -1285,12 +1538,12 @@ struct NativeRealtimeSessionDriverTests {
         await connection.enqueue(.text(#"{"type":"response.output_text.delta","response_id":"resp_previous","delta":"late prior text"}"#))
         await connection.enqueue(.text(#"{"type":"response.done","response":{"id":"resp_previous","status":"completed"}}"#))
         try await Task.sleep(for: .milliseconds(20))
-        #expect(await events.snapshot().count == 1)
+        #expect(await events.snapshot().count == 2)
 
         await connection.enqueue(.text(#"{"type":"response.created","response":{"id":"resp_current"}}"#))
         await connection.enqueue(.text(#"{"type":"response.output_text.delta","response_id":"resp_current","delta":"second caption"}"#))
         await connection.enqueue(.text(#"{"type":"response.done","response":{"id":"resp_current","status":"completed"}}"#))
-        #expect(await events.waitForCount(2))
+        #expect(await events.waitForCount(4))
         #expect(await events.snapshot() == [
             .correctedText(
                 sourceAlias: "audio-1",
@@ -1299,6 +1552,7 @@ struct NativeRealtimeSessionDriverTests {
                 utteranceID: firstUtterance.utteranceID,
                 text: "first caption"
             ),
+            completedEvent(for: firstUtterance),
             .correctedText(
                 sourceAlias: "audio-1",
                 generation: 7,
@@ -1306,6 +1560,7 @@ struct NativeRealtimeSessionDriverTests {
                 utteranceID: secondUtterance.utteranceID,
                 text: "second caption"
             ),
+            completedEvent(for: secondUtterance),
         ])
 
         await driver.stop()
@@ -1326,25 +1581,29 @@ struct NativeRealtimeSessionDriverTests {
             "Of course — I can provide the corrected transcript: hello.",
             "For this audio, I can provide a transcription: hello.",
         ]
+        var expectedEvents: [RealtimeProviderEvent] = []
         for (index, reply) in replies.enumerated() {
             let timestamp = UInt64(100 + index * 200)
             let responseID = "resp_answer_\(index)"
             let sentCount = await connection.sentMessageTypes().count
             try await driver.sendAudioChunk(makeChunk(generation: 7, timestamp: timestamp))
-            try await driver.commit(makeUtterance(
+            let utterance = makeUtterance(
                 generation: 7,
                 start: timestamp - 10,
                 end: timestamp + 100
-            ))
+            )
+            try await driver.commit(utterance)
+            expectedEvents.append(completedEvent(for: utterance))
             #expect(await connection.waitUntilSentMessageCount(sentCount + 2))
             await connection.enqueue(.text(#"{"type":"input_audio_buffer.committed"}"#))
             #expect(await connection.waitUntilSentMessageCount(sentCount + 3))
             await connection.enqueue(.text(#"{"type":"response.created","response":{"id":"\#(responseID)"}}"#))
             await connection.enqueue(.text(#"{"type":"response.text.delta","response_id":"\#(responseID)","delta":"\#(reply)"}"#))
             await connection.enqueue(.text(#"{"type":"response.done","response":{"id":"\#(responseID)","status":"completed"}}"#))
-            try await Task.sleep(for: .milliseconds(20))
+            #expect(await events.waitForCount(expectedEvents.count))
         }
-        #expect(await events.snapshot().isEmpty)
+        #expect(await events.waitForCount(replies.count))
+        #expect(await events.snapshot() == expectedEvents)
 
         await driver.stop()
         eventTask.cancel()
@@ -1423,16 +1682,17 @@ struct NativeRealtimeSessionDriverTests {
     @Test func embeddedConversationalAnswerCannotOverwriteCaption() async throws {
         let (driver, connection, recorder, task) = await makeReadyDriver(profile: .openAIMini)
         let (events, eventTask) = await recordEvents(from: driver)
+        let utterance = makeUtterance(generation: 7, start: 90, end: 200)
         try await driver.sendAudioChunk(makeChunk(generation: 7, timestamp: 100))
-        try await driver.commit(makeUtterance(generation: 7, start: 90, end: 200))
+        try await driver.commit(utterance)
         #expect(await connection.waitUntilSentMessageCount(3))
         await connection.enqueue(.text(#"{"type":"input_audio_buffer.committed"}"#))
         #expect(await connection.waitUntilSentMessageCount(4))
         await connection.enqueue(.text(#"{"type":"response.created","response":{"id":"resp_reply"}}"#))
         await connection.enqueue(.text(#"{"type":"response.output_text.delta","response_id":"resp_reply","delta":"Hello! How can I help you today?"}"#))
         await connection.enqueue(.text(#"{"type":"response.done","response":{"id":"resp_reply","status":"completed"}}"#))
-        try await Task.sleep(for: .milliseconds(20))
-        #expect(await events.snapshot().isEmpty)
+        #expect(await events.waitForCount(1))
+        #expect(await events.snapshot() == [completedEvent(for: utterance)])
         await driver.stop()
         eventTask.cancel()
         #expect(await recorder.outcome() == .succeeded)
@@ -1451,7 +1711,7 @@ struct NativeRealtimeSessionDriverTests {
         await connection.enqueue(.text(#"{"type":"response.created","response":{"id":"resp_statement"}}"#))
         await connection.enqueue(.text(#"{"type":"response.output_text.delta","response_id":"resp_statement","delta":"The package arrives\ntomorrow."}"#))
         await connection.enqueue(.text(#"{"type":"response.done","response":{"id":"resp_statement","status":"completed"}}"#))
-        #expect(await events.waitForCount(1))
+        #expect(await events.waitForCount(2))
         #expect(await events.snapshot() == [
             .correctedText(
                 sourceAlias: "audio-1",
@@ -1460,6 +1720,7 @@ struct NativeRealtimeSessionDriverTests {
                 utteranceID: utterance.utteranceID,
                 text: "The package arrives\ntomorrow."
             ),
+            completedEvent(for: utterance),
         ])
         await driver.stop()
         eventTask.cancel()
@@ -1470,8 +1731,9 @@ struct NativeRealtimeSessionDriverTests {
     @Test func cancelledQwenResponseCannotCorrectCaption() async throws {
         let (driver, connection, recorder, task) = await makeReadyDriver(profile: .qwenOmniFlash)
         let (events, eventTask) = await recordEvents(from: driver)
+        let utterance = makeUtterance(generation: 7, start: 90, end: 200)
         try await driver.sendAudioChunk(makeChunk(generation: 7, timestamp: 100))
-        try await driver.commit(makeUtterance(generation: 7, start: 90, end: 200))
+        try await driver.commit(utterance)
         #expect(await connection.waitUntilSentMessageCount(3))
         await connection.enqueue(.text(#"{"type":"input_audio_buffer.committed"}"#))
         #expect(await connection.waitUntilSentMessageCount(4))
@@ -1491,8 +1753,9 @@ struct NativeRealtimeSessionDriverTests {
     @Test func overlongCumulativeResponseCannotCorrectCaption() async throws {
         let (driver, connection, recorder, task) = await makeReadyDriver(profile: .openAIMini)
         let (events, eventTask) = await recordEvents(from: driver)
+        let utterance = makeUtterance(generation: 7, start: 90, end: 200)
         try await driver.sendAudioChunk(makeChunk(generation: 7, timestamp: 100))
-        try await driver.commit(makeUtterance(generation: 7, start: 90, end: 200))
+        try await driver.commit(utterance)
         #expect(await connection.waitUntilSentMessageCount(3))
         await connection.enqueue(.text(#"{"type":"input_audio_buffer.committed"}"#))
         #expect(await connection.waitUntilSentMessageCount(4))
@@ -1502,8 +1765,8 @@ struct NativeRealtimeSessionDriverTests {
         await connection.enqueue(.text(#"{"type":"response.output_text.delta","response_id":"resp_long","delta":"\#(firstHalf)"}"#))
         await connection.enqueue(.text(#"{"type":"response.output_text.delta","response_id":"resp_long","delta":"\#(secondHalf)"}"#))
         await connection.enqueue(.text(#"{"type":"response.done","response":{"id":"resp_long","status":"completed"}}"#))
-        try await Task.sleep(for: .milliseconds(40))
-        #expect(await events.snapshot().isEmpty)
+        #expect(await events.waitForCount(1))
+        #expect(await events.snapshot() == [completedEvent(for: utterance)])
 
         await driver.stop()
         eventTask.cancel()
@@ -1600,7 +1863,7 @@ struct NativeRealtimeSessionDriverTests {
         await healthyConnection.enqueue(.text(#"{"type":"response.output_text.delta","response_id":"resp_healthy","delta":"healthy caption"}"#))
         await healthyConnection.enqueue(.text(#"{"type":"response.done","response":{"id":"resp_healthy","status":"completed"}}"#))
         #expect(await failedEvents.waitForCount(1))
-        #expect(await healthyEvents.waitForCount(1))
+        #expect(await healthyEvents.waitForCount(2))
         #expect(await failedEvents.snapshot() == [
             .failure(sourceAlias: "audio-1", generation: 7, .capabilityRejected),
         ])
@@ -1612,6 +1875,7 @@ struct NativeRealtimeSessionDriverTests {
                 utteranceID: healthyUtterance.utteranceID,
                 text: "healthy caption"
             ),
+            completedEvent(for: healthyUtterance),
         ])
 
         await failedDriver.stop()
@@ -1632,7 +1896,7 @@ struct NativeRealtimeSessionDriverTests {
         try await driver.commit(utterance)
         #expect(await connection.waitUntilSentMessageCount(4))
         await connection.enqueue(.text(#"{"serverContent":{"outputTranscription":{"text":"transcribed words"},"turnComplete":true,"modelTurn":{"parts":[{"inlineData":{"data":"private-generated-audio"}}]}}}"#))
-        #expect(await events.waitForCount(1))
+        #expect(await events.waitForCount(2))
         #expect(await events.snapshot() == [
             .correctedText(
                 sourceAlias: "audio-1",
@@ -1641,6 +1905,7 @@ struct NativeRealtimeSessionDriverTests {
                 utteranceID: utterance.utteranceID,
                 text: "transcribed words"
             ),
+            completedEvent(for: utterance),
         ])
         #expect(!(await events.snapshot().description.contains("private-generated-audio")))
 
@@ -1672,11 +1937,11 @@ struct NativeRealtimeSessionDriverTests {
         try await driver.commit(utterance)
         #expect(await connection.waitUntilSuspendedMessageTypeStarted("activityEnd"))
         await connection.enqueue(.text(#"{"serverContent":{"outputTranscription":{"text":"turn left"},"turnComplete":true}}"#))
-        try await Task.sleep(for: .milliseconds(20))
+        await driver.waitForDeferredGeminiTerminalForTesting()
         #expect(await events.snapshot().isEmpty)
 
         await connection.releaseSuspendedSend()
-        #expect(await events.waitForCount(1))
+        #expect(await events.waitForCount(2))
         #expect(await events.snapshot() == [
             .correctedText(
                 sourceAlias: "audio-1",
@@ -1685,6 +1950,7 @@ struct NativeRealtimeSessionDriverTests {
                 utteranceID: utterance.utteranceID,
                 text: "turn left"
             ),
+            completedEvent(for: utterance),
         ])
         await driver.stop()
         eventTask.cancel()
@@ -1707,16 +1973,17 @@ struct NativeRealtimeSessionDriverTests {
         #expect(await recorder.waitForOutcome() == .succeeded)
         await task.value
         let (events, eventTask) = await recordEvents(from: driver)
+        let utterance = makeUtterance(generation: 7, start: 90, end: 200)
         try await driver.sendAudioChunk(makeChunk(generation: 7, timestamp: 100))
-        try await driver.commit(makeUtterance(generation: 7, start: 90, end: 200))
+        try await driver.commit(utterance)
         #expect(await connection.waitUntilSuspendedMessageTypeStarted("activityEnd"))
         await connection.enqueue(.text(#"{"serverContent":{"outputTranscription":{"text":"cancelled words"},"interrupted":true,"turnComplete":true}}"#))
-        try await Task.sleep(for: .milliseconds(20))
+        await driver.waitForDeferredGeminiTerminalForTesting()
         #expect(await events.snapshot().isEmpty)
 
         await connection.releaseSuspendedSend()
-        try await Task.sleep(for: .milliseconds(30))
-        #expect(await events.snapshot().isEmpty)
+        #expect(await events.waitForCount(1))
+        #expect(await events.snapshot() == [completedEvent(for: utterance)])
         await driver.stop()
         eventTask.cancel()
     }
@@ -1737,17 +2004,18 @@ struct NativeRealtimeSessionDriverTests {
         #expect(await recorder.waitForOutcome() == .succeeded)
         await task.value
         let (events, eventTask) = await recordEvents(from: driver)
+        let utterance = makeUtterance(generation: 7, start: 90, end: 200)
         try await driver.sendAudioChunk(makeChunk(generation: 7, timestamp: 100))
-        try await driver.commit(makeUtterance(generation: 7, start: 90, end: 200))
+        try await driver.commit(utterance)
         #expect(await connection.waitUntilSuspendedMessageTypeStarted("activityEnd"))
         await connection.enqueue(.text(#"{"serverContent":{"outputTranscription":{"text":"cancelled words"},"interrupted":true}}"#))
         await connection.enqueue(.text(#"{"serverContent":{"outputTranscription":{"text":"late words"},"turnComplete":true}}"#))
-        try await Task.sleep(for: .milliseconds(20))
+        await driver.waitForDeferredGeminiTerminalForTesting()
         #expect(await events.snapshot().isEmpty)
 
         await connection.releaseSuspendedSend()
-        try await Task.sleep(for: .milliseconds(30))
-        #expect(await events.snapshot().isEmpty)
+        #expect(await events.waitForCount(1))
+        #expect(await events.snapshot() == [completedEvent(for: utterance)])
         await driver.stop()
         eventTask.cancel()
     }
@@ -1970,14 +2238,17 @@ struct NativeRealtimeSessionDriverTests {
         let types = await connection.sentMessageTypes()
         #expect(types == ["setup", "activityStart", "audio", "activityEnd"])
         await connection.enqueue(.text(#"{"serverContent":{"outputTranscription":{"text":"corrected words"},"turnComplete":true,"modelTurn":{"parts":[{"inlineData":{"data":"discard-this-audio"}}]}}}"#))
-        #expect(await events.waitForCount(1))
-        #expect(await events.snapshot().first == .correctedText(
-            sourceAlias: "audio-1",
-            generation: 7,
-            captionID: firstUtterance.captionID,
-            utteranceID: "synthetic-utterance",
-            text: "corrected words"
-        ))
+        #expect(await events.waitForCount(2))
+        #expect(await events.snapshot() == [
+            .correctedText(
+                sourceAlias: "audio-1",
+                generation: 7,
+                captionID: firstUtterance.captionID,
+                utteranceID: "synthetic-utterance",
+                text: "corrected words"
+            ),
+            completedEvent(for: firstUtterance),
+        ])
 
         // The next Gemini utterance may begin after turnComplete.
         try await driver.sendAudioChunk(makeChunk(generation: 7, timestamp: 600))
@@ -2192,6 +2463,15 @@ private func makeUtterance(
     )
 }
 
+private func completedEvent(for utterance: RealtimeUtterance) -> RealtimeProviderEvent {
+    .utteranceCompleted(
+        sourceAlias: utterance.sourceAlias,
+        generation: utterance.generation,
+        captionID: utterance.captionID,
+        utteranceID: utterance.utteranceID
+    )
+}
+
 private func expectFailure(
     _ expected: RealtimeFailureCode,
     _ operation: () async throws -> Void
@@ -2312,6 +2592,7 @@ private actor FakeRealtimeWebSocketConnection: RealtimeWebSocketConnection {
     private var didSuspendConfiguredSendTypes: Set<String> = []
     private var closed = false
     private var closes = 0
+    private var closeWaiters: [CheckedContinuation<Void, Never>] = []
 
     init(
         suspendSend: Bool = false,
@@ -2368,6 +2649,9 @@ private actor FakeRealtimeWebSocketConnection: RealtimeWebSocketConnection {
         guard !closed else { return }
         closed = true
         closes += 1
+        let waiters = closeWaiters
+        closeWaiters.removeAll()
+        waiters.forEach { $0.resume() }
         if let receiveWaiter {
             self.receiveWaiter = nil
             receiveWaiter.resume(throwing: RealtimeTransportError.closed)
@@ -2394,6 +2678,11 @@ private actor FakeRealtimeWebSocketConnection: RealtimeWebSocketConnection {
         return sentMessages.contains(where: { Self.containsFrame($0, frame: frame) })
     }
     func closeCount() -> Int { closes }
+
+    func waitForClose() async {
+        if closed { return }
+        await withCheckedContinuation { closeWaiters.append($0) }
+    }
 
     func waitUntilSendStarted() async -> Bool {
         for _ in 0..<200 {
