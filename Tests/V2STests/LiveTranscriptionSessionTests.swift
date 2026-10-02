@@ -1,5 +1,7 @@
 import AVFoundation
+import CoreMedia
 import Foundation
+import Speech
 import Testing
 @testable import v2s
 
@@ -178,6 +180,632 @@ import Testing
                 durationSeconds: Double(Int64.max) / 16_000
             ) == nil
         )
+    }
+
+    @Test func modernRecognitionClockRequiresMatchingContiguousAnalyzerFrames() {
+        let sourceToken = UUID()
+        var valid = ModernRecognitionSampleMapping(
+            sourceToken: sourceToken,
+            captureGeneration: 11
+        )
+        let validAppendSucceeded = valid.appendBuffer(
+            captureInterval: 4..<8,
+            outputSampleRate: 16_000,
+            outputFrameCount: 4,
+            preservesFrameIdentity: true
+        )
+        valid.recordDelivery(.enqueued)
+        let exactProvenance = valid.provenance(for: sampleTimeRange(start: 4, duration: 2))
+        #expect(validAppendSucceeded)
+        #expect(exactProvenance?.sourceToken == sourceToken)
+        #expect(exactProvenance?.captureGeneration == 11)
+        #expect(exactProvenance?.sampleInterval == 4..<6)
+        #expect(valid.provenance(for: sampleTimeRange(start: 3, duration: 1)) == nil)
+        #expect(valid.provenance(for: sampleTimeRange(start: 7, duration: 2)) == nil)
+
+        var mapping = ModernRecognitionSampleMapping(
+            sourceToken: UUID(),
+            captureGeneration: 12
+        )
+
+        let firstAppendSucceeded = mapping.appendBuffer(
+            captureInterval: 4..<8,
+            outputSampleRate: 16_000,
+            outputFrameCount: 4,
+            preservesFrameIdentity: true
+        )
+        let secondAppendSucceeded = mapping.appendBuffer(
+            captureInterval: 8..<12,
+            outputSampleRate: 48_000,
+            outputFrameCount: 12,
+            preservesFrameIdentity: true
+        )
+
+        #expect(firstAppendSucceeded)
+        #expect(secondAppendSucceeded == false)
+        #expect(mapping.isValid == false)
+        #expect(mapping.provenance(for: sampleTimeRange(start: 4, duration: 2)) == nil)
+    }
+
+    @Test func modernRecognitionClockRejectsTimeFromDifferentCMTimeEpochButKeepsLocalText() {
+        var mapping = ModernRecognitionSampleMapping(sourceToken: UUID(), captureGeneration: 22)
+        let appendSucceeded = mapping.appendBuffer(
+            captureInterval: 0..<8,
+            outputSampleRate: 16_000,
+            outputFrameCount: 8,
+            preservesFrameIdentity: true
+        )
+        mapping.recordDelivery(.enqueued)
+        let foreignEpochRange = CMTimeRange(
+            start: CMTime(value: 0, timescale: 16_000, flags: .valid, epoch: 1),
+            duration: CMTime(value: 2, timescale: 16_000)
+        )
+        let foreignEpochProvenance = mapping.provenance(for: foreignEpochRange)
+        let snapshot = ModernSpeechTextSnapshot(
+            text: "声。",
+            runs: [ModernSpeechTimedTextRun(utf16Range: 0..<2, audioProvenance: foreignEpochProvenance)]
+        )
+
+        #expect(appendSucceeded)
+        #expect(snapshot.text == "声。")
+        #expect(snapshot.audioProvenance == nil)
+    }
+
+    @Test @available(macOS 26.0, *) func modernAnalyzerInputUsesCaptureStartForEnqueuedUnchangedPCM() async throws {
+        let session = LiveTranscriptionSession()
+        await session.beginRecognitionSessionForTesting()
+        let stream = await session.installModernAnalyzerInputStreamForTesting()
+        await session.appendCapturedAudioBufferForTesting(
+            try makeMono16KBuffer(samples: [0.1, 0.2, 0.3, 0.4])
+        )
+
+        var iterator = stream.makeAsyncIterator()
+        let input = try #require(await iterator.next())
+        let provenance = await session.modernAudioProvenanceForTesting(sampleTimeRange(start: 0, duration: 4))
+        #expect(input.bufferStartTime == CMTime(value: 0, timescale: 16_000))
+        #expect(input.sampleRate == 16_000)
+        #expect(input.frameCount == 4)
+        #expect(provenance?.sampleInterval == 0..<4)
+    }
+
+    @Test @available(macOS 26.0, *) func modernAnalyzerStreamDropInvalidatesMappingButRetainsNewestLocalBuffer() async throws {
+        let session = LiveTranscriptionSession()
+        await session.beginRecognitionSessionForTesting()
+        let stream = await session.installModernAnalyzerInputStreamForTesting()
+        for frame in 0..<13 {
+            await session.appendCapturedAudioBufferForTesting(
+                try makeMono16KBuffer(samples: [Float(frame) / 13])
+            )
+        }
+
+        var iterator = stream.makeAsyncIterator()
+        var retainedInputs: [ModernAnalyzerInputSummary] = []
+        for _ in 0..<12 {
+            if let input = await iterator.next() {
+                retainedInputs.append(input)
+            }
+        }
+        let provenance = await session.modernAudioProvenanceForTesting(sampleTimeRange(start: 12, duration: 1))
+        #expect(retainedInputs.count == 12)
+        #expect(retainedInputs.first?.bufferStartTime == CMTime(value: 1, timescale: 16_000))
+        #expect(retainedInputs.last?.frameCount == 1)
+        #expect(retainedInputs.last?.bufferStartTime == CMTime(value: 12, timescale: 16_000))
+        #expect(provenance == nil)
+    }
+
+    @Test @available(macOS 26.0, *) func modernAnalyzerConversionKeepsLocalPCMWithoutInventingCaptureStart() async throws {
+        let session = LiveTranscriptionSession()
+        await session.beginRecognitionSessionForTesting()
+        let convertedFormat = try #require(
+            AVAudioFormat(
+                commonFormat: .pcmFormatInt16,
+                sampleRate: 16_000,
+                channels: 1,
+                interleaved: true
+            )
+        )
+        let stream = await session.installModernAnalyzerInputStreamForTesting(analyzerFormat: convertedFormat)
+        await session.appendCapturedAudioBufferForTesting(
+            try makeMono16KBuffer(samples: Array(repeating: 0.25, count: 160))
+        )
+
+        var iterator = stream.makeAsyncIterator()
+        let retainedInput = try #require(await iterator.next())
+        let provenance = await session.modernAudioProvenanceForTesting(sampleTimeRange(start: 0, duration: 160))
+        #expect(retainedInput.frameCount == 160)
+        #expect(retainedInput.sampleRate == 16_000)
+        #expect(retainedInput.isInt16PCM)
+        #expect(retainedInput.isInterleaved)
+        #expect(retainedInput.bufferStartTime == nil)
+        #expect(provenance == nil)
+    }
+
+    @Test func modernAnalyzerWithoutMappingStillYieldsLocalPCM() async throws {
+        let (stream, continuation) = AsyncStream<ModernAnalyzerInputSummary>.makeStream(
+            bufferingPolicy: .bufferingNewest(1)
+        )
+        var mapping: ModernRecognitionSampleMapping?
+        var deliveryCount = 0
+        let timestamp = ModernAnalyzerInputAppender.appendAndDeliver(
+            mapping: &mapping,
+            captureSampleInterval: nil,
+            inputSampleRate: 16_000,
+            inputChannelCount: 1,
+            inputFrameCount: 8,
+            outputSampleRate: 16_000,
+            outputChannelCount: 1,
+            outputFrameCount: 8,
+            unchangedBufferObject: true
+        ) { bufferStartTime in
+            deliveryCount += 1
+            switch continuation.yield(
+                ModernAnalyzerInputSummary(
+                    frameCount: 8,
+                    sampleRate: 16_000,
+                    isInt16PCM: false,
+                    isInterleaved: false,
+                    bufferStartTime: bufferStartTime
+                )
+            ) {
+            case .enqueued:
+                return .enqueued
+            case .dropped:
+                return .dropped
+            case .terminated:
+                return .terminated
+            @unknown default:
+                return .terminated
+            }
+        }
+
+        #expect(deliveryCount == 1)
+        var iterator = stream.makeAsyncIterator()
+        let retainedInput = deliveryCount == 1 ? await iterator.next() : nil
+        #expect(timestamp == nil)
+        #expect(retainedInput?.frameCount == 8)
+        #expect(retainedInput?.bufferStartTime == nil)
+    }
+
+    @Test @available(macOS 26.0, *) func modernAnalyzerTerminatedStreamInvalidatesMapping() async throws {
+        let session = LiveTranscriptionSession()
+        await session.beginRecognitionSessionForTesting()
+        _ = await session.installModernAnalyzerInputStreamForTesting()
+        await session.terminateModernAnalyzerInputStreamForTesting()
+        await session.appendCapturedAudioBufferForTesting(
+            try makeMono16KBuffer(samples: [0.1, 0.2, 0.3])
+        )
+
+        let provenance = await session.modernAudioProvenanceForTesting(sampleTimeRange(start: 0, duration: 3))
+        #expect(provenance == nil)
+    }
+
+    @Test @available(macOS 26.0, *)
+    func captureSampleBufferGapsInvalidateModernProvenanceButPreserveLaterLocalInput() async throws {
+        for gap in ["not ready", "conversion failed"] {
+            let session = LiveTranscriptionSession()
+            await session.beginRecognitionSessionForTesting()
+            let stream = await session.installModernAnalyzerInputStreamForTesting()
+            await session.appendCapturedAudioBufferForTesting(
+                try makeMono16KBuffer(samples: [0.1, 0.2])
+            )
+
+            var iterator = stream.makeAsyncIterator()
+            let beforeGap = try #require(await iterator.next())
+            #expect(beforeGap.bufferStartTime == CMTime(value: 0, timescale: 16_000))
+
+            await session.appendCapturedSampleBufferForTesting(
+                dataIsReady: gap != "not ready",
+                convertedPCMBuffer: nil
+            )
+            await session.appendCapturedAudioBufferForTesting(
+                try makeMono16KBuffer(samples: [0.3, 0.4])
+            )
+
+            let afterGap = try #require(await iterator.next())
+            let provenance = await session.modernAudioProvenanceForTesting(
+                sampleTimeRange(start: 2, duration: 2)
+            )
+            #expect(afterGap.frameCount == 2)
+            #expect(afterGap.bufferStartTime == nil)
+            #expect(provenance == nil)
+        }
+    }
+
+    @Test func normalizedSampleIdentityRejectsConvertedBuffersWithMatchingFormatAndLength() {
+        let captureInterval: NormalizedAudioSampleInterval = 20..<24
+        let unchangedBufferIsValid = NormalizedAudioFrameIdentity.preservesNormalizedSamples(
+            captureInterval: captureInterval,
+            inputSampleRate: 16_000,
+            inputChannelCount: 1,
+            inputFrameCount: 4,
+            outputSampleRate: 16_000,
+            outputChannelCount: 1,
+            outputFrameCount: 4,
+            unchangedBufferObject: true
+        )
+        let sameShapeConvertedBufferIsValid = NormalizedAudioFrameIdentity.preservesNormalizedSamples(
+            captureInterval: captureInterval,
+            inputSampleRate: 16_000,
+            inputChannelCount: 1,
+            inputFrameCount: 4,
+            outputSampleRate: 16_000,
+            outputChannelCount: 1,
+            outputFrameCount: 4,
+            unchangedBufferObject: false
+        )
+
+        #expect(unchangedBufferIsValid)
+        #expect(sameShapeConvertedBufferIsValid == false)
+
+        var unprovenMapping = ModernRecognitionSampleMapping(sourceToken: UUID(), captureGeneration: 19)
+        let unprovenAppendSucceeded = unprovenMapping.appendBuffer(
+            captureInterval: captureInterval,
+            outputSampleRate: 16_000,
+            outputFrameCount: 4,
+            preservesFrameIdentity: sameShapeConvertedBufferIsValid
+        )
+        #expect(unprovenAppendSucceeded == false)
+        #expect(unprovenMapping.isValid == false)
+    }
+
+    @Test func modernRecognitionClockInvalidatesSkippedBuffersAndStreamDrops() {
+        var skipped = ModernRecognitionSampleMapping(sourceToken: UUID(), captureGeneration: 13)
+        let initialAppendSucceeded = skipped.appendBuffer(
+            captureInterval: 0..<4,
+            outputSampleRate: 16_000,
+            outputFrameCount: 4,
+            preservesFrameIdentity: true
+        )
+        let skippedAppendSucceeded = skipped.appendBuffer(
+            captureInterval: 5..<7,
+            outputSampleRate: 16_000,
+            outputFrameCount: 2,
+            preservesFrameIdentity: true
+        )
+        #expect(initialAppendSucceeded)
+        #expect(skippedAppendSucceeded == false)
+        #expect(skipped.provenance(for: sampleTimeRange(start: 0, duration: 1)) == nil)
+
+        var dropped = ModernRecognitionSampleMapping(sourceToken: UUID(), captureGeneration: 14)
+        let droppedAppendSucceeded = dropped.appendBuffer(
+            captureInterval: 0..<4,
+            outputSampleRate: 16_000,
+            outputFrameCount: 4,
+            preservesFrameIdentity: true
+        )
+        #expect(droppedAppendSucceeded)
+        dropped.recordDelivery(.dropped)
+        #expect(dropped.isValid == false)
+        #expect(dropped.provenance(for: sampleTimeRange(start: 0, duration: 1)) == nil)
+
+        var terminated = ModernRecognitionSampleMapping(sourceToken: UUID(), captureGeneration: 18)
+        let terminatedAppendSucceeded = terminated.appendBuffer(
+            captureInterval: 0..<4,
+            outputSampleRate: 16_000,
+            outputFrameCount: 4,
+            preservesFrameIdentity: true
+        )
+        #expect(terminatedAppendSucceeded)
+        terminated.recordDelivery(.terminated)
+        #expect(terminated.isValid == false)
+        #expect(terminated.provenance(for: sampleTimeRange(start: 0, duration: 1)) == nil)
+    }
+
+    @Test func modernTimedTextRetainsExactUTF16RunsAcrossUnicodeAndTrimming() throws {
+        let sourceToken = UUID()
+        let generation: UInt64 = 15
+        let secondRange = RecognizedAudioProvenance(
+            sourceToken: sourceToken,
+            captureGeneration: generation,
+            sampleInterval: 40..<70
+        )
+        let snapshot = ModernSpeechTextSnapshot(
+            text: "  中🙂e\u{301}。次の文!  ",
+            runs: [
+                ModernSpeechTimedTextRun(utf16Range: 0..<2, audioProvenance: nil),
+                ModernSpeechTimedTextRun(
+                    utf16Range: 2..<5,
+                    audioProvenance: RecognizedAudioProvenance(
+                        sourceToken: sourceToken,
+                        captureGeneration: generation,
+                        sampleInterval: 0..<20
+                    )
+                ),
+                ModernSpeechTimedTextRun(
+                    utf16Range: 5..<8,
+                    audioProvenance: RecognizedAudioProvenance(
+                        sourceToken: sourceToken,
+                        captureGeneration: generation,
+                        sampleInterval: 20..<40
+                    )
+                ),
+                ModernSpeechTimedTextRun(utf16Range: 8..<12, audioProvenance: secondRange),
+                ModernSpeechTimedTextRun(utf16Range: 12..<14, audioProvenance: nil)
+            ]
+        )
+
+        let firstSentence = try #require(snapshot.slice(relativeUTF16Range: 0..<6))
+        let secondSentence = try #require(snapshot.slice(relativeUTF16Range: 6..<10))
+        #expect(snapshot.text == "中🙂e\u{301}。次の文!")
+        #expect(firstSentence.text == "中🙂e\u{301}。")
+        #expect(secondSentence.text == "次の文!")
+        #expect(firstSentence.audioProvenance?.sampleInterval == 0..<40)
+        #expect(secondSentence.audioProvenance == secondRange)
+        #expect(firstSentence.audioProvenance?.sampleInterval != secondSentence.audioProvenance?.sampleInterval)
+    }
+
+    @Test @available(macOS 26.0, *) func modernTimedTextSnapshotsActualSpeechAttributeRuns() throws {
+        let sourceToken = UUID()
+        var mapping = ModernRecognitionSampleMapping(sourceToken: sourceToken, captureGeneration: 21)
+        let appendSucceeded = mapping.appendBuffer(
+            captureInterval: 0..<70,
+            outputSampleRate: 16_000,
+            outputFrameCount: 70,
+            preservesFrameIdentity: true
+        )
+        mapping.recordDelivery(.enqueued)
+        #expect(appendSucceeded)
+
+        var attributedText = AttributedString("中🙂e\u{301}。次の文!")
+        let firstRunRange = try #require(attributedText.range(of: "中🙂"))
+        attributedText[firstRunRange].audioTimeRange = sampleTimeRange(start: 0, duration: 20)
+        let secondRunRange = try #require(attributedText.range(of: "e\u{301}。"))
+        attributedText[secondRunRange].audioTimeRange = sampleTimeRange(start: 20, duration: 20)
+        let thirdRunRange = try #require(attributedText.range(of: "次の文!"))
+        attributedText[thirdRunRange].audioTimeRange = sampleTimeRange(start: 40, duration: 30)
+
+        let snapshot = ModernSpeechTextSnapshot(attributedText: attributedText, mapping: mapping)
+        let firstSentence = try #require(snapshot.slice(relativeUTF16Range: 0..<6))
+        let secondSentence = try #require(snapshot.slice(relativeUTF16Range: 6..<10))
+        #expect(firstSentence.text == "中🙂e\u{301}。")
+        #expect(secondSentence.text == "次の文!")
+        #expect(firstSentence.audioProvenance?.sampleInterval == 0..<40)
+        #expect(secondSentence.audioProvenance?.sampleInterval == 40..<70)
+    }
+
+    @Test @MainActor @available(macOS 26.0, *)
+    func modernTimedEmissionKeepsSentenceIntervalsAfterMappingInvalidationAndAudioOptOut() async throws {
+        let session = LiveTranscriptionSession()
+        let recorder = RecognizedSentenceRecorder()
+        session.setTranscriptHandlerForTesting { recorder.record($0) }
+        await session.beginRecognitionSessionForTesting()
+        session.setCorrectionAudioCaptureEnabled(true)
+        let input = try #require(await session.makeRealtimePCM16AudioInput())
+        let epoch = await session.beginSpeechAnalyzerRecognitionForTesting()
+        _ = await session.installModernAnalyzerInputStreamForTesting(bufferingCapacity: 2)
+
+        await session.appendCapturedAudioBufferForTesting(try makeMono16KBuffer(samples: [0.1, 0.2]))
+        await session.appendCapturedAudioBufferForTesting(try makeMono16KBuffer(samples: [0.3, 0.4]))
+        let firstProvenance = RecognizedAudioProvenance(
+            sourceToken: input.sourceToken,
+            captureGeneration: input.generation,
+            sampleInterval: 0..<2
+        )
+        let secondProvenance = RecognizedAudioProvenance(
+            sourceToken: input.sourceToken,
+            captureGeneration: input.generation,
+            sampleInterval: 2..<4
+        )
+        let snapshot = ModernSpeechTextSnapshot(
+            text: "中。次。",
+            runs: [
+                ModernSpeechTimedTextRun(utf16Range: 0..<2, audioProvenance: firstProvenance),
+                ModernSpeechTimedTextRun(utf16Range: 2..<4, audioProvenance: secondProvenance)
+            ]
+        )
+
+        #expect(firstProvenance.sourceToken == input.sourceToken)
+        #expect(firstProvenance.captureGeneration == input.generation)
+        #expect(await session.enqueueModernTimedCommittedEmissionForTesting(snapshot: snapshot, epoch: epoch))
+
+        _ = await session.installModernAnalyzerInputStreamForTesting(bufferingCapacity: 1)
+        await session.appendCapturedAudioBufferForTesting(try makeMono16KBuffer(samples: [0.5, 0.6]))
+        await session.appendCapturedAudioBufferForTesting(try makeMono16KBuffer(samples: [0.7, 0.8]))
+        #expect(
+            await session.modernAudioProvenanceForTesting(sampleTimeRange(start: 0, duration: 2)) == nil
+        )
+
+        session.setCorrectionAudioCaptureEnabled(false)
+        await session.deliverQueuedCommittedEmissionForTesting()
+
+        #expect(recorder.texts == ["中。", "次。"])
+        #expect(recorder.sentences.map(\.audioProvenance) == [firstProvenance, secondProvenance])
+        #expect(recorder.receivedAudio == [false, false])
+    }
+
+    @Test @MainActor @available(macOS 26.0, *)
+    func modernTimedPrefixContinuationDoesNotReuseWholePriorIntervalForTail() async throws {
+        let session = LiveTranscriptionSession()
+        let recorder = RecognizedSentenceRecorder()
+        session.setTranscriptHandlerForTesting { recorder.record($0) }
+        await session.beginRecognitionSessionForTesting()
+        let input = try #require(await session.makeRealtimePCM16AudioInput())
+        let epoch = await session.beginSpeechAnalyzerRecognitionForTesting()
+        let knownPrefix = ModernSpeechTextSnapshot(
+            text: "Known",
+            runs: [ModernSpeechTimedTextRun(utf16Range: 0..<5, audioProvenance: nil)]
+        )
+        #expect(
+            await session.enqueueModernTimedCommittedEmissionForTesting(snapshot: knownPrefix, epoch: epoch)
+        )
+        await session.deliverQueuedCommittedEmissionForTesting()
+
+        let wholePriorInterval = RecognizedAudioProvenance(
+            sourceToken: input.sourceToken,
+            captureGeneration: input.generation,
+            sampleInterval: 40..<80
+        )
+        let continuedText = ModernSpeechTextSnapshot(
+            text: "Known new.",
+            runs: [ModernSpeechTimedTextRun(utf16Range: 0..<10, audioProvenance: wholePriorInterval)]
+        )
+        let preparedTail = try #require(session.prepareModernTimedSentenceForTesting(continuedText))
+
+        #expect(preparedTail.text == "new.")
+        #expect(preparedTail.audioProvenance == nil)
+        #expect(recorder.texts == ["Known"])
+    }
+
+    @Test func pendingModernPrefixStrippingKeepsOnlyTheExactTailInterval() async throws {
+        let token = UUID()
+        let firstProvenance = RecognizedAudioProvenance(
+            sourceToken: token,
+            captureGeneration: 24,
+            sampleInterval: 0..<10
+        )
+        let tailProvenance = RecognizedAudioProvenance(
+            sourceToken: token,
+            captureGeneration: 24,
+            sampleInterval: 10..<20
+        )
+        let snapshot = ModernSpeechTextSnapshot(
+            text: "中。次。",
+            runs: [
+                ModernSpeechTimedTextRun(utf16Range: 0..<2, audioProvenance: firstProvenance),
+                ModernSpeechTimedTextRun(utf16Range: 2..<4, audioProvenance: tailProvenance)
+            ]
+        )
+        let pending = await LiveTranscriptionSession().pendingModernTextForTesting(
+            snapshot,
+            committedPrefixText: "中。"
+        )
+
+        #expect(pending.text == "次。")
+        #expect(pending.audioProvenance == tailProvenance)
+    }
+
+    @Test func modernTimedTextRejectsMissingOverlappingAndStraddlingAudioRuns() throws {
+        let token = UUID()
+        let generation: UInt64 = 16
+        let missing = ModernSpeechTextSnapshot(
+            text: "First. Second.",
+            runs: [
+                ModernSpeechTimedTextRun(utf16Range: 0..<7, audioProvenance: nil),
+                ModernSpeechTimedTextRun(
+                    utf16Range: 7..<14,
+                    audioProvenance: RecognizedAudioProvenance(
+                        sourceToken: token,
+                        captureGeneration: generation,
+                        sampleInterval: 10..<20
+                    )
+                )
+            ]
+        )
+        let overlap = ModernSpeechTextSnapshot(
+            text: "First. Second.",
+            runs: [
+                ModernSpeechTimedTextRun(
+                    utf16Range: 0..<7,
+                    audioProvenance: RecognizedAudioProvenance(
+                        sourceToken: token,
+                        captureGeneration: generation,
+                        sampleInterval: 0..<12
+                    )
+                ),
+                ModernSpeechTimedTextRun(
+                    utf16Range: 7..<14,
+                    audioProvenance: RecognizedAudioProvenance(
+                        sourceToken: token,
+                        captureGeneration: generation,
+                        sampleInterval: 8..<20
+                    )
+                )
+            ]
+        )
+        let straddling = ModernSpeechTextSnapshot(
+            text: "First. Second.",
+            runs: [
+                ModernSpeechTimedTextRun(
+                    utf16Range: 0..<14,
+                    audioProvenance: RecognizedAudioProvenance(
+                        sourceToken: token,
+                        captureGeneration: generation,
+                        sampleInterval: 0..<30
+                    )
+                )
+            ]
+        )
+
+        #expect(try #require(missing.slice(relativeUTF16Range: 0..<7)).audioProvenance == nil)
+        #expect(try #require(overlap.slice(relativeUTF16Range: 0..<7)).audioProvenance == nil)
+        #expect(try #require(overlap.slice(relativeUTF16Range: 7..<14)).audioProvenance == nil)
+        #expect(try #require(straddling.slice(relativeUTF16Range: 0..<7)).audioProvenance == nil)
+        #expect(try #require(straddling.slice(relativeUTF16Range: 7..<14)).audioProvenance == nil)
+    }
+
+    @Test func modernTimedTextRejectsAttributeRunsThatSplitAComposedGrapheme() throws {
+        let token = UUID()
+        let generation: UInt64 = 17
+        let snapshot = ModernSpeechTextSnapshot(
+            text: "e\u{301} word.",
+            runs: [
+                ModernSpeechTimedTextRun(
+                    utf16Range: 0..<1,
+                    audioProvenance: RecognizedAudioProvenance(
+                        sourceToken: token,
+                        captureGeneration: generation,
+                        sampleInterval: 0..<4
+                    )
+                ),
+                ModernSpeechTimedTextRun(
+                    utf16Range: 1..<2,
+                    audioProvenance: RecognizedAudioProvenance(
+                        sourceToken: token,
+                        captureGeneration: generation,
+                        sampleInterval: 4..<8
+                    )
+                ),
+                ModernSpeechTimedTextRun(
+                    utf16Range: 2..<8,
+                    audioProvenance: RecognizedAudioProvenance(
+                        sourceToken: token,
+                        captureGeneration: generation,
+                        sampleInterval: 8..<20
+                    )
+                )
+            ]
+        )
+
+        let ambiguousUnit = try #require(snapshot.slice(relativeUTF16Range: 0..<8))
+        #expect(ambiguousUnit.text == "e\u{301} word.")
+        #expect(ambiguousUnit.audioProvenance == nil)
+    }
+
+    @Test func modernTimedTextRejectsNegativeAndEmptySampleIntervalsWithoutDroppingText() throws {
+        let token = UUID()
+        let negative = ModernSpeechTextSnapshot(
+            text: "A.",
+            runs: [
+                ModernSpeechTimedTextRun(
+                    utf16Range: 0..<2,
+                    audioProvenance: RecognizedAudioProvenance(
+                        sourceToken: token,
+                        captureGeneration: 20,
+                        sampleInterval: -1..<1
+                    )
+                )
+            ]
+        )
+        let empty = ModernSpeechTextSnapshot(
+            text: "B.",
+            runs: [
+                ModernSpeechTimedTextRun(
+                    utf16Range: 0..<2,
+                    audioProvenance: RecognizedAudioProvenance(
+                        sourceToken: token,
+                        captureGeneration: 20,
+                        sampleInterval: 5..<5
+                    )
+                )
+            ]
+        )
+
+        let negativeUnit = try #require(negative.slice(relativeUTF16Range: 0..<2))
+        let emptyUnit = try #require(empty.slice(relativeUTF16Range: 0..<2))
+        #expect(negativeUnit.text == "A.")
+        #expect(emptyUnit.text == "B.")
+        #expect(negativeUnit.audioProvenance == nil)
+        #expect(emptyUnit.audioProvenance == nil)
     }
 
     @Test @MainActor func committedLegacyProvenanceSurvivesRecognitionRestart() async throws {
@@ -580,6 +1208,131 @@ import Testing
         #expect(recorder.texts.isEmpty)
     }
 
+    @Test @MainActor @available(macOS 26.0, *)
+    func deferredModernEmptyResultsCannotClearDraftAfterFallbackOrNewCapture() async {
+        for resultKind in ["empty final", "empty nonfinal"] {
+            for transition in ["fallback", "new capture"] {
+                let session = LiveTranscriptionSession()
+                await session.beginRecognitionSessionForTesting()
+                let epoch = await session.beginSpeechAnalyzerRecognitionForTesting()
+                #expect(await session.enqueueModernPartialDraftForTesting(nil, epoch: epoch))
+
+                switch transition {
+                case "fallback":
+                    await session.fallbackSpeechAnalyzerToLegacyForTesting()
+                default:
+                    await session.beginRecognitionSessionForTesting()
+                }
+
+                var callbackCount = 0
+                session.setPartialHandlerForTesting { _ in callbackCount += 1 }
+                await session.deliverQueuedModernPartialDraftForTesting()
+                #expect(callbackCount == 0, "\(resultKind) callback reached after \(transition)")
+            }
+        }
+
+        let session = LiveTranscriptionSession()
+        await session.beginRecognitionSessionForTesting()
+        let epoch = await session.beginSpeechAnalyzerRecognitionForTesting()
+        var acceptedClearCount = 0
+        session.setPartialHandlerForTesting { draft in
+            if draft == nil { acceptedClearCount += 1 }
+        }
+        #expect(await session.enqueueModernPartialDraftForTesting(nil, epoch: epoch))
+        await session.deliverQueuedModernPartialDraftForTesting()
+        #expect(acceptedClearCount == 1)
+    }
+
+    @Test @MainActor @available(macOS 26.0, *)
+    func deferredModernDraftUpdateIsSuppressedAfterCaptureChanges() async {
+        let session = LiveTranscriptionSession()
+        await session.beginRecognitionSessionForTesting()
+        let epoch = await session.beginSpeechAnalyzerRecognitionForTesting()
+        let draft = DraftSegment(
+            segmentId: UUID(),
+            sourceText: "Old draft",
+            stablePrefixLength: 3,
+            mutableTailText: " draft",
+            avgConfidence: 0.9,
+            startMs: 0,
+            lastUpdateMs: 1,
+            silenceMs: 0,
+            stabilityScore: 1,
+            boundaryScore: 0.45,
+            chunkScore: 0.8,
+            vadProbability: 0.8,
+            words: []
+        )
+        #expect(await session.enqueueModernPartialDraftForTesting(draft, epoch: epoch))
+
+        await session.beginRecognitionSessionForTesting()
+        var callbackCount = 0
+        session.setPartialHandlerForTesting { _ in callbackCount += 1 }
+        await session.deliverQueuedModernPartialDraftForTesting()
+        #expect(callbackCount == 0)
+    }
+
+    @Test @MainActor @available(macOS 26.0, *)
+    func deferredModernTimedEmissionIsSuppressedAfterFallbackStopOrNewCapture() async throws {
+        for transition in ["fallback", "stop", "new capture"] {
+            let session = LiveTranscriptionSession()
+            let recorder = RecognizedSentenceRecorder()
+            session.setTranscriptHandlerForTesting { recorder.record($0) }
+            await session.beginRecognitionSessionForTesting()
+            let input = try #require(await session.makeRealtimePCM16AudioInput())
+            let epoch = await session.beginSpeechAnalyzerRecognitionForTesting()
+            let provenance = RecognizedAudioProvenance(
+                sourceToken: input.sourceToken,
+                captureGeneration: input.generation,
+                sampleInterval: 0..<10
+            )
+            let snapshot = ModernSpeechTextSnapshot(
+                text: "Queued.",
+                runs: [ModernSpeechTimedTextRun(utf16Range: 0..<7, audioProvenance: provenance)]
+            )
+            #expect(
+                await session.enqueueModernTimedCommittedEmissionForTesting(snapshot: snapshot, epoch: epoch)
+            )
+
+            switch transition {
+            case "fallback":
+                await session.fallbackSpeechAnalyzerToLegacyForTesting()
+            case "stop":
+                await session.stopAndWait()
+            default:
+                await session.beginRecognitionSessionForTesting()
+            }
+
+            var partialClearCallbacks = 0
+            session.setPartialHandlerForTesting { draft in
+                if draft == nil { partialClearCallbacks += 1 }
+            }
+            await session.deliverQueuedCommittedEmissionForTesting(clearDraftAfter: true)
+            #expect(recorder.texts.isEmpty)
+            #expect(partialClearCallbacks == 0)
+        }
+
+        let acceptedSession = LiveTranscriptionSession()
+        let acceptedRecorder = RecognizedSentenceRecorder()
+        var acceptedPartialClearCallbacks = 0
+        acceptedSession.setTranscriptHandlerForTesting { acceptedRecorder.record($0) }
+        acceptedSession.setPartialHandlerForTesting { draft in
+            if draft == nil { acceptedPartialClearCallbacks += 1 }
+        }
+        await acceptedSession.beginRecognitionSessionForTesting()
+        let acceptedEpoch = await acceptedSession.beginSpeechAnalyzerRecognitionForTesting()
+        let acceptedSnapshot = ModernSpeechTextSnapshot(text: "Accepted.", runs: [])
+        #expect(
+            await acceptedSession.enqueueModernTimedCommittedEmissionForTesting(
+                snapshot: acceptedSnapshot,
+                epoch: acceptedEpoch
+            )
+        )
+        await acceptedSession.deliverQueuedCommittedEmissionForTesting(clearDraftAfter: true)
+        #expect(acceptedRecorder.texts == ["Accepted."])
+        #expect(acceptedPartialClearCallbacks == 1)
+    }
+
     @Test @MainActor func disablingCaptureStripsAudioFromQueuedEmissionButRetainsText() async throws {
         let session = LiveTranscriptionSession()
         let recorder = RecognizedSentenceRecorder()
@@ -928,6 +1681,13 @@ import Testing
             domain: "kAFAssistantErrorDomain",
             code: code,
             message: message
+        )
+    }
+
+    private func sampleTimeRange(start: Int64, duration: Int64) -> CMTimeRange {
+        CMTimeRange(
+            start: CMTime(value: start, timescale: 16_000),
+            duration: CMTime(value: duration, timescale: 16_000)
         )
     }
 

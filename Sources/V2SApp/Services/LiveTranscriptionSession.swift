@@ -393,6 +393,7 @@ final class LiveTranscriptionSession: NSObject, @unchecked Sendable {
         let promotionSegmentID: UUID?
         let audioWAVData: Data?
         let audioProvenance: RecognizedAudioProvenance?
+        let modernTimedText: ModernSpeechTextSnapshot?
         let deliveryToken: CommittedEmissionDeliveryToken
 
         init(
@@ -400,12 +401,14 @@ final class LiveTranscriptionSession: NSObject, @unchecked Sendable {
             promotionSegmentID: UUID?,
             audioWAVData: Data? = nil,
             audioProvenance: RecognizedAudioProvenance? = nil,
+            modernTimedText: ModernSpeechTextSnapshot? = nil,
             deliveryToken: CommittedEmissionDeliveryToken
         ) {
             self.text = text
             self.promotionSegmentID = promotionSegmentID
             self.audioWAVData = audioWAVData
             self.audioProvenance = audioProvenance
+            self.modernTimedText = modernTimedText?.text == text ? modernTimedText : nil
             self.deliveryToken = deliveryToken
         }
     }
@@ -414,6 +417,11 @@ final class LiveTranscriptionSession: NSObject, @unchecked Sendable {
         let sessionEpoch: Int
         let audioCaptureEpoch: Int?
         let modernRecognitionEpoch: Int?
+    }
+
+    private struct ModernPartialDraftDelivery: Sendable {
+        let draft: DraftSegment?
+        let deliveryToken: CommittedEmissionDeliveryToken
     }
 
     private enum CommittedEmissionDeliveryPermission: Equatable {
@@ -543,6 +551,7 @@ final class LiveTranscriptionSession: NSObject, @unchecked Sendable {
     /// receive a partial correction WAV, so the next committed boundary discards it.
     private var legacyCorrectionAudioHasConversionGap = false
     private var queuedCommittedEmissionForTesting: CommittedEmission?
+    private var queuedModernPartialDraftDeliveryForTesting: ModernPartialDraftDelivery?
     private var committedSegmentCount = 0
     private let committedBoundaryToleranceSec: TimeInterval = 0.08
     private var committedAudioBoundaryTime: TimeInterval?
@@ -557,7 +566,10 @@ final class LiveTranscriptionSession: NSObject, @unchecked Sendable {
     private var speechTranscriberState: AnyObject?
     private var analyzerInputContinuationState: Any?
     private var analyzerInputFormat: AVAudioFormat?
+    private var modernAnalyzerInputYieldForTesting: ((AVAudioPCMBuffer, CMTime?) -> ModernAnalyzerInputDeliveryOutcome)?
+    private var modernAnalyzerInputFinishForTesting: (() -> Void)?
     private var latestModernText = ""
+    private var latestModernTimedText: ModernSpeechTextSnapshot?
     private var modernCommittedPrefixText = ""
 
     private var microphoneCaptureSession: AVCaptureSession?
@@ -567,6 +579,7 @@ final class LiveTranscriptionSession: NSObject, @unchecked Sendable {
     private var realtimeAudioGeneration: UInt64 = 0
     private var normalizedAudioSampleClock = NormalizedAudioSampleClock()
     private var legacyRecognitionSampleMapping: LegacyRecognitionSampleMapping?
+    private var modernRecognitionSampleMapping: ModernRecognitionSampleMapping?
 
     private var transcriptHandler: (@MainActor (RecognizedSentence) -> Void)?
     private var partialHandler: (@MainActor (DraftSegment?) -> Void)?
@@ -842,6 +855,13 @@ final class LiveTranscriptionSession: NSObject, @unchecked Sendable {
         transcriptHandler = handler
     }
 
+    @MainActor
+    func setPartialHandlerForTesting(
+        _ handler: @escaping @MainActor (DraftSegment?) -> Void
+    ) {
+        partialHandler = handler
+    }
+
     func appendCorrectionAudioBufferForTesting(_ audioBuffer: AVAudioPCMBuffer) async {
         let sendableAudioBuffer = UncheckedSendablePCMBuffer(value: audioBuffer)
         await withCheckedContinuation { continuation in
@@ -889,6 +909,83 @@ final class LiveTranscriptionSession: NSObject, @unchecked Sendable {
 
     func beginModernSetupForTesting() async -> Int {
         await beginRecognitionSessionOnCaptureQueue()
+    }
+
+    @available(macOS 26.0, *)
+    func installModernAnalyzerInputStreamForTesting(
+        bufferingCapacity: Int = 12,
+        analyzerFormat: AVAudioFormat? = nil
+    ) async -> AsyncStream<ModernAnalyzerInputSummary> {
+        await withCheckedContinuation { continuation in
+            captureQueue.async { [weak self] in
+                guard let self else {
+                    let (stream, inputContinuation) = AsyncStream<ModernAnalyzerInputSummary>.makeStream(
+                        bufferingPolicy: .bufferingNewest(max(1, bufferingCapacity))
+                    )
+                    inputContinuation.finish()
+                    continuation.resume(returning: stream)
+                    return
+                }
+                let (stream, inputContinuation) = AsyncStream<ModernAnalyzerInputSummary>.makeStream(
+                    bufferingPolicy: .bufferingNewest(max(1, bufferingCapacity))
+                )
+                self.analyzerInputContinuationState = nil
+                self.analyzerInputFormat = analyzerFormat
+                self.modernAnalyzerInputYieldForTesting = { buffer, bufferStartTime in
+                    switch inputContinuation.yield(
+                        ModernAnalyzerInputSummary(
+                            frameCount: Int(buffer.frameLength),
+                            sampleRate: buffer.format.sampleRate,
+                            isInt16PCM: buffer.format.commonFormat == .pcmFormatInt16,
+                            isInterleaved: buffer.format.isInterleaved,
+                            bufferStartTime: bufferStartTime
+                        )
+                    ) {
+                    case .enqueued:
+                        return .enqueued
+                    case .dropped:
+                        return .dropped
+                    case .terminated:
+                        return .terminated
+                    @unknown default:
+                        return .terminated
+                    }
+                }
+                self.modernAnalyzerInputFinishForTesting = { inputContinuation.finish() }
+                self.modernRecognitionSampleMapping = self.makeModernRecognitionSampleMapping()
+                self.setRecognitionBackend(.speechAnalyzer)
+                continuation.resume(returning: stream)
+            }
+        }
+    }
+
+    func terminateModernAnalyzerInputStreamForTesting() async {
+        await withCheckedContinuation { continuation in
+            captureQueue.async { [weak self] in
+                self?.modernAnalyzerInputFinishForTesting?()
+                continuation.resume()
+            }
+        }
+    }
+
+    func appendCapturedAudioBufferForTesting(_ audioBuffer: AVAudioPCMBuffer) async {
+        let sendableBuffer = UncheckedSendablePCMBuffer(value: audioBuffer)
+        await withCheckedContinuation { continuation in
+            captureQueue.async { [weak self] in
+                self?.append(audioBuffer: sendableBuffer.value)
+                continuation.resume()
+            }
+        }
+    }
+
+    func modernAudioProvenanceForTesting(_ timeRange: CMTimeRange) async -> RecognizedAudioProvenance? {
+        await withCheckedContinuation { continuation in
+            captureQueue.async { [weak self] in
+                continuation.resume(
+                    returning: self?.modernRecognitionSampleMapping?.provenance(for: timeRange)
+                )
+            }
+        }
     }
 
     func finalizeModernSetupForTesting(_ expectedEpoch: Int) async -> Bool {
@@ -1141,6 +1238,87 @@ final class LiveTranscriptionSession: NSObject, @unchecked Sendable {
         }
     }
 
+    @available(macOS 26.0, *)
+    func enqueueModernPartialDraftForTesting(_ draft: DraftSegment?, epoch: Int) async -> Bool {
+        await withCheckedContinuation { continuation in
+            captureQueue.async { [weak self] in
+                guard let self, acceptsModernResult(for: epoch) else {
+                    continuation.resume(returning: false)
+                    return
+                }
+                queuedModernPartialDraftDeliveryForTesting = makeModernPartialDraftDelivery(
+                    draft,
+                    recognitionEpoch: epoch
+                )
+                continuation.resume(returning: true)
+            }
+        }
+    }
+
+    @available(macOS 26.0, *)
+    func deliverQueuedModernPartialDraftForTesting() async {
+        let delivery = await withCheckedContinuation { continuation in
+            captureQueue.async { [weak self] in
+                let delivery = self?.queuedModernPartialDraftDeliveryForTesting
+                self?.queuedModernPartialDraftDeliveryForTesting = nil
+                continuation.resume(returning: delivery)
+            }
+        }
+        guard let delivery else { return }
+        await deliverModernPartialDraft(delivery)
+    }
+
+    @available(macOS 26.0, *)
+    func enqueueModernTimedCommittedEmissionForTesting(
+        snapshot: ModernSpeechTextSnapshot,
+        epoch: Int
+    ) async -> Bool {
+        await withCheckedContinuation { continuation in
+            captureQueue.async { [weak self] in
+                guard let self,
+                      acceptsModernResult(for: epoch),
+                      snapshot.text.isEmpty == false else {
+                    continuation.resume(returning: false)
+                    return
+                }
+                queuedCommittedEmissionForTesting = makeCommittedEmission(
+                    text: snapshot.text,
+                    promotionSegmentID: nil,
+                    audioWAVData: finishCorrectionAudio(),
+                    modernRecognitionEpoch: epoch,
+                    modernTimedText: snapshot
+                )
+                continuation.resume(returning: true)
+            }
+        }
+    }
+
+    func pendingModernTextForTesting(
+        _ snapshot: ModernSpeechTextSnapshot,
+        committedPrefixText: String
+    ) async -> ModernSpeechTextSnapshot {
+        await withCheckedContinuation { continuation in
+            captureQueue.async { [weak self] in
+                guard let self else {
+                    continuation.resume(returning: snapshot)
+                    return
+                }
+                let previousPrefix = modernCommittedPrefixText
+                modernCommittedPrefixText = committedPrefixText
+                let pendingSnapshot = pendingModernText(from: snapshot)
+                modernCommittedPrefixText = previousPrefix
+                continuation.resume(returning: pendingSnapshot)
+            }
+        }
+    }
+
+    @MainActor
+    func prepareModernTimedSentenceForTesting(
+        _ snapshot: ModernSpeechTextSnapshot
+    ) -> (text: String, audioProvenance: RecognizedAudioProvenance?)? {
+        prepareModernTimedSentenceForEmission(snapshot)
+    }
+
     func queueCommittedEmissionForTesting(text: String) async {
         await withCheckedContinuation { continuation in
             captureQueue.async { [weak self] in
@@ -1181,7 +1359,7 @@ final class LiveTranscriptionSession: NSObject, @unchecked Sendable {
         }
     }
 
-    func deliverQueuedCommittedEmissionForTesting() async {
+    func deliverQueuedCommittedEmissionForTesting(clearDraftAfter: Bool = false) async {
         let emission = await withCheckedContinuation { continuation in
             captureQueue.async { [weak self] in
                 let emission = self?.queuedCommittedEmissionForTesting
@@ -1190,7 +1368,7 @@ final class LiveTranscriptionSession: NSObject, @unchecked Sendable {
             }
         }
         guard let emission else { return }
-        await emitCommittedSequence([emission])
+        await emitCommittedSequence([emission], clearDraftAfter: clearDraftAfter)
     }
 
     func finishCorrectionAudioThroughForTesting(_ time: TimeInterval) async {
@@ -1277,6 +1455,7 @@ final class LiveTranscriptionSession: NSObject, @unchecked Sendable {
     private func resetRecognitionEpoch() {
         recognitionEpoch &+= 1
         legacyRecognitionSampleMapping = nil
+        modernRecognitionSampleMapping = nil
         transcriptDeliveryLock.lock()
         deliveryRecognitionEpoch = recognitionEpoch
         transcriptDeliveryLock.unlock()
@@ -1291,11 +1470,27 @@ final class LiveTranscriptionSession: NSObject, @unchecked Sendable {
         )
     }
 
+    private func makeModernRecognitionSampleMapping() -> ModernRecognitionSampleMapping? {
+        guard let realtimeAudioFanout else { return nil }
+        return ModernRecognitionSampleMapping(
+            sourceToken: realtimeAudioFanout.sourceToken,
+            captureGeneration: realtimeAudioFanout.generation
+        )
+    }
+
     private func setRecognitionBackend(_ backend: RecognitionBackend) {
         if recognitionBackend != backend {
             legacyCorrectionAudioHasConversionGap = false
         }
         recognitionBackend = backend
+        if backend == .speechAnalyzer {
+            if modernRecognitionSampleMapping == nil {
+                modernRecognitionSampleMapping = makeModernRecognitionSampleMapping()
+            }
+            legacyRecognitionSampleMapping = nil
+        } else {
+            modernRecognitionSampleMapping = nil
+        }
         transcriptDeliveryLock.lock()
         deliveryRecognitionBackend = backend
         transcriptDeliveryLock.unlock()
@@ -1630,6 +1825,9 @@ final class LiveTranscriptionSession: NSObject, @unchecked Sendable {
         if #available(macOS 26.0, *) {
             (analyzerInputContinuationState as? AsyncStream<AnalyzerInput>.Continuation)?.finish()
             analyzerInputContinuationState = nil
+            modernAnalyzerInputFinishForTesting?()
+            modernAnalyzerInputFinishForTesting = nil
+            modernAnalyzerInputYieldForTesting = nil
             let analyzer = speechAnalyzerState as? SpeechAnalyzer
             speechAnalyzerState = nil
             speechTranscriberState = nil
@@ -1720,6 +1918,7 @@ final class LiveTranscriptionSession: NSObject, @unchecked Sendable {
 
     private func resetModernTranscriptionState() {
         latestModernText = ""
+        latestModernTimedText = nil
         modernCommittedPrefixText = ""
     }
 
@@ -1865,21 +2064,59 @@ final class LiveTranscriptionSession: NSObject, @unchecked Sendable {
     }
 
     private func append(sampleBuffer: CMSampleBuffer) {
-        guard CMSampleBufferDataIsReady(sampleBuffer) else {
+        let dataIsReady = CMSampleBufferDataIsReady(sampleBuffer)
+        let pcmBuffer = dataIsReady ? pcmBuffer(from: sampleBuffer) : nil
+        appendCapturedSampleBuffer(
+            dataIsReady: dataIsReady,
+            pcmBuffer: pcmBuffer
+        ) {
+            guard self.recognitionBackend == .legacy,
+                  let recognitionRequest = self.recognitionRequest else {
+                return
+            }
+            // Keep legacy recognition alive without inventing a second normalization path.
+            recognitionRequest.appendAudioSampleBuffer(sampleBuffer)
+        }
+    }
+
+    private func appendCapturedSampleBuffer(
+        dataIsReady: Bool,
+        pcmBuffer: AVAudioPCMBuffer?,
+        appendRawSampleBuffer: () -> Void
+    ) {
+        guard dataIsReady else {
+            invalidateRecognitionMappingsForCaptureGap()
             return
         }
+        guard let pcmBuffer else {
+            invalidateRecognitionMappingsForCaptureGap()
+            appendRawSampleBuffer()
+            return
+        }
+        append(audioBuffer: pcmBuffer)
+    }
 
-        // Convert to PCMBuffer so gain processing can be applied (same path as app audio).
-        // Fall back to direct append if conversion fails.
-        if let pcmBuffer = pcmBuffer(from: sampleBuffer) {
-            append(audioBuffer: pcmBuffer)
-        } else if recognitionBackend == .legacy, let recognitionRequest {
-            // Keep legacy recognition alive without inventing a second normalization path.
-            // The next boundary drops its normalized attachment instead of emitting a
-            // partial WAV around this raw-only conversion gap.
-            markLegacyCorrectionAudioConversionGap()
-            legacyRecognitionSampleMapping?.invalidate()
-            recognitionRequest.appendAudioSampleBuffer(sampleBuffer)
+    private func invalidateRecognitionMappingsForCaptureGap() {
+        markLegacyCorrectionAudioConversionGap()
+        legacyRecognitionSampleMapping?.invalidate()
+        modernRecognitionSampleMapping?.invalidate()
+    }
+
+    func appendCapturedSampleBufferForTesting(dataIsReady: Bool, convertedPCMBuffer: AVAudioPCMBuffer?) async {
+        let sendableBuffer = convertedPCMBuffer.map(UncheckedSendablePCMBuffer.init)
+        await withCheckedContinuation { continuation in
+            captureQueue.async { [weak self] in
+                guard let self else {
+                    continuation.resume()
+                    return
+                }
+                appendCapturedSampleBuffer(
+                    dataIsReady: dataIsReady,
+                    pcmBuffer: sendableBuffer?.value,
+                    appendRawSampleBuffer: {}
+                )
+                continuation.resume()
+            }
         }
     }
 
@@ -1915,6 +2152,8 @@ final class LiveTranscriptionSession: NSObject, @unchecked Sendable {
         guard let processingBuffer = prepareProcessingBuffer(from: audioBuffer) else {
             if recognitionBackend == .legacy {
                 legacyRecognitionSampleMapping?.invalidate()
+            } else if recognitionBackend == .speechAnalyzer {
+                modernRecognitionSampleMapping?.invalidate()
             }
             return
         }
@@ -1937,7 +2176,7 @@ final class LiveTranscriptionSession: NSObject, @unchecked Sendable {
         }
 
         if recognitionBackend == .speechAnalyzer {
-            appendToSpeechAnalyzer(processingBuffer)
+            appendToSpeechAnalyzer(processingBuffer, captureSampleInterval: captureSampleInterval)
             return
         }
 
@@ -1956,9 +2195,16 @@ final class LiveTranscriptionSession: NSObject, @unchecked Sendable {
             return
         }
 
-        let preserves16kFrameIdentity = processingBuffer.format.sampleRate == 16_000
-            && recognizerBuffer.format.sampleRate == 16_000
-            && processingBuffer.frameLength == recognizerBuffer.frameLength
+        let preserves16kFrameIdentity = NormalizedAudioFrameIdentity.preservesNormalizedSamples(
+            captureInterval: captureSampleInterval,
+            inputSampleRate: processingBuffer.format.sampleRate,
+            inputChannelCount: Int(processingBuffer.format.channelCount),
+            inputFrameCount: Int(processingBuffer.frameLength),
+            outputSampleRate: recognizerBuffer.format.sampleRate,
+            outputChannelCount: Int(recognizerBuffer.format.channelCount),
+            outputFrameCount: Int(recognizerBuffer.frameLength),
+            unchangedBufferObject: processingBuffer === recognizerBuffer
+        )
         _ = legacyRecognitionSampleMapping?.append(
             captureInterval: captureSampleInterval,
             preserves16kFrameIdentity: preserves16kFrameIdentity
@@ -2063,13 +2309,10 @@ final class LiveTranscriptionSession: NSObject, @unchecked Sendable {
         legacyCorrectionAudioHasConversionGap = true
     }
 
-    private func makeCommittedEmission(
-        text: String,
-        promotionSegmentID: UUID?,
+    private func makeCommittedEmissionDeliveryToken(
         audioWAVData: Data?,
-        audioProvenance: RecognizedAudioProvenance? = nil,
-        modernRecognitionEpoch: Int? = nil
-    ) -> CommittedEmission {
+        modernRecognitionEpoch: Int?
+    ) -> CommittedEmissionDeliveryToken {
         transcriptDeliveryLock.lock()
         let deliveryToken = CommittedEmissionDeliveryToken(
             sessionEpoch: transcriptDeliveryEpoch,
@@ -2077,12 +2320,58 @@ final class LiveTranscriptionSession: NSObject, @unchecked Sendable {
             modernRecognitionEpoch: modernRecognitionEpoch
         )
         transcriptDeliveryLock.unlock()
+        return deliveryToken
+    }
 
+    private func makeModernPartialDraftDelivery(
+        _ draft: DraftSegment?,
+        recognitionEpoch: Int
+    ) -> ModernPartialDraftDelivery {
+        ModernPartialDraftDelivery(
+            draft: draft,
+            deliveryToken: makeCommittedEmissionDeliveryToken(
+                audioWAVData: nil,
+                modernRecognitionEpoch: recognitionEpoch
+            )
+        )
+    }
+
+    private func scheduleModernPartialDraft(_ draft: DraftSegment?, recognitionEpoch: Int) {
+        let delivery = makeModernPartialDraftDelivery(draft, recognitionEpoch: recognitionEpoch)
+        Task { @MainActor [weak self] in
+            self?.deliverModernPartialDraft(delivery)
+        }
+    }
+
+    @MainActor
+    private func deliverModernPartialDraft(_ delivery: ModernPartialDraftDelivery) {
+        committedSequenceDeliveryGate.lock()
+        defer { committedSequenceDeliveryGate.unlock() }
+
+        guard committedEmissionDeliveryPermission(for: delivery.deliveryToken) != .suppress else {
+            return
+        }
+        emitPartialDraft(delivery.draft)
+    }
+
+    private func makeCommittedEmission(
+        text: String,
+        promotionSegmentID: UUID?,
+        audioWAVData: Data?,
+        audioProvenance: RecognizedAudioProvenance? = nil,
+        modernRecognitionEpoch: Int? = nil,
+        modernTimedText: ModernSpeechTextSnapshot? = nil
+    ) -> CommittedEmission {
+        let deliveryToken = makeCommittedEmissionDeliveryToken(
+            audioWAVData: audioWAVData,
+            modernRecognitionEpoch: modernRecognitionEpoch
+        )
         return CommittedEmission(
             text: text,
             promotionSegmentID: promotionSegmentID,
             audioWAVData: audioWAVData,
             audioProvenance: audioProvenance,
+            modernTimedText: modernTimedText,
             deliveryToken: deliveryToken
         )
     }
@@ -2128,18 +2417,59 @@ final class LiveTranscriptionSession: NSObject, @unchecked Sendable {
         stopModernSpeechRecognizer()
     }
 
-    private func appendToSpeechAnalyzer(_ processingBuffer: AVAudioPCMBuffer) {
+    private func appendToSpeechAnalyzer(
+        _ processingBuffer: AVAudioPCMBuffer,
+        captureSampleInterval: NormalizedAudioSampleInterval?
+    ) {
         guard #available(macOS 26.0, *),
-              recognitionBackend == .speechAnalyzer,
-              let continuation = analyzerInputContinuationState as? AsyncStream<AnalyzerInput>.Continuation else {
+              recognitionBackend == .speechAnalyzer else {
+            if recognitionBackend == .speechAnalyzer {
+                modernRecognitionSampleMapping?.invalidate()
+            }
             return
         }
 
         guard let analyzerBuffer = makeSpeechAnalyzerBuffer(from: processingBuffer) else {
+            modernRecognitionSampleMapping?.invalidate()
             return
         }
 
-        continuation.yield(AnalyzerInput(buffer: analyzerBuffer))
+        let deliver: (CMTime?) -> ModernAnalyzerInputDeliveryOutcome
+        if let yieldForTesting = modernAnalyzerInputYieldForTesting {
+            deliver = { bufferStartTime in yieldForTesting(analyzerBuffer, bufferStartTime) }
+        } else {
+            guard let inputContinuation = analyzerInputContinuationState as? AsyncStream<AnalyzerInput>.Continuation else {
+                modernRecognitionSampleMapping?.invalidate()
+                return
+            }
+            deliver = { bufferStartTime in
+                switch inputContinuation.yield(
+                    AnalyzerInput(buffer: analyzerBuffer, bufferStartTime: bufferStartTime)
+                ) {
+                case .enqueued:
+                    return .enqueued
+                case .dropped:
+                    return .dropped
+                case .terminated:
+                    return .terminated
+                @unknown default:
+                    return .terminated
+                }
+            }
+        }
+
+        ModernAnalyzerInputAppender.appendAndDeliver(
+            mapping: &modernRecognitionSampleMapping,
+            captureSampleInterval: captureSampleInterval,
+            inputSampleRate: processingBuffer.format.sampleRate,
+            inputChannelCount: Int(processingBuffer.format.channelCount),
+            inputFrameCount: Int(processingBuffer.frameLength),
+            outputSampleRate: analyzerBuffer.format.sampleRate,
+            outputChannelCount: Int(analyzerBuffer.format.channelCount),
+            outputFrameCount: Int(analyzerBuffer.frameLength),
+            unchangedBufferObject: processingBuffer === analyzerBuffer,
+            deliver: deliver
+        )
     }
 
     private func prepareProcessingBuffer(from audioBuffer: AVAudioPCMBuffer) -> AVAudioPCMBuffer? {
@@ -2440,7 +2770,13 @@ final class LiveTranscriptionSession: NSObject, @unchecked Sendable {
             emitCommittedEmissionTransaction(emission)
         }
 
-        if clearDraftAfter {
+        if clearDraftAfter, let deliveryToken = emissions.last?.deliveryToken {
+            committedSequenceDeliveryGate.lock()
+            defer { committedSequenceDeliveryGate.unlock() }
+
+            guard committedEmissionDeliveryPermission(for: deliveryToken) != .suppress else {
+                return
+            }
             emitPartialDraft(nil)
         }
     }
@@ -2467,29 +2803,109 @@ final class LiveTranscriptionSession: NSObject, @unchecked Sendable {
         let audioWAVData = deliveryPermission == .textAndAudio ? emission.audioWAVData : nil
         pauseCommittedDeliveryAfterAuthorizationForTestingIfNeeded()
 
-        let sentenceTexts = splitCommittedEmissionUnits(in: emission.text)
+        let modernUnits = emission.modernTimedText.map(splitModernTimedEmissionUnits)
+        let sentenceUnits: [(text: String, timedText: ModernSpeechTextSnapshot?)]
+        if let modernUnits {
+            sentenceUnits = modernUnits.map { ($0.text, $0) }
+        } else {
+            sentenceUnits = splitCommittedEmissionUnits(in: emission.text).map { ($0, nil) }
+        }
         var pendingPromotionID = emission.promotionSegmentID
 
-        for sentenceText in sentenceTexts {
-            guard let preparedSentence = prepareCommittedSentenceForEmission(sentenceText) else {
-                continue
+        for unit in sentenceUnits {
+            let preparedText: String
+            let sentenceProvenance: RecognizedAudioProvenance?
+            if let timedText = unit.timedText {
+                guard let prepared = prepareModernTimedSentenceForEmission(timedText) else {
+                    continue
+                }
+                preparedText = prepared.text
+                sentenceProvenance = prepared.audioProvenance
+            } else {
+                guard let prepared = prepareCommittedSentenceForEmission(unit.text) else {
+                    continue
+                }
+                preparedText = prepared.text
+                sentenceProvenance = sentenceUnits.count == 1 && preparedText == unit.text
+                    ? emission.audioProvenance
+                    : nil
             }
 
-            let sentenceProvenance = sentenceTexts.count == 1
-                && preparedSentence == sentenceText
-                ? emission.audioProvenance
-                : nil
-
             if emitCommittedSentence(
-                text: preparedSentence,
+                text: preparedText,
                 promotionSegmentID: pendingPromotionID,
                 audioWAVData: audioWAVData,
                 audioProvenance: sentenceProvenance
             ) {
-                rememberCommittedSentence(preparedSentence)
+                rememberCommittedSentence(preparedText)
             }
             pendingPromotionID = nil
         }
+    }
+
+    @MainActor
+    private func prepareModernTimedSentenceForEmission(
+        _ timedText: ModernSpeechTextSnapshot
+    ) -> (text: String, audioProvenance: RecognizedAudioProvenance?)? {
+        guard let prepared = prepareCommittedSentenceForEmission(timedText.text) else {
+            return nil
+        }
+        let preparedTimedText = timedText.slice(relativeUTF16Range: prepared.sourceUTF16Range)
+        let provenance = preparedTimedText?.text == prepared.text
+            ? preparedTimedText?.audioProvenance
+            : nil
+        return (prepared.text, provenance)
+    }
+
+    private func splitModernTimedEmissionUnits(
+        in snapshot: ModernSpeechTextSnapshot
+    ) -> [ModernSpeechTextSnapshot] {
+        let source = snapshot.text
+        guard source.isEmpty == false else { return [] }
+        let nsSource = source as NSString
+        let ranges = sentenceRanges(in: nsSource)
+        let sentenceRanges = ranges.isEmpty
+            ? [0..<snapshot.utf16Count]
+            : ranges.map { $0.location..<($0.location + $0.length) }
+
+        return sentenceRanges.flatMap { range in
+            let sourceUnit = modernSlice(snapshot, relativeRange: range)
+            let trimmedUnit = sourceUnit.trimmingWhitespace()
+                ?? ModernSpeechTextSnapshot(
+                    text: nsSource.substring(with: NSRange(location: range.lowerBound, length: range.count))
+                        .trimmingCharacters(in: .whitespacesAndNewlines),
+                    runs: []
+                )
+            return splitModernDialogueUnit(trimmedUnit)
+        }
+    }
+
+    private func splitModernDialogueUnit(
+        _ snapshot: ModernSpeechTextSnapshot
+    ) -> [ModernSpeechTextSnapshot] {
+        let text = snapshot.text
+        guard let separatorRange = singleDialogueClauseSeparatorRange(in: text) else {
+            return text.isEmpty ? [] : [snapshot]
+        }
+
+        let left = String(text[..<separatorRange.lowerBound]).trimmingCharacters(in: .whitespacesAndNewlines)
+        let right = String(text[separatorRange.upperBound...]).trimmingCharacters(in: .whitespacesAndNewlines)
+        guard shouldSplitDialogueClauses(left: left, right: right) else {
+            return text.isEmpty ? [] : [snapshot]
+        }
+
+        let separatorStart = text.utf16.distance(from: text.utf16.startIndex, to: separatorRange.lowerBound)
+        let separatorEnd = text.utf16.distance(from: text.utf16.startIndex, to: separatorRange.upperBound)
+        let leftSnapshot = trimmedModernSlice(snapshot, relativeRange: 0..<separatorStart)
+        let rightSnapshot = trimmedModernSlice(snapshot, relativeRange: separatorEnd..<snapshot.utf16Count)
+        guard leftSnapshot.text == left,
+              rightSnapshot.text == right else {
+            return [
+                ModernSpeechTextSnapshot(text: left, runs: []),
+                ModernSpeechTextSnapshot(text: right, runs: [])
+            ].filter { $0.text.isEmpty == false }
+        }
+        return [leftSnapshot, rightSnapshot].filter { $0.text.isEmpty == false }
     }
 
     private func splitCommittedEmissionUnits(in text: String) -> [String] {
@@ -2567,7 +2983,9 @@ final class LiveTranscriptionSession: NSObject, @unchecked Sendable {
     }
 
     @MainActor
-    private func prepareCommittedSentenceForEmission(_ text: String) -> String? {
+    private func prepareCommittedSentenceForEmission(
+        _ text: String
+    ) -> (text: String, sourceUTF16Range: Range<Int>)? {
         let trimmed = text.trimmingCharacters(in: .whitespacesAndNewlines)
         guard trimmed.isEmpty == false else {
             return nil
@@ -2589,7 +3007,9 @@ final class LiveTranscriptionSession: NSObject, @unchecked Sendable {
                 return nil
             }
 
-            return extendedSentence
+            guard trimmed.hasSuffix(extendedSentence) else { return nil }
+            let start = trimmed.utf16.count - extendedSentence.utf16.count
+            return (extendedSentence, start..<trimmed.utf16.count)
         }
 
         let bestOverlap = recentCommittedSentenceHistory
@@ -2615,7 +3035,9 @@ final class LiveTranscriptionSession: NSObject, @unchecked Sendable {
             return nil
         }
 
-        return candidateText
+        guard trimmed.hasSuffix(candidateText) else { return nil }
+        let start = trimmed.utf16.count - candidateText.utf16.count
+        return (candidateText, start..<trimmed.utf16.count)
     }
 
     @MainActor
@@ -2649,8 +3071,12 @@ final class LiveTranscriptionSession: NSObject, @unchecked Sendable {
                 continue
             }
 
-            let remainder = dropLeadingCharacters(previous.rawText.count, from: text)
-                .trimmingCharacters(in: Self.leadingOverlapTrimCharacterSet)
+            let remainder = String(
+                dropLeadingCharacters(previous.rawText.count, from: text).drop(while: { character in
+                    character.unicodeScalars.allSatisfy(Self.leadingOverlapTrimCharacterSet.contains)
+                })
+            )
+            .trimmingCharacters(in: .whitespacesAndNewlines)
             guard remainder.isEmpty == false else {
                 continue
             }
@@ -2828,6 +3254,98 @@ final class LiveTranscriptionSession: NSObject, @unchecked Sendable {
         }
 
         return (committedRawText, remainingRawText)
+    }
+
+    private func pendingModernText(from snapshot: ModernSpeechTextSnapshot) -> ModernSpeechTextSnapshot {
+        let fullText = snapshot.text
+        guard modernCommittedPrefixText.isEmpty == false else { return snapshot }
+        if fullText.hasPrefix(modernCommittedPrefixText) {
+            let prefixLength = modernCommittedPrefixText.utf16.count
+            return trimmedModernSlice(snapshot, relativeRange: prefixLength..<snapshot.utf16Count)
+        }
+
+        let committedSentences = splitRecognizedSentences(in: modernCommittedPrefixText)
+        let nsFullText = fullText as NSString
+        let fullSentenceRanges = sentenceRanges(in: nsFullText)
+        let fullSentences = fullSentenceRanges.map {
+            nsFullText.substring(with: $0).trimmingCharacters(in: .whitespacesAndNewlines)
+        }
+
+        guard committedSentences.isEmpty == false,
+              fullSentences.isEmpty == false else {
+            return snapshot
+        }
+
+        let committedComparable = committedSentences.map(comparableCommittedSentenceText)
+        let fullComparable = fullSentences.map(comparableCommittedSentenceText)
+        let maxOverlap = min(committedComparable.count, fullComparable.count)
+        for overlap in stride(from: maxOverlap, through: 1, by: -1) {
+            if Array(committedComparable.suffix(overlap)) == Array(fullComparable.prefix(overlap)) {
+                let matchedRange = fullSentenceRanges[overlap - 1]
+                let nextLocation = matchedRange.location + matchedRange.length
+                guard nextLocation < nsFullText.length else {
+                    return ModernSpeechTextSnapshot(text: "", runs: [])
+                }
+                return trimmedModernSlice(
+                    snapshot,
+                    relativeRange: nextLocation..<nsFullText.length
+                )
+            }
+        }
+
+        return snapshot
+    }
+
+    private func committableModernText(
+        in snapshot: ModernSpeechTextSnapshot
+    ) -> (committed: ModernSpeechTextSnapshot, remaining: ModernSpeechTextSnapshot)? {
+        guard let split = committableModernText(in: snapshot.text) else { return nil }
+        let committedLength = split.committedRawText.utf16.count
+        guard committedLength <= snapshot.utf16Count else { return nil }
+
+        let committed = trimmedModernSlice(snapshot, relativeRange: 0..<committedLength)
+        let remaining = trimmedModernSlice(snapshot, relativeRange: committedLength..<snapshot.utf16Count)
+        guard committed.text == split.committedRawText.trimmingCharacters(in: .whitespacesAndNewlines),
+              remaining.text == split.remainingRawText.trimmingCharacters(in: .whitespacesAndNewlines) else {
+            return (
+                ModernSpeechTextSnapshot(text: split.committedRawText, runs: []),
+                ModernSpeechTextSnapshot(text: split.remainingRawText, runs: [])
+            )
+        }
+        return (committed, remaining)
+    }
+
+    private func trimmedModernSlice(
+        _ snapshot: ModernSpeechTextSnapshot,
+        relativeRange: Range<Int>
+    ) -> ModernSpeechTextSnapshot {
+        let rawSlice = modernSlice(snapshot, relativeRange: relativeRange)
+        if let trimmed = rawSlice.trimmingWhitespace() {
+            return trimmed
+        }
+        return ModernSpeechTextSnapshot(
+            text: rawSlice.text.trimmingCharacters(in: .whitespacesAndNewlines),
+            runs: []
+        )
+    }
+
+    private func modernSlice(
+        _ snapshot: ModernSpeechTextSnapshot,
+        relativeRange: Range<Int>
+    ) -> ModernSpeechTextSnapshot {
+        if let slice = snapshot.slice(relativeUTF16Range: relativeRange) {
+            return slice
+        }
+
+        let text = snapshot.text as NSString
+        let range = NSRange(
+            location: relativeRange.lowerBound,
+            length: max(0, relativeRange.upperBound - relativeRange.lowerBound)
+        )
+        guard range.location >= 0, NSMaxRange(range) <= text.length else {
+            return ModernSpeechTextSnapshot(text: "", runs: [])
+        }
+        return ModernSpeechTextSnapshot(text: text.substring(with: range), runs: [])
     }
 
     private func hasLikelyPunctuationBoundary(
@@ -3172,9 +3690,13 @@ final class LiveTranscriptionSession: NSObject, @unchecked Sendable {
         guard acceptsModernResult(for: epoch) else { return }
         let now = Date()
         lastRecognitionResultTime = now
-        let fullText = normalizedTranscriberText(result.text)
-        let pendingRawText = pendingModernText(from: fullText)
-        let text = pendingRawText.trimmingCharacters(in: .whitespacesAndNewlines)
+        let resultSnapshot = ModernSpeechTextSnapshot(
+            attributedText: result.text,
+            mapping: modernRecognitionSampleMapping
+        )
+        let pendingSnapshot = pendingModernText(from: resultSnapshot)
+        let pendingRawText = pendingSnapshot.text
+        let text = pendingRawText
 
         if result.isFinal {
             let identity = modernResultIdentity(for: result)
@@ -3193,7 +3715,8 @@ final class LiveTranscriptionSession: NSObject, @unchecked Sendable {
                     text: text,
                     promotionSegmentID: committedDraftID,
                     audioWAVData: audioWAVData,
-                    modernRecognitionEpoch: epoch
+                    modernRecognitionEpoch: epoch,
+                    modernTimedText: pendingSnapshot
                 )
                 Task { [committedEmission] in
                     await emitCommittedSequence(
@@ -3202,36 +3725,40 @@ final class LiveTranscriptionSession: NSObject, @unchecked Sendable {
                     )
                 }
             } else {
-                Task { await emitPartialDraft(nil) }
+                scheduleModernPartialDraft(nil, recognitionEpoch: epoch)
             }
             return
         }
 
         guard text.isEmpty == false else {
             latestModernText = ""
+            latestModernTimedText = nil
             cancelSilenceTimer()
             cancelVADSilenceTimer()
-            Task { await emitPartialDraft(nil) }
+            scheduleModernPartialDraft(nil, recognitionEpoch: epoch)
             return
         }
 
         observeDraftText(text, at: now)
         latestModernText = pendingRawText
-        if let split = committableModernText(in: pendingRawText),
-           split.remainingRawText.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty,
+        latestModernTimedText = pendingSnapshot
+        if let split = committableModernText(in: pendingSnapshot),
+           split.remaining.text.isEmpty,
            SentenceBoundaryHeuristics.endsWithLikelySentenceTerminator(in: text),
            canFastCommitModernBoundary(at: now) {
-            let committedText = split.committedRawText.trimmingCharacters(in: .whitespacesAndNewlines)
+            let committedText = split.committed.text
             guard committedText.isEmpty == false else {
                 latestModernText = ""
-                Task { await emitPartialDraft(nil) }
+                latestModernTimedText = nil
+                scheduleModernPartialDraft(nil, recognitionEpoch: epoch)
                 return
             }
 
             cancelSilenceTimer()
             cancelVADSilenceTimer()
-            modernCommittedPrefixText += split.committedRawText
-            latestModernText = split.remainingRawText
+            modernCommittedPrefixText += split.committed.text
+            latestModernText = split.remaining.text
+            latestModernTimedText = split.remaining
             let committedDraftID = currentDraftId
             resetDraftState()
             let audioWAVData = finishCorrectionAudio()
@@ -3239,7 +3766,8 @@ final class LiveTranscriptionSession: NSObject, @unchecked Sendable {
                 text: committedText,
                 promotionSegmentID: committedDraftID,
                 audioWAVData: audioWAVData,
-                modernRecognitionEpoch: epoch
+                modernRecognitionEpoch: epoch,
+                modernTimedText: split.committed
             )
             Task { [committedEmission] in
                 await emitCommittedSequence(
@@ -3250,7 +3778,7 @@ final class LiveTranscriptionSession: NSObject, @unchecked Sendable {
             return
         }
 
-        emitDraftUpdate(from: result, text: text)
+        emitDraftUpdate(from: result, text: text, recognitionEpoch: epoch)
         scheduleSilenceCommit()
     }
 
@@ -3344,7 +3872,11 @@ final class LiveTranscriptionSession: NSObject, @unchecked Sendable {
     }
 
     @available(macOS 26.0, *)
-    private func emitDraftUpdate(from result: SpeechTranscriber.Result, text: String) {
+    private func emitDraftUpdate(
+        from result: SpeechTranscriber.Result,
+        text: String,
+        recognitionEpoch: Int
+    ) {
         let now = Date()
         observeDraftText(text, at: now)
         let draftStability = currentDraftStability(at: now)
@@ -3384,7 +3916,7 @@ final class LiveTranscriptionSession: NSObject, @unchecked Sendable {
             words: []
         )
 
-        Task { await emitPartialDraft(draft) }
+        scheduleModernPartialDraft(draft, recognitionEpoch: recognitionEpoch)
     }
 
     @available(macOS 26.0, *)
@@ -3555,33 +4087,37 @@ final class LiveTranscriptionSession: NSObject, @unchecked Sendable {
         }
 
         if recognitionBackend == .speechAnalyzer {
-            let committedRawText: String
-            let remainingRawText: String
+            let latestSnapshot = latestModernTimedText
+                ?? ModernSpeechTextSnapshot(text: latestModernText, runs: [])
+            let committedSnapshot: ModernSpeechTextSnapshot
+            let remainingSnapshot: ModernSpeechTextSnapshot
 
             switch trigger {
             case .asrInactivity:
-                guard let split = committableModernText(in: latestModernText) else {
+                guard let split = committableModernText(in: latestSnapshot) else {
                     return
                 }
-                committedRawText = split.committedRawText
-                remainingRawText = split.remainingRawText
+                committedSnapshot = split.committed
+                remainingSnapshot = split.remaining
             case .vadOffset:
                 let now = Date()
                 guard canVADCommitModernDraft(latestModernText, at: now) else {
                     return
                 }
-                committedRawText = latestModernText
-                remainingRawText = ""
+                committedSnapshot = latestSnapshot
+                remainingSnapshot = ModernSpeechTextSnapshot(text: "", runs: [])
             }
 
-            let text = committedRawText.trimmingCharacters(in: .whitespacesAndNewlines)
+            let text = committedSnapshot.text
             guard text.isEmpty == false else {
-                latestModernText = remainingRawText
+                latestModernText = remainingSnapshot.text
+                latestModernTimedText = remainingSnapshot
                 return
             }
 
-            modernCommittedPrefixText += committedRawText
-            latestModernText = remainingRawText
+            modernCommittedPrefixText += committedSnapshot.text
+            latestModernText = remainingSnapshot.text
+            latestModernTimedText = remainingSnapshot
             let committedDraftID = currentDraftId
             resetDraftState()
             let audioWAVData = finishCorrectionAudio()
@@ -3589,12 +4125,13 @@ final class LiveTranscriptionSession: NSObject, @unchecked Sendable {
                 text: text,
                 promotionSegmentID: committedDraftID,
                 audioWAVData: audioWAVData,
-                modernRecognitionEpoch: recognitionEpoch
+                modernRecognitionEpoch: recognitionEpoch,
+                modernTimedText: committedSnapshot
             )
             Task { [committedEmission] in
                 await emitCommittedSequence(
                     [committedEmission],
-                    clearDraftAfter: remainingRawText.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+                    clearDraftAfter: remainingSnapshot.text.isEmpty
                 )
             }
             return
