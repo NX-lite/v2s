@@ -699,6 +699,7 @@ import Testing
         #expect(ordinaryCapture.fanout.offer(
             pcm16LE: Data([2, 0]),
             frameCount: 1,
+            sampleInterval: 0..<1,
             sourceToken: ordinaryCapture.source.input.sourceToken,
             generation: ordinaryCapture.source.input.generation,
             captureTimestampNanoseconds: 202
@@ -943,6 +944,7 @@ import Testing
         #expect(capture.fanout.offer(
             pcm16LE: Data([2, 0]),
             frameCount: 1,
+            sampleInterval: 0..<1,
             sourceToken: capture.source.input.sourceToken,
             generation: capture.source.input.generation,
             captureTimestampNanoseconds: 303
@@ -955,6 +957,7 @@ import Testing
         #expect(capture.fanout.offer(
             pcm16LE: Data([3, 0]),
             frameCount: 1,
+            sampleInterval: 0..<1,
             sourceToken: capture.source.input.sourceToken,
             generation: capture.source.input.generation,
             captureTimestampNanoseconds: 404
@@ -1155,6 +1158,7 @@ private func offerResult(
     capture.fanout.offer(
         pcm16LE: Data(bytes),
         frameCount: bytes.count / 2,
+        sampleInterval: 0..<Int64(bytes.count / 2),
         sourceToken: capture.source.input.sourceToken,
         generation: capture.source.input.generation,
         captureTimestampNanoseconds: bytes.first == 1 ? 101 : 202

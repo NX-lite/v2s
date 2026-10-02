@@ -9,11 +9,18 @@ struct RecognizedSentence: Equatable, Sendable {
     let text: String
     let promotionSegmentID: UUID?
     let audioWAVData: Data?
+    let audioProvenance: RecognizedAudioProvenance?
 
-    init(text: String, promotionSegmentID: UUID? = nil, audioWAVData: Data? = nil) {
+    init(
+        text: String,
+        promotionSegmentID: UUID? = nil,
+        audioWAVData: Data? = nil,
+        audioProvenance: RecognizedAudioProvenance? = nil
+    ) {
         self.text = text
         self.promotionSegmentID = promotionSegmentID
         self.audioWAVData = audioWAVData
+        self.audioProvenance = audioProvenance
     }
 }
 
@@ -27,6 +34,7 @@ struct RealtimePCM16AudioChunk: Equatable, Sendable {
     let captureTimestampNanoseconds: UInt64
     let sampleRate: Int
     let frameCount: Int
+    let sampleInterval: NormalizedAudioSampleInterval
     let pcm16LE: Data
 }
 
@@ -166,6 +174,7 @@ final class RealtimePCM16AudioFanout: @unchecked Sendable {
     func offer(
         pcm16LE: Data,
         frameCount: Int,
+        sampleInterval: NormalizedAudioSampleInterval,
         sourceToken offeredSourceToken: UUID,
         generation offeredGeneration: UInt64,
         captureTimestampNanoseconds: UInt64
@@ -187,9 +196,12 @@ final class RealtimePCM16AudioFanout: @unchecked Sendable {
             lock.unlock()
             return .noConsumer
         }
-        guard frameCount > 0,
+        guard sampleInterval.lowerBound >= 0,
+              sampleInterval.upperBound > sampleInterval.lowerBound,
+              frameCount > 0,
               frameCount <= Int.max / 2,
-              pcm16LE.count == frameCount * 2 else {
+              pcm16LE.count == frameCount * 2,
+              Int64(exactly: frameCount) == sampleInterval.upperBound - sampleInterval.lowerBound else {
             isClosed = true
             terminalError = .invalidAudioChunk
             chunks.removeAll(keepingCapacity: false)
@@ -226,6 +238,7 @@ final class RealtimePCM16AudioFanout: @unchecked Sendable {
             captureTimestampNanoseconds: captureTimestampNanoseconds,
             sampleRate: 16_000,
             frameCount: frameCount,
+            sampleInterval: sampleInterval,
             pcm16LE: pcm16LE
         )
         if let waiter = waitingReader {
@@ -379,17 +392,20 @@ final class LiveTranscriptionSession: NSObject, @unchecked Sendable {
         let text: String
         let promotionSegmentID: UUID?
         let audioWAVData: Data?
+        let audioProvenance: RecognizedAudioProvenance?
         let deliveryToken: CommittedEmissionDeliveryToken
 
         init(
             text: String,
             promotionSegmentID: UUID?,
             audioWAVData: Data? = nil,
+            audioProvenance: RecognizedAudioProvenance? = nil,
             deliveryToken: CommittedEmissionDeliveryToken
         ) {
             self.text = text
             self.promotionSegmentID = promotionSegmentID
             self.audioWAVData = audioWAVData
+            self.audioProvenance = audioProvenance
             self.deliveryToken = deliveryToken
         }
     }
@@ -549,6 +565,8 @@ final class LiveTranscriptionSession: NSObject, @unchecked Sendable {
     /// Recreated for each recognition session so a reader can never cross a restart.
     private var realtimeAudioFanout: RealtimePCM16AudioFanout?
     private var realtimeAudioGeneration: UInt64 = 0
+    private var normalizedAudioSampleClock = NormalizedAudioSampleClock()
+    private var legacyRecognitionSampleMapping: LegacyRecognitionSampleMapping?
 
     private var transcriptHandler: (@MainActor (RecognizedSentence) -> Void)?
     private var partialHandler: (@MainActor (DraftSegment?) -> Void)?
@@ -906,6 +924,63 @@ final class LiveTranscriptionSession: NSObject, @unchecked Sendable {
         _ = await beginRecognitionSessionOnCaptureQueue()
     }
 
+    func beginLegacySampleMappingForTesting() async {
+        await withCheckedContinuation { continuation in
+            captureQueue.async { [weak self] in
+                self?.legacyRecognitionSampleMapping = self?.makeLegacyRecognitionSampleMapping()
+                continuation.resume()
+            }
+        }
+    }
+
+    func appendLegacyNormalizedBufferForTesting(
+        _ processingBuffer: AVAudioPCMBuffer,
+        preservesIdentity: Bool
+    ) async -> NormalizedAudioSampleInterval? {
+        let sendableBuffer = UncheckedSendablePCMBuffer(value: processingBuffer)
+        return await withCheckedContinuation { continuation in
+            captureQueue.async { [weak self] in
+                guard let self else {
+                    continuation.resume(returning: nil)
+                    return
+                }
+                let interval = publishRealtimePCM16Audio(from: sendableBuffer.value)
+                appendCorrectionAudioBuffer(sendableBuffer.value)
+                if let interval {
+                    _ = legacyRecognitionSampleMapping?.append(
+                        captureInterval: interval,
+                        preserves16kFrameIdentity: preservesIdentity
+                    )
+                } else {
+                    legacyRecognitionSampleMapping?.invalidate()
+                }
+                continuation.resume(returning: interval)
+            }
+        }
+    }
+
+    func queueLegacyCommittedEmissionForTesting(
+        text: String,
+        segments: [LegacySpeechSegmentTiming]
+    ) async -> Bool {
+        await withCheckedContinuation { continuation in
+            captureQueue.async { [weak self] in
+                guard let self else {
+                    continuation.resume(returning: false)
+                    return
+                }
+                let audioProvenance = legacyRecognitionSampleMapping?.provenance(for: segments)
+                queuedCommittedEmissionForTesting = makeCommittedEmission(
+                    text: text,
+                    promotionSegmentID: nil,
+                    audioWAVData: finishCorrectionAudio(),
+                    audioProvenance: audioProvenance
+                )
+                continuation.resume(returning: audioProvenance != nil)
+            }
+        }
+    }
+
     @MainActor
     func invalidateNextCommittedDeliveryAfterAuthorizationForTesting() {
         shouldInvalidateCommittedDeliveryAfterAuthorizationForTesting = true
@@ -1172,6 +1247,8 @@ final class LiveTranscriptionSession: NSObject, @unchecked Sendable {
                 resetRecognitionEpoch()
                 self.realtimeAudioFanout?.finish(error: .sourceSuperseded)
                 self.realtimeAudioGeneration &+= 1
+                self.normalizedAudioSampleClock.reset()
+                self.legacyRecognitionSampleMapping = nil
                 self.realtimeAudioFanout = RealtimePCM16AudioFanout(
                     sourceToken: UUID(),
                     generation: self.realtimeAudioGeneration
@@ -1199,10 +1276,19 @@ final class LiveTranscriptionSession: NSObject, @unchecked Sendable {
 
     private func resetRecognitionEpoch() {
         recognitionEpoch &+= 1
+        legacyRecognitionSampleMapping = nil
         transcriptDeliveryLock.lock()
         deliveryRecognitionEpoch = recognitionEpoch
         transcriptDeliveryLock.unlock()
         resetCorrectionAudioBuffer()
+    }
+
+    private func makeLegacyRecognitionSampleMapping() -> LegacyRecognitionSampleMapping? {
+        guard let realtimeAudioFanout else { return nil }
+        return LegacyRecognitionSampleMapping(
+            sourceToken: realtimeAudioFanout.sourceToken,
+            captureGeneration: realtimeAudioFanout.generation
+        )
     }
 
     private func setRecognitionBackend(_ backend: RecognitionBackend) {
@@ -1309,6 +1395,7 @@ final class LiveTranscriptionSession: NSObject, @unchecked Sendable {
         recognitionRequest = request
         recognitionTask = task
         setRecognitionBackend(.legacy)
+        legacyRecognitionSampleMapping = makeLegacyRecognitionSampleMapping()
         resetRecognitionFailureState()
         resetAudioProcessingState()
         resetLegacyTranscriptionState()
@@ -1791,6 +1878,7 @@ final class LiveTranscriptionSession: NSObject, @unchecked Sendable {
             // The next boundary drops its normalized attachment instead of emitting a
             // partial WAV around this raw-only conversion gap.
             markLegacyCorrectionAudioConversionGap()
+            legacyRecognitionSampleMapping?.invalidate()
             recognitionRequest.appendAudioSampleBuffer(sampleBuffer)
         }
     }
@@ -1825,12 +1913,15 @@ final class LiveTranscriptionSession: NSObject, @unchecked Sendable {
         }
 
         guard let processingBuffer = prepareProcessingBuffer(from: audioBuffer) else {
+            if recognitionBackend == .legacy {
+                legacyRecognitionSampleMapping?.invalidate()
+            }
             return
         }
 
         let audioLevels = cleanUpSpeechBuffer(processingBuffer)
         boostIfQuiet(buffer: processingBuffer, levels: audioLevels)
-        publishRealtimePCM16Audio(from: processingBuffer)
+        let captureSampleInterval = publishRealtimePCM16Audio(from: processingBuffer)
         appendCorrectionAudioBuffer(processingBuffer)
 
         if let vadEngine {
@@ -1855,8 +1946,23 @@ final class LiveTranscriptionSession: NSObject, @unchecked Sendable {
         }
 
         guard let recognizerBuffer = makeRecognizerBuffer(from: processingBuffer, nativeFormat: recognitionRequest.nativeAudioFormat) else {
+            legacyRecognitionSampleMapping?.invalidate()
             return
         }
+
+        guard let captureSampleInterval else {
+            legacyRecognitionSampleMapping?.invalidate()
+            recognitionRequest.append(recognizerBuffer)
+            return
+        }
+
+        let preserves16kFrameIdentity = processingBuffer.format.sampleRate == 16_000
+            && recognizerBuffer.format.sampleRate == 16_000
+            && processingBuffer.frameLength == recognizerBuffer.frameLength
+        _ = legacyRecognitionSampleMapping?.append(
+            captureInterval: captureSampleInterval,
+            preserves16kFrameIdentity: preserves16kFrameIdentity
+        )
 
         // Always forward audio to the recognizer — VAD is used only
         // for silence-commit timing, not to gate the audio stream.
@@ -1868,22 +1974,36 @@ final class LiveTranscriptionSession: NSObject, @unchecked Sendable {
         correctionAudioBuffer.append(processingBuffer)
     }
 
-    private func publishRealtimePCM16Audio(from processingBuffer: AVAudioPCMBuffer) {
-        guard let fanout = realtimeAudioFanout, fanout.isActive else { return }
+    @discardableResult
+    private func publishRealtimePCM16Audio(
+        from processingBuffer: AVAudioPCMBuffer
+    ) -> NormalizedAudioSampleInterval? {
         guard processingBuffer.frameLength > 0,
               processingBuffer.format.commonFormat == .pcmFormatFloat32,
               processingBuffer.format.sampleRate == 16_000,
               processingBuffer.format.channelCount == 1,
               let samples = processingBuffer.floatChannelData?[0] else {
-            fanout.finish(error: .invalidAudioChunk)
-            return
+            if realtimeAudioFanout?.isActive == true {
+                realtimeAudioFanout?.finish(error: .invalidAudioChunk)
+            }
+            return nil
         }
 
         let frameCount = Int(processingBuffer.frameLength)
+        guard let sampleInterval = normalizedAudioSampleClock.append(frameCount: frameCount) else {
+            realtimeAudioFanout?.finish(error: .invalidAudioChunk)
+            return nil
+        }
+
+        guard let fanout = realtimeAudioFanout, fanout.isActive else {
+            return sampleInterval
+        }
+
         guard frameCount <= fanout.maximumBufferedFrames else {
             fanout.finish(error: .backpressureExceeded)
-            return
+            return sampleInterval
         }
+
         var pcm16LE = Data(count: frameCount * 2)
         pcm16LE.withUnsafeMutableBytes { (destination: UnsafeMutableRawBufferPointer) in
             guard let bytes = destination.baseAddress?.assumingMemoryBound(to: UInt8.self) else { return }
@@ -1907,10 +2027,12 @@ final class LiveTranscriptionSession: NSObject, @unchecked Sendable {
         _ = fanout.offer(
             pcm16LE: pcm16LE,
             frameCount: frameCount,
+            sampleInterval: sampleInterval,
             sourceToken: fanout.sourceToken,
             generation: fanout.generation,
             captureTimestampNanoseconds: DispatchTime.now().uptimeNanoseconds
         )
+        return sampleInterval
     }
 
     private func finishCorrectionAudio(through absoluteTime: TimeInterval? = nil) -> Data? {
@@ -1935,7 +2057,9 @@ final class LiveTranscriptionSession: NSObject, @unchecked Sendable {
     }
 
     private func markLegacyCorrectionAudioConversionGap() {
-        guard recognitionBackend == .legacy, correctionAudioCaptureEnabled else { return }
+        guard recognitionBackend == .legacy else { return }
+        legacyRecognitionSampleMapping?.invalidate()
+        guard correctionAudioCaptureEnabled else { return }
         legacyCorrectionAudioHasConversionGap = true
     }
 
@@ -1943,6 +2067,7 @@ final class LiveTranscriptionSession: NSObject, @unchecked Sendable {
         text: String,
         promotionSegmentID: UUID?,
         audioWAVData: Data?,
+        audioProvenance: RecognizedAudioProvenance? = nil,
         modernRecognitionEpoch: Int? = nil
     ) -> CommittedEmission {
         transcriptDeliveryLock.lock()
@@ -1957,6 +2082,7 @@ final class LiveTranscriptionSession: NSObject, @unchecked Sendable {
             text: text,
             promotionSegmentID: promotionSegmentID,
             audioWAVData: audioWAVData,
+            audioProvenance: audioProvenance,
             deliveryToken: deliveryToken
         )
     }
@@ -2265,7 +2391,8 @@ final class LiveTranscriptionSession: NSObject, @unchecked Sendable {
     private func emitCommittedSentence(
         text: String,
         promotionSegmentID: UUID?,
-        audioWAVData: Data?
+        audioWAVData: Data?,
+        audioProvenance: RecognizedAudioProvenance? = nil
     ) -> Bool {
         let handler = transcriptHandler
         guard let handler else {
@@ -2276,7 +2403,8 @@ final class LiveTranscriptionSession: NSObject, @unchecked Sendable {
             RecognizedSentence(
                 text: text,
                 promotionSegmentID: promotionSegmentID,
-                audioWAVData: audioWAVData
+                audioWAVData: audioWAVData,
+                audioProvenance: audioProvenance
             )
         )
         return true
@@ -2347,10 +2475,16 @@ final class LiveTranscriptionSession: NSObject, @unchecked Sendable {
                 continue
             }
 
+            let sentenceProvenance = sentenceTexts.count == 1
+                && preparedSentence == sentenceText
+                ? emission.audioProvenance
+                : nil
+
             if emitCommittedSentence(
                 text: preparedSentence,
                 promotionSegmentID: pendingPromotionID,
-                audioWAVData: audioWAVData
+                audioWAVData: audioWAVData,
+                audioProvenance: sentenceProvenance
             ) {
                 rememberCommittedSentence(preparedSentence)
             }
@@ -2820,11 +2954,16 @@ final class LiveTranscriptionSession: NSObject, @unchecked Sendable {
                 let audioWAVData = finishCorrectionAudio(
                     through: segmentEndTime(for: segments[commitEndIndex])
                 )
+                let segmentTimings = segments[sentenceStartIndex...commitEndIndex].map {
+                    LegacySpeechSegmentTiming(timestamp: $0.timestamp, duration: $0.duration)
+                }
+                let audioProvenance = legacyRecognitionSampleMapping?.provenance(for: segmentTimings)
                 committedEmissions.append(
                     makeCommittedEmission(
                         text: sentenceText,
                         promotionSegmentID: committedDraftID,
-                        audioWAVData: audioWAVData
+                        audioWAVData: audioWAVData,
+                        audioProvenance: audioProvenance
                     )
                 )
             }
@@ -2905,6 +3044,7 @@ final class LiveTranscriptionSession: NSObject, @unchecked Sendable {
 
         recognitionRequest = request
         recognitionTask = task
+        legacyRecognitionSampleMapping = makeLegacyRecognitionSampleMapping()
         // Reset the converter — new request may have a different nativeAudioFormat.
         resetAudioProcessingState()
         resetLegacyTranscriptionState()
@@ -3465,7 +3605,8 @@ final class LiveTranscriptionSession: NSObject, @unchecked Sendable {
 
         guard committedSegmentCount < segments.count else { return }
 
-        let pendingSegments = Array(segments[committedSegmentCount...])
+        let pendingStartIndex = committedSegmentCount
+        let pendingSegments = Array(segments[pendingStartIndex...])
         if let delayMs = requiredCommitDelayMs(trigger: trigger, pendingSegments: pendingSegments) {
             scheduleSilenceCommit(trigger: trigger, afterMs: delayMs)
             return
@@ -3485,10 +3626,15 @@ final class LiveTranscriptionSession: NSObject, @unchecked Sendable {
             let audioWAVData = finishCorrectionAudio(
                 through: segmentEndTime(for: segments[lastIdx])
             )
+            let segmentTimings = pendingSegments.map {
+                LegacySpeechSegmentTiming(timestamp: $0.timestamp, duration: $0.duration)
+            }
+            let audioProvenance = legacyRecognitionSampleMapping?.provenance(for: segmentTimings)
             let committedEmission = makeCommittedEmission(
                 text: sentenceText,
                 promotionSegmentID: committedDraftID,
-                audioWAVData: audioWAVData
+                audioWAVData: audioWAVData,
+                audioProvenance: audioProvenance
             )
             Task { [committedEmission] in
                 await emitCommittedSequence(
@@ -3531,6 +3677,7 @@ final class LiveTranscriptionSession: NSObject, @unchecked Sendable {
 
     private func alignCommittedSegmentCount(to segments: [SFTranscriptionSegment]) {
         if segments.count < committedSegmentCount {
+            legacyRecognitionSampleMapping?.invalidate()
             resetLegacyTranscriptionState()
             resetCorrectionAudioBuffer()
             resetDraftState()

@@ -835,6 +835,315 @@ struct NativeRealtimeSessionDriverTests {
         await task.value
     }
 
+    @Test func exactCommitRejectsGapsAndPreservesBothUsableRanges() async throws {
+        let (driver, connection, recorder, task) = await makeReadyDriver(profile: .openAIMini)
+        let (events, eventTask) = await recordEvents(from: driver)
+        let firstPCM = Data([10, 0, 20, 0])
+        let laterPCM = Data([40, 0, 50, 0])
+        try await driver.sendAudioChunk(makeExactChunk(generation: 7, start: 0, pcm16LEData: firstPCM))
+        try await driver.sendAudioChunk(makeExactChunk(generation: 7, start: 187_500, pcm16LEData: laterPCM))
+
+        var gapWasRejected = false
+        do {
+            try await driver.commit(makeUtterance(generation: 7, start: 0, end: 312_500))
+        } catch let code as RealtimeFailureCode {
+            gapWasRejected = code == .invalidConfiguration
+        }
+        #expect(gapWasRejected)
+        if !gapWasRejected {
+            #expect(await connection.waitUntilSentMessageCount(3))
+            #expect(await connection.sentMessageTypes() == ["session.update"])
+            await driver.stop()
+            eventTask.cancel()
+            #expect(await recorder.outcome() == .succeeded)
+            await task.value
+            return
+        }
+        #expect(await connection.sentMessageTypes() == ["session.update"])
+
+        // The failed full-span commit left both disjoint chunks available for their
+        // own caption intervals, with no partial audio sent for the rejected one.
+        try await driver.commit(makeUtterance(generation: 7, start: 0, end: 125_000))
+        #expect(await connection.waitUntilSentMessageCount(3))
+        #expect(appendedPCM(in: await connection.sentTextMessages()) == [firstPCM])
+        await connection.enqueue(.text(#"{"type":"input_audio_buffer.committed"}"#))
+        #expect(await connection.waitUntilSentMessageCount(4))
+        await connection.enqueue(.text(#"{"type":"response.created","response":{"id":"resp_gap_first"}}"#))
+        await connection.enqueue(.text(#"{"type":"response.output_text.delta","response_id":"resp_gap_first","delta":"first"}"#))
+        await connection.enqueue(.text(#"{"type":"response.done","response":{"id":"resp_gap_first","status":"completed"}}"#))
+        #expect(await events.waitForCount(1))
+
+        try await driver.commit(makeUtterance(generation: 7, start: 187_500, end: 312_500))
+        #expect(await connection.waitUntilSentMessageCount(6))
+        #expect(appendedPCM(in: await connection.sentTextMessages()) == [firstPCM, laterPCM])
+
+        await driver.stop()
+        eventTask.cancel()
+        #expect(await recorder.outcome() == .succeeded)
+        await task.value
+    }
+
+    @Test func exactCommitRejectsUnavailableStartHistoryWithoutSendingPCM() async throws {
+        let (driver, connection, recorder, task) = await makeReadyDriver(profile: .openAIMini)
+        try await driver.sendAudioChunk(makeExactChunk(
+            generation: 7,
+            start: 125_000,
+            pcm16LEData: Data([10, 0, 20, 0])
+        ))
+        var rejected = false
+        do {
+            try await driver.commit(makeUtterance(generation: 7, start: 62_500, end: 187_500))
+        } catch let code as RealtimeFailureCode {
+            rejected = code == .invalidConfiguration
+        }
+        #expect(rejected)
+        if !rejected { #expect(await connection.waitUntilSentMessageCount(3)) }
+        #expect(await connection.sentMessageTypes() == ["session.update"])
+        await driver.stop()
+        #expect(await recorder.outcome() == .succeeded)
+        await task.value
+    }
+
+    @Test func exactCommitRejectsUnavailableEndHistoryWithoutSendingPCM() async throws {
+        let (driver, connection, recorder, task) = await makeReadyDriver(profile: .openAIMini)
+        try await driver.sendAudioChunk(makeExactChunk(
+            generation: 7,
+            start: 125_000,
+            pcm16LEData: Data([10, 0, 20, 0])
+        ))
+        var rejected = false
+        do {
+            try await driver.commit(makeUtterance(generation: 7, start: 125_000, end: 312_500))
+        } catch let code as RealtimeFailureCode {
+            rejected = code == .invalidConfiguration
+        }
+        #expect(rejected)
+        if !rejected { #expect(await connection.waitUntilSentMessageCount(3)) }
+        #expect(await connection.sentMessageTypes() == ["session.update"])
+        await driver.stop()
+        #expect(await recorder.outcome() == .succeeded)
+        await task.value
+    }
+
+    @Test func preciseCoverageRequirementRejectsPointOnlyAudioAndPreservesCompatibilityMailbox() async throws {
+        let (driver, connection, recorder, task) = await makeReadyDriver(profile: .openAIMini)
+        let interval = makeUtterance(
+            generation: 7,
+            start: 0,
+            end: 500,
+            requiresPreciseSampleCoverage: true
+        )
+        try await driver.sendAudioChunk(makeChunk(generation: 7, timestamp: 100, bytes: 4))
+
+        var rejected = false
+        do {
+            try await driver.commit(interval)
+        } catch let code as RealtimeFailureCode {
+            rejected = code == .invalidConfiguration
+        }
+        #expect(rejected)
+        if !rejected {
+            #expect(await connection.waitUntilSentMessageCount(3))
+            #expect(await connection.sentMessageTypes().contains("input_audio_buffer.append"))
+            await driver.stop()
+            #expect(await recorder.outcome() == .succeeded)
+            await task.value
+            return
+        }
+        #expect(await connection.sentMessageTypes() == ["session.update"])
+
+        // The compatibility caller can still consume the original point-only PCM.
+        try await driver.commit(makeUtterance(generation: 7, start: 0, end: 500))
+        #expect(await connection.waitUntilSentMessageCount(3))
+        #expect(appendedPCM(in: await connection.sentTextMessages()) == [Data([0, 0, 0, 0])])
+        await driver.stop()
+        #expect(await recorder.outcome() == .succeeded)
+        await task.value
+    }
+
+    @Test func exactAudioRejectsIncompleteAndDurationInvalidSpans() async throws {
+        let (driver, connection, recorder, task) = await makeReadyDriver(profile: .openAIMini)
+        let incompleteChunks = [
+            RealtimeAudioChunk(
+                sourceAlias: "audio-1",
+                generation: 7,
+                capturedAtMonotonicNanoseconds: 0,
+                endMonotonicNanoseconds: 62_500,
+                pcm16LEData: Data([1, 0]),
+                sampleRate: 16_000
+            ),
+            RealtimeAudioChunk(
+                sourceAlias: "audio-1",
+                generation: 7,
+                capturedAtMonotonicNanoseconds: 0,
+                startMonotonicNanoseconds: 0,
+                pcm16LEData: Data([2, 0]),
+                sampleRate: 16_000
+            ),
+            RealtimeAudioChunk(
+                sourceAlias: "audio-1",
+                generation: 7,
+                capturedAtMonotonicNanoseconds: 0,
+                startMonotonicNanoseconds: 0,
+                endMonotonicNanoseconds: 125_000,
+                pcm16LEData: Data([3, 0]),
+                sampleRate: 16_000
+            ),
+        ]
+        for chunk in incompleteChunks {
+            await expectFailure(.invalidConfiguration) {
+                try await driver.sendAudioChunk(chunk)
+            }
+        }
+        #expect(await connection.sentMessageTypes() == ["session.update"])
+        await driver.stop()
+        #expect(await recorder.outcome() == .succeeded)
+        await task.value
+    }
+
+    @Test func exactAudioRejectsOverlappingInputWithoutSendingAudio() async throws {
+        let (driver, connection, recorder, task) = await makeReadyDriver(profile: .openAIMini)
+        try await driver.sendAudioChunk(makeExactChunk(
+            generation: 7,
+            start: 0,
+            pcm16LEData: Data([10, 0, 20, 0])
+        ))
+        await expectFailure(.invalidConfiguration) {
+            try await driver.sendAudioChunk(makeExactChunk(
+                generation: 7,
+                start: 62_500,
+                pcm16LEData: Data([30, 0, 40, 0])
+            ))
+        }
+        #expect(await connection.sentMessageTypes() == ["session.update"])
+        await driver.stop()
+        #expect(await recorder.outcome() == .succeeded)
+        await task.value
+    }
+
+    @Test func exactAudioRejectsOutOfOrderInput() async throws {
+        let (driver, connection, recorder, task) = await makeReadyDriver(profile: .openAIMini)
+        try await driver.sendAudioChunk(makeExactChunk(
+            generation: 7,
+            start: 125_000,
+            pcm16LEData: Data([10, 0, 20, 0])
+        ))
+        await expectFailure(.invalidConfiguration) {
+            try await driver.sendAudioChunk(makeExactChunk(
+                generation: 7,
+                start: 0,
+                pcm16LEData: Data([30, 0, 40, 0])
+            ))
+        }
+        #expect(await connection.sentMessageTypes() == ["session.update"])
+        await driver.stop()
+        #expect(await recorder.outcome() == .succeeded)
+        await task.value
+    }
+
+    @Test func exactAudioRejectsStaleInputAfterCommitDrainsMailbox() async throws {
+        let (driver, connection, recorder, task) = await makeReadyDriver(profile: .openAIMini)
+        let pcm = Data([10, 0, 20, 0])
+        let chunk = makeExactChunk(generation: 7, start: 0, pcm16LEData: pcm)
+        try await driver.sendAudioChunk(chunk)
+        try await driver.commit(makeUtterance(generation: 7, start: 0, end: 125_000))
+        #expect(await connection.waitUntilSentMessageCount(3))
+
+        await expectFailure(.invalidConfiguration) {
+            try await driver.sendAudioChunk(chunk)
+        }
+        #expect(await connection.sentMessageTypes() == [
+            "session.update", "input_audio_buffer.append", "input_audio_buffer.commit",
+        ])
+        await driver.stop()
+        #expect(await recorder.outcome() == .succeeded)
+        await task.value
+    }
+
+    @Test func exactSampleBoundariesMustBeFrameAligned() async throws {
+        let (driver, connection, recorder, task) = await makeReadyDriver(profile: .openAIMini)
+        let pcm = Data([10, 0, 20, 0, 30, 0, 40, 0])
+        try await driver.sendAudioChunk(makeExactChunk(generation: 7, start: 0, pcm16LEData: pcm))
+        await expectFailure(.invalidConfiguration) {
+            try await driver.commit(makeUtterance(generation: 7, start: 0, end: 187_501))
+        }
+        #expect(await connection.sentMessageTypes() == ["session.update"])
+        await driver.stop()
+        #expect(await recorder.outcome() == .succeeded)
+        await task.value
+    }
+
+    @Test func exactCommitFailurePreservesQueuedPCM() async throws {
+        let (driver, connection, recorder, task) = await makeReadyDriver(profile: .openAIMini)
+        let pcm = Data([10, 0, 20, 0, 30, 0, 40, 0])
+        try await driver.sendAudioChunk(makeExactChunk(generation: 7, start: 0, pcm16LEData: pcm))
+        await expectFailure(.invalidConfiguration) {
+            try await driver.commit(makeUtterance(generation: 7, start: 0, end: 187_501))
+        }
+        #expect(await connection.sentMessageTypes() == ["session.update"])
+
+        try await driver.commit(makeUtterance(generation: 7, start: 0, end: 250_000))
+        #expect(await connection.waitUntilSentMessageCount(3))
+        #expect(appendedPCM(in: await connection.sentTextMessages()) == [pcm])
+        await driver.stop()
+        #expect(await recorder.outcome() == .succeeded)
+        await task.value
+    }
+
+    @Test func commitSlicesPartialPCMChunksAndRetainsTheLaterSuffix() async throws {
+        let (driver, connection, recorder, task) = await makeReadyDriver(profile: .openAIMini)
+        let (events, eventTask) = await recordEvents(from: driver)
+        let firstPCM = Data([10, 0, 20, 0, 30, 0, 40, 0])
+        let secondPCM = Data([50, 0, 60, 0, 70, 0, 80, 0])
+        try await driver.sendAudioChunk(RealtimeAudioChunk(
+            sourceAlias: "audio-1",
+            generation: 7,
+            capturedAtMonotonicNanoseconds: 0,
+            startMonotonicNanoseconds: 0,
+            endMonotonicNanoseconds: 250_000,
+            pcm16LEData: firstPCM,
+            sampleRate: 16_000
+        ))
+        try await driver.sendAudioChunk(RealtimeAudioChunk(
+            sourceAlias: "audio-1",
+            generation: 7,
+            capturedAtMonotonicNanoseconds: 250_000,
+            startMonotonicNanoseconds: 250_000,
+            endMonotonicNanoseconds: 500_000,
+            pcm16LEData: secondPCM,
+            sampleRate: 16_000
+        ))
+
+        try await driver.commit(makeUtterance(generation: 7, start: 62_500, end: 312_500))
+        #expect(await connection.waitUntilSentMessageCount(4))
+        let firstTurnMessages = await connection.sentTextMessages()
+        #expect(appendedPCM(in: firstTurnMessages) == [
+            Data([20, 0, 30, 0, 40, 0]),
+            Data([50, 0]),
+        ])
+
+        await connection.enqueue(.text(#"{"type":"input_audio_buffer.committed"}"#))
+        #expect(await connection.waitUntilSentMessageCount(5))
+        await connection.enqueue(.text(#"{"type":"response.created","response":{"id":"resp_sliced"}}"#))
+        await connection.enqueue(.text(#"{"type":"response.output_text.delta","response_id":"resp_sliced","delta":"ready"}"#))
+        await connection.enqueue(.text(#"{"type":"response.done","response":{"id":"resp_sliced","status":"completed"}}"#))
+        #expect(await events.waitForCount(1))
+
+        try await driver.commit(makeUtterance(generation: 7, start: 312_500, end: 500_000))
+        #expect(await connection.waitUntilSentMessageCount(7))
+        let secondTurnMessages = await connection.sentTextMessages()
+        #expect(appendedPCM(in: secondTurnMessages) == [
+            Data([20, 0, 30, 0, 40, 0]),
+            Data([50, 0]),
+            Data([60, 0, 70, 0, 80, 0]),
+        ])
+
+        await driver.stop()
+        eventTask.cancel()
+        #expect(await recorder.outcome() == .succeeded)
+        await task.value
+    }
+
     @Test func committedUtteranceRequestsOneTextCorrectionAndWaitsForCompletion() async throws {
         let (driver, connection, recorder, task) = await makeReadyDriver(profile: .openAIMini)
         let (events, eventTask) = await recordEvents(from: driver)
@@ -1815,6 +2124,24 @@ private func makeChunk(
     )
 }
 
+private func makeExactChunk(
+    alias: String = "audio-1",
+    generation: Int,
+    start: UInt64,
+    pcm16LEData: Data
+) -> RealtimeAudioChunk {
+    let frameCount = UInt64(pcm16LEData.count / 2)
+    return RealtimeAudioChunk(
+        sourceAlias: alias,
+        generation: generation,
+        capturedAtMonotonicNanoseconds: start,
+        startMonotonicNanoseconds: start,
+        endMonotonicNanoseconds: start + frameCount * 62_500,
+        pcm16LEData: pcm16LEData,
+        sampleRate: 16_000
+    )
+}
+
 private func makeVideoFrame(
     timestamp: UInt64,
     marker: UInt8 = 0x01
@@ -1835,11 +2162,24 @@ private func containsEncodedFrame(_ text: String, frame: RealtimeVideoFrame) -> 
     return video["data"] as? String == frame.jpegData.base64EncodedString()
 }
 
+private func appendedPCM(in messages: [String]) -> [Data] {
+    messages.compactMap { message in
+        guard let data = message.data(using: .utf8),
+              let object = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+              object["type"] as? String == "input_audio_buffer.append",
+              let encoded = object["audio"] as? String else {
+            return nil
+        }
+        return Data(base64Encoded: encoded)
+    }
+}
+
 private func makeUtterance(
     alias: String = "audio-1",
     generation: Int,
     start: UInt64,
-    end: UInt64
+    end: UInt64,
+    requiresPreciseSampleCoverage: Bool = false
 ) -> RealtimeUtterance {
     RealtimeUtterance(
         sourceAlias: alias,
@@ -1847,7 +2187,8 @@ private func makeUtterance(
         captionID: UUID(),
         utteranceID: "synthetic-utterance",
         startMonotonicNanoseconds: start,
-        endMonotonicNanoseconds: end
+        endMonotonicNanoseconds: end,
+        requiresPreciseSampleCoverage: requiresPreciseSampleCoverage
     )
 }
 

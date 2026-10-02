@@ -71,6 +71,228 @@ import Testing
         #expect(RecognizedSentence(text: "Recognized text.").audioWAVData == nil)
     }
 
+    @Test func recognizedSentenceWithoutProvenProvenanceRemainsLocalOnly() {
+        let sentence = RecognizedSentence(text: "Local caption.")
+
+        #expect(sentence.audioProvenance == nil)
+    }
+
+    @Test func realtimePCMChunkCarriesSampleIntervalAfterPreInputAudio() async throws {
+        let session = LiveTranscriptionSession()
+        await session.beginRecognitionSessionForTesting()
+
+        // Capture advances its normalized sample clock before the native input is activated.
+        await session.appendRealtimePCM16AudioForTesting(
+            try makeMono16KBuffer(samples: [0.125, -0.25, 0.5])
+        )
+        let input = try #require(await session.makeRealtimePCM16AudioInput())
+        await session.appendRealtimePCM16AudioForTesting(
+            try makeMono16KBuffer(samples: [-0.5, 0.75])
+        )
+        let chunk = try #require(try await input.nextChunk())
+
+        #expect(chunk.sourceToken == input.sourceToken)
+        #expect(chunk.generation == input.generation)
+        #expect(chunk.sampleInterval == 3..<5)
+    }
+
+    @Test func realtimePCMChunkSampleClockRestartsWithCaptureGeneration() async throws {
+        let session = LiveTranscriptionSession()
+        await session.beginRecognitionSessionForTesting()
+        let oldInput = try #require(await session.makeRealtimePCM16AudioInput())
+        await session.appendRealtimePCM16AudioForTesting(
+            try makeMono16KBuffer(samples: [0.1, 0.2])
+        )
+        let oldChunk = try #require(try await oldInput.nextChunk())
+
+        await session.beginRecognitionSessionForTesting()
+        let newInput = try #require(await session.makeRealtimePCM16AudioInput())
+        await session.appendRealtimePCM16AudioForTesting(
+            try makeMono16KBuffer(samples: [-0.1])
+        )
+        let newChunk = try #require(try await newInput.nextChunk())
+
+        #expect(oldChunk.sampleInterval == 0..<2)
+        #expect(newInput.sourceToken != oldInput.sourceToken)
+        #expect(newInput.generation > oldInput.generation)
+        #expect(newChunk.sourceToken == newInput.sourceToken)
+        #expect(newChunk.generation == newInput.generation)
+        #expect(newChunk.sampleInterval == 0..<1)
+    }
+
+    @Test func legacyRecognitionClockMapsRequestTimeToCaptureSamples() {
+        let sourceToken = UUID()
+        var mapping = LegacyRecognitionSampleMapping(
+            sourceToken: sourceToken,
+            captureGeneration: 9
+        )
+
+        let firstAppendSucceeded = mapping.append(captureInterval: 3..<7, preserves16kFrameIdentity: true)
+        let secondAppendSucceeded = mapping.append(captureInterval: 7..<10, preserves16kFrameIdentity: true)
+        #expect(firstAppendSucceeded)
+        #expect(secondAppendSucceeded)
+        let provenance = mapping.provenance(for: [
+            LegacySpeechSegmentTiming(timestamp: 2.0 / 16_000, duration: 1.0 / 16_000),
+            LegacySpeechSegmentTiming(timestamp: 3.0 / 16_000, duration: 1.0 / 16_000)
+        ])
+
+        #expect(provenance?.sourceToken == sourceToken)
+        #expect(provenance?.captureGeneration == 9)
+        #expect(provenance?.sampleInterval == 5..<7)
+    }
+
+    @Test func legacyRecognitionClockInvalidatesSkippedOrConvertedAudio() {
+        let sourceToken = UUID()
+        var skipped = LegacyRecognitionSampleMapping(sourceToken: sourceToken, captureGeneration: 4)
+        let initialAppendSucceeded = skipped.append(captureInterval: 0..<3, preserves16kFrameIdentity: true)
+        #expect(initialAppendSucceeded)
+        #expect(skipped.append(captureInterval: 4..<6, preserves16kFrameIdentity: true) == false)
+        #expect(skipped.provenance(startSeconds: 0, durationSeconds: 2.0 / 16_000) == nil)
+
+        var converted = LegacyRecognitionSampleMapping(sourceToken: sourceToken, captureGeneration: 4)
+        let convertedInitialAppendSucceeded = converted.append(captureInterval: 0..<3, preserves16kFrameIdentity: true)
+        #expect(convertedInitialAppendSucceeded)
+        #expect(converted.append(captureInterval: 3..<5, preserves16kFrameIdentity: false) == false)
+        #expect(converted.provenance(startSeconds: 0, durationSeconds: 2.0 / 16_000) == nil)
+
+        var malformedSegmentsMapping = LegacyRecognitionSampleMapping(
+            sourceToken: sourceToken,
+            captureGeneration: 4
+        )
+        let malformedAppendSucceeded = malformedSegmentsMapping.append(
+            captureInterval: 0..<4,
+            preserves16kFrameIdentity: true
+        )
+        #expect(malformedAppendSucceeded)
+        #expect(malformedSegmentsMapping.provenance(for: [
+            LegacySpeechSegmentTiming(timestamp: 1.0 / 16_000, duration: 2.0 / 16_000),
+            LegacySpeechSegmentTiming(timestamp: 2.0 / 16_000, duration: 1.0 / 16_000)
+        ]) == nil)
+
+        var extreme = LegacyRecognitionSampleMapping(sourceToken: sourceToken, captureGeneration: 4)
+        let extremeAppendSucceeded = extreme.append(captureInterval: 0..<1, preserves16kFrameIdentity: true)
+        #expect(extremeAppendSucceeded)
+        #expect(
+            extreme.provenance(
+                startSeconds: 0,
+                durationSeconds: Double(Int64.max) / 16_000
+            ) == nil
+        )
+    }
+
+    @Test @MainActor func committedLegacyProvenanceSurvivesRecognitionRestart() async throws {
+        let session = LiveTranscriptionSession()
+        let recorder = RecognizedSentenceRecorder()
+        session.setTranscriptHandlerForTesting { recorder.record($0) }
+        session.setCorrectionAudioCaptureEnabled(true)
+        await session.beginRecognitionSessionForTesting()
+        let input = try #require(await session.makeRealtimePCM16AudioInput())
+        await session.beginLegacySampleMappingForTesting()
+
+        let first = try makeMono16KBuffer(samples: [0.25, -0.25])
+        let second = try makeMono16KBuffer(samples: [0.5, -0.5])
+        #expect(await session.appendLegacyNormalizedBufferForTesting(first, preservesIdentity: true) == 0..<2)
+        #expect(await session.appendLegacyNormalizedBufferForTesting(second, preservesIdentity: true) == 2..<4)
+        #expect(
+            await session.queueLegacyCommittedEmissionForTesting(
+                text: "Final legacy sentence.",
+                segments: [LegacySpeechSegmentTiming(timestamp: 1.0 / 16_000, duration: 2.0 / 16_000)]
+            ) == true
+        )
+
+        await session.resetRecognitionGenerationForTesting()
+        await session.deliverQueuedCommittedEmissionForTesting()
+
+        let sentence = try #require(recorder.sentences.first)
+        #expect(sentence.text == "Final legacy sentence.")
+        #expect(sentence.audioProvenance?.sourceToken == input.sourceToken)
+        #expect(sentence.audioProvenance?.captureGeneration == input.generation)
+        #expect(sentence.audioProvenance?.sampleInterval == 1..<3)
+        let wav = try #require(sentence.audioWAVData)
+        #expect(pcm16Samples(from: wav) == [8_192, -8_192, 16_384, -16_384])
+    }
+
+    @Test @MainActor func unprovenLegacyMappingKeepsLocalTextAndEligibleWAV() async throws {
+        let session = LiveTranscriptionSession()
+        let recorder = RecognizedSentenceRecorder()
+        session.setTranscriptHandlerForTesting { recorder.record($0) }
+        session.setCorrectionAudioCaptureEnabled(true)
+        await session.beginRecognitionSessionForTesting()
+        await session.beginLegacySampleMappingForTesting()
+
+        let first = try makeMono16KBuffer(samples: [0.25, -0.25])
+        let changedFormat = try makeMono16KBuffer(samples: [0.5, -0.5])
+        _ = await session.appendLegacyNormalizedBufferForTesting(first, preservesIdentity: true)
+        _ = await session.appendLegacyNormalizedBufferForTesting(changedFormat, preservesIdentity: false)
+        #expect(
+            await session.queueLegacyCommittedEmissionForTesting(
+                text: "Keep local text and audio.",
+                segments: [LegacySpeechSegmentTiming(timestamp: 0, duration: 2.0 / 16_000)]
+            ) == false
+        )
+        await session.deliverQueuedCommittedEmissionForTesting()
+
+        let sentence = try #require(recorder.sentences.first)
+        #expect(sentence.text == "Keep local text and audio.")
+        #expect(sentence.audioProvenance == nil)
+        let wav = try #require(sentence.audioWAVData)
+        #expect(pcm16Samples(from: wav) == [8_192, -8_192, 16_384, -16_384])
+    }
+
+    @Test @MainActor func legacyCaptureOptOutStripsWAVButRetainsSnapshottedNativeProvenance() async throws {
+        let session = LiveTranscriptionSession()
+        let recorder = RecognizedSentenceRecorder()
+        session.setTranscriptHandlerForTesting { recorder.record($0) }
+        await session.resetCorrectionAudioCapture(enabled: true)
+        await session.beginRecognitionSessionForTesting()
+        let input = try #require(await session.makeRealtimePCM16AudioInput())
+        await session.beginLegacySampleMappingForTesting()
+
+        _ = await session.appendLegacyNormalizedBufferForTesting(
+            try makeMono16KBuffer(samples: [0.25, -0.25]),
+            preservesIdentity: true
+        )
+        #expect(
+            await session.queueLegacyCommittedEmissionForTesting(
+                text: "Preserve native timing.",
+                segments: [LegacySpeechSegmentTiming(timestamp: 0, duration: 2.0 / 16_000)]
+            )
+        )
+
+        await session.resetCorrectionAudioCapture(enabled: false)
+        await session.deliverQueuedCommittedEmissionForTesting()
+
+        let sentence = try #require(recorder.sentences.first)
+        #expect(sentence.text == "Preserve native timing.")
+        #expect(sentence.audioWAVData == nil)
+        #expect(sentence.audioProvenance?.sourceToken == input.sourceToken)
+        #expect(sentence.audioProvenance?.captureGeneration == input.generation)
+        #expect(sentence.audioProvenance?.sampleInterval == 0..<2)
+    }
+
+    @Test @MainActor func splitLegacyEmissionDoesNotCopyItsWholeIntervalToEachUnit() async throws {
+        let session = LiveTranscriptionSession()
+        let recorder = RecognizedSentenceRecorder()
+        session.setTranscriptHandlerForTesting { recorder.record($0) }
+        await session.beginRecognitionSessionForTesting()
+        await session.beginLegacySampleMappingForTesting()
+        _ = await session.appendLegacyNormalizedBufferForTesting(
+            try makeMono16KBuffer(samples: [0.25, -0.25, 0.5, -0.5]),
+            preservesIdentity: true
+        )
+        #expect(
+            await session.queueLegacyCommittedEmissionForTesting(
+                text: "First unit. Second unit.",
+                segments: [LegacySpeechSegmentTiming(timestamp: 0, duration: 4.0 / 16_000)]
+            )
+        )
+
+        await session.deliverQueuedCommittedEmissionForTesting()
+
+        #expect(recorder.sentences.map(\.text) == ["First unit.", "Second unit."])
+        #expect(recorder.sentences.allSatisfy { $0.audioProvenance == nil })
+    }
+
     @Test func realtimeInputPublishesRawPCM16LEWithItsSourceAndGeneration() async throws {
         let session = LiveTranscriptionSession()
         await session.beginRecognitionSessionForTesting()
@@ -131,6 +353,7 @@ import Testing
         #expect(fanout.offer(
             pcm16LE: Data(repeating: 0x11, count: 6),
             frameCount: 3,
+            sampleInterval: 0..<3,
             sourceToken: sourceToken,
             generation: 7,
             captureTimestampNanoseconds: 10
@@ -138,6 +361,7 @@ import Testing
         #expect(fanout.offer(
             pcm16LE: Data(repeating: 0x22, count: 4),
             frameCount: 2,
+            sampleInterval: 3..<5,
             sourceToken: sourceToken,
             generation: 7,
             captureTimestampNanoseconds: 20
@@ -153,10 +377,42 @@ import Testing
         #expect(fanout.offer(
             pcm16LE: Data([0x33, 0x33]),
             frameCount: 1,
+            sampleInterval: 5..<6,
             sourceToken: sourceToken,
             generation: 7,
             captureTimestampNanoseconds: 30
         ) == .closed)
+    }
+
+    @Test func realtimeFanoutRejectsNegativeExtremeSampleIntervalWithoutOverflowing() async throws {
+        let sourceToken = UUID()
+        let fanout = RealtimePCM16AudioFanout(sourceToken: sourceToken, generation: 2)
+        _ = try #require(fanout.makeInput())
+
+        let result = fanout.offer(
+            pcm16LE: Data(repeating: 0, count: 2),
+            frameCount: 1,
+            sampleInterval: Int64.min..<Int64.max,
+            sourceToken: sourceToken,
+            generation: 2,
+            captureTimestampNanoseconds: 0
+        )
+
+        #expect(result == .invalidAudioChunk)
+        #expect(fanout.terminationError == .invalidAudioChunk)
+
+        let largestFanout = RealtimePCM16AudioFanout(sourceToken: sourceToken, generation: 3)
+        _ = try #require(largestFanout.makeInput())
+        let largestRangeResult = largestFanout.offer(
+            pcm16LE: Data(repeating: 0, count: 2),
+            frameCount: 1,
+            sampleInterval: 0..<Int64.max,
+            sourceToken: sourceToken,
+            generation: 3,
+            captureTimestampNanoseconds: 0
+        )
+        #expect(largestRangeResult == .invalidAudioChunk)
+        #expect(largestFanout.terminationError == .invalidAudioChunk)
     }
 
     @Test func realtimeInputRejectsOtherSourcesAndStaleGenerations() async throws {
@@ -172,6 +428,7 @@ import Testing
         #expect(fanout.offer(
             pcm16LE: Data([0x01, 0x02]),
             frameCount: 1,
+            sampleInterval: 0..<1,
             sourceToken: UUID(),
             generation: 12,
             captureTimestampNanoseconds: 1
@@ -179,6 +436,7 @@ import Testing
         #expect(fanout.offer(
             pcm16LE: Data([0x03, 0x04]),
             frameCount: 1,
+            sampleInterval: 0..<1,
             sourceToken: sourceToken,
             generation: 11,
             captureTimestampNanoseconds: 2
@@ -186,6 +444,7 @@ import Testing
         #expect(fanout.offer(
             pcm16LE: Data([0x05, 0x06]),
             frameCount: 1,
+            sampleInterval: 0..<1,
             sourceToken: sourceToken,
             generation: 12,
             captureTimestampNanoseconds: 3

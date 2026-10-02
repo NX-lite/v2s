@@ -24,9 +24,37 @@ struct RealtimeSourceAliases: Sendable {
 struct RealtimeAudioChunk: Equatable, Sendable {
     let sourceAlias: String
     let generation: Int
+    /// Capture arrival is provenance only. It must never be used to infer an ASR
+    /// sentence boundary because it is not a sample-clock interval.
     let capturedAtMonotonicNanoseconds: UInt64
+    /// Exact normalized-16-kHz logical sample span, when the capture fanout can
+    /// prove one. The interval is half-open: [start, end).
+    let startMonotonicNanoseconds: UInt64
+    let endMonotonicNanoseconds: UInt64
+    let hasPreciseSampleSpan: Bool
+    let hasIncompleteSampleSpan: Bool
     let pcm16LEData: Data
     let sampleRate: Int
+
+    init(
+        sourceAlias: String,
+        generation: Int,
+        capturedAtMonotonicNanoseconds: UInt64,
+        startMonotonicNanoseconds: UInt64? = nil,
+        endMonotonicNanoseconds: UInt64? = nil,
+        pcm16LEData: Data,
+        sampleRate: Int
+    ) {
+        self.sourceAlias = sourceAlias
+        self.generation = generation
+        self.capturedAtMonotonicNanoseconds = capturedAtMonotonicNanoseconds
+        self.startMonotonicNanoseconds = startMonotonicNanoseconds ?? capturedAtMonotonicNanoseconds
+        self.endMonotonicNanoseconds = endMonotonicNanoseconds ?? capturedAtMonotonicNanoseconds
+        self.hasPreciseSampleSpan = startMonotonicNanoseconds != nil && endMonotonicNanoseconds != nil
+        self.hasIncompleteSampleSpan = (startMonotonicNanoseconds == nil) != (endMonotonicNanoseconds == nil)
+        self.pcm16LEData = pcm16LEData
+        self.sampleRate = sampleRate
+    }
 }
 
 enum RealtimeAudioSourceRole: Equatable, Sendable {
@@ -54,6 +82,25 @@ struct RealtimeUtterance: Equatable, Sendable {
     let utteranceID: String
     let startMonotonicNanoseconds: UInt64
     let endMonotonicNanoseconds: UInt64
+    let requiresPreciseSampleCoverage: Bool
+
+    init(
+        sourceAlias: String,
+        generation: Int,
+        captionID: UUID,
+        utteranceID: String,
+        startMonotonicNanoseconds: UInt64,
+        endMonotonicNanoseconds: UInt64,
+        requiresPreciseSampleCoverage: Bool = false
+    ) {
+        self.sourceAlias = sourceAlias
+        self.generation = generation
+        self.captionID = captionID
+        self.utteranceID = utteranceID
+        self.startMonotonicNanoseconds = startMonotonicNanoseconds
+        self.endMonotonicNanoseconds = endMonotonicNanoseconds
+        self.requiresPreciseSampleCoverage = requiresPreciseSampleCoverage
+    }
 }
 
 enum RealtimeFailureCode: String, Error, Equatable, Sendable {

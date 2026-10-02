@@ -74,6 +74,7 @@
 		B00000000000000000000112 /* VisualSourceCatalog.swift in Sources */ = {isa = PBXBuildFile; fileRef = B00000000000000000000113 /* VisualSourceCatalog.swift */; };
 		B00000000000000000000114 /* NativeRealtimeSessionDriver.swift in Sources */ = {isa = PBXBuildFile; fileRef = B00000000000000000000115 /* NativeRealtimeSessionDriver.swift */; };
 		B00000000000000000000117 /* NativeRealtimeSessionCoordinator.swift in Sources */ = {isa = PBXBuildFile; fileRef = B00000000000000000000116 /* NativeRealtimeSessionCoordinator.swift */; };
+		B0000000000000000000011A /* SpeechSampleProvenance.swift in Sources */ = {isa = PBXBuildFile; fileRef = B0000000000000000000011B /* SpeechSampleProvenance.swift */; };
 /* End PBXBuildFile section */
 
 /* Begin PBXFileReference section */
@@ -145,6 +146,7 @@
 		B00000000000000000000113 /* VisualSourceCatalog.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = VisualSourceCatalog.swift; sourceTree = "<group>"; };
 		B00000000000000000000115 /* NativeRealtimeSessionDriver.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = NativeRealtimeSessionDriver.swift; sourceTree = "<group>"; };
 		B00000000000000000000116 /* NativeRealtimeSessionCoordinator.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = NativeRealtimeSessionCoordinator.swift; sourceTree = "<group>"; };
+		B0000000000000000000011B /* SpeechSampleProvenance.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = SpeechSampleProvenance.swift; sourceTree = "<group>"; };
 /* End PBXFileReference section */
 
 /* Begin PBXFrameworksBuildPhase section */
@@ -261,6 +263,7 @@
 				A00000000000000000000105 /* HTTPTransport.swift */,
 				A00000000000000000000093 /* TranslationCoordinator.swift */,
 				A00000000000000000000041 /* LiveTranscriptionSession.swift */,
+				B0000000000000000000011B /* SpeechSampleProvenance.swift */,
 				A00000000000000000000106 /* OpenAIResponsesClient.swift */,
 				03B7BEF7D7B4C94980869707 /* RealtimeCorrectionCoordinator.swift */,
 				B00000000000000000000107 /* RealtimeCredentialStore.swift */,
@@ -495,6 +498,7 @@
 				A0000000000000000000005F /* StatusBarController.swift in Sources */,
 				A00000000000000000000060 /* StatusBarPopoverView.swift in Sources */,
 				A00000000000000000000061 /* LiveTranscriptionSession.swift in Sources */,
+				B0000000000000000000011A /* SpeechSampleProvenance.swift in Sources */,
 				A00000000000000000000086 /* UpdaterService.swift in Sources */,
 			);
 			runOnlyForDeploymentPostprocessing = 0;

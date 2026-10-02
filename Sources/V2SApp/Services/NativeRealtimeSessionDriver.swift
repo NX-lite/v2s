@@ -4,6 +4,7 @@ actor NativeRealtimeSessionDriver: RealtimeSessionDriving {
     private static let maximumAudioChunkBytes = 32_000
     private static let maximumAudioMailboxBytes = 512_000
     private static let maximumAudioMailboxChunks = 128
+    private static let audioFrameDurationNanoseconds: UInt64 = 62_500
     private static let maximumCorrectionTextLength = 8_192
     private static let minimumVideoFrameIntervalNanoseconds: UInt64 = 1_000_000_000
 
@@ -77,6 +78,7 @@ actor NativeRealtimeSessionDriver: RealtimeSessionDriving {
     private var videoDrainTask: Task<Void, Never>?
     private var audioMailbox: [RealtimeAudioChunk] = []
     private var audioMailboxBytes = 0
+    private var lastAudioSpanEnd: UInt64?
     private var videoMailbox: RealtimeVideoFrame?
     private var lastVideoFrameTimestamp: UInt64?
     private var lastVideoSendUptimeNanoseconds: UInt64?
@@ -126,6 +128,7 @@ actor NativeRealtimeSessionDriver: RealtimeSessionDriving {
         }
 
         clearMailbox()
+        lastAudioSpanEnd = nil
         clearVideoMailbox()
         lastVideoFrameTimestamp = nil
         pendingUtterance = nil
@@ -204,6 +207,21 @@ actor NativeRealtimeSessionDriver: RealtimeSessionDriving {
               chunk.pcm16LEData.count <= Self.maximumAudioChunkBytes else {
             throw RealtimeFailureCode.capabilityRejected
         }
+        guard !chunk.hasIncompleteSampleSpan else {
+            throw RealtimeFailureCode.invalidConfiguration
+        }
+
+        if chunk.hasPreciseSampleSpan {
+            guard isValidPreciseSampleSpan(chunk),
+                  audioMailbox.allSatisfy(\.hasPreciseSampleSpan),
+                  lastAudioSpanEnd.map({ chunk.startMonotonicNanoseconds >= $0 }) ?? true else {
+                throw RealtimeFailureCode.invalidConfiguration
+            }
+        } else if lastAudioSpanEnd != nil || audioMailbox.contains(where: \.hasPreciseSampleSpan) {
+            // Never mix exact sample-clock intervals with point-only compatibility
+            // chunks: their relative coverage cannot be proven.
+            throw RealtimeFailureCode.invalidConfiguration
+        }
 
         let wouldExceedBytes = audioMailboxBytes + chunk.pcm16LEData.count > Self.maximumAudioMailboxBytes
         let wouldExceedChunks = audioMailbox.count >= Self.maximumAudioMailboxChunks
@@ -215,6 +233,9 @@ actor NativeRealtimeSessionDriver: RealtimeSessionDriving {
 
         audioMailbox.append(chunk)
         audioMailboxBytes += chunk.pcm16LEData.count
+        if chunk.hasPreciseSampleSpan {
+            lastAudioSpanEnd = chunk.endMonotonicNanoseconds
+        }
     }
 
     func commit(_ utterance: RealtimeUtterance) async throws {
@@ -222,21 +243,68 @@ actor NativeRealtimeSessionDriver: RealtimeSessionDriving {
         guard let alias = sourceAlias, let generation = sourceGeneration,
               utterance.sourceAlias == alias, utterance.generation == generation,
               !utterance.utteranceID.isEmpty,
-              utterance.endMonotonicNanoseconds >= utterance.startMonotonicNanoseconds else {
+              utterance.endMonotonicNanoseconds > utterance.startMonotonicNanoseconds else {
+            throw RealtimeFailureCode.invalidConfiguration
+        }
+        if utterance.requiresPreciseSampleCoverage,
+           audioMailbox.first?.hasPreciseSampleSpan != true {
             throw RealtimeFailureCode.invalidConfiguration
         }
 
         var committed: [RealtimeAudioChunk] = []
         var remainder: [RealtimeAudioChunk] = []
         var remainderBytes = 0
-        for chunk in audioMailbox {
-            if chunk.capturedAtMonotonicNanoseconds > utterance.endMonotonicNanoseconds {
-                remainder.append(chunk)
-                remainderBytes += chunk.pcm16LEData.count
-            } else if chunk.capturedAtMonotonicNanoseconds >= utterance.startMonotonicNanoseconds {
-                committed.append(chunk)
+        if audioMailbox.first?.hasPreciseSampleSpan == true {
+            guard audioMailbox.allSatisfy(\.hasPreciseSampleSpan) else {
+                throw RealtimeFailureCode.invalidConfiguration
             }
-            // Chunks earlier than the utterance window are stale and dropped.
+            var previousChunkEnd: UInt64?
+            var coveredThrough = utterance.startMonotonicNanoseconds
+            for chunk in audioMailbox {
+                guard isValidPreciseSampleSpan(chunk),
+                      previousChunkEnd.map({ chunk.startMonotonicNanoseconds >= $0 }) ?? true else {
+                    throw RealtimeFailureCode.invalidConfiguration
+                }
+                previousChunkEnd = chunk.endMonotonicNanoseconds
+
+                guard let pieces = slicedPCM(
+                    chunk,
+                    for: utterance.startMonotonicNanoseconds..<utterance.endMonotonicNanoseconds
+                ) else {
+                    // A precise capture span with a malformed clock cannot be safely
+                    // reassigned to another caption. Leave the mailbox untouched.
+                    throw RealtimeFailureCode.invalidConfiguration
+                }
+                let overlapStart = max(chunk.startMonotonicNanoseconds, utterance.startMonotonicNanoseconds)
+                let overlapEnd = min(chunk.endMonotonicNanoseconds, utterance.endMonotonicNanoseconds)
+                if overlapStart < overlapEnd {
+                    guard overlapStart == coveredThrough else {
+                        throw RealtimeFailureCode.invalidConfiguration
+                    }
+                    coveredThrough = overlapEnd
+                }
+                if let committedPiece = pieces.committed {
+                    committed.append(committedPiece)
+                }
+                if let laterPiece = pieces.later {
+                    remainder.append(laterPiece)
+                    remainderBytes += laterPiece.pcm16LEData.count
+                }
+            }
+            guard coveredThrough == utterance.endMonotonicNanoseconds else {
+                throw RealtimeFailureCode.invalidConfiguration
+            }
+        } else {
+            // Compatibility for synthetic callers that have no capture ledger.
+            // Production captions use only precise sample spans.
+            for chunk in audioMailbox {
+                if chunk.capturedAtMonotonicNanoseconds > utterance.endMonotonicNanoseconds {
+                    remainder.append(chunk)
+                    remainderBytes += chunk.pcm16LEData.count
+                } else if chunk.capturedAtMonotonicNanoseconds >= utterance.startMonotonicNanoseconds {
+                    committed.append(chunk)
+                }
+            }
         }
         guard !committed.isEmpty else { throw RealtimeFailureCode.invalidConfiguration }
 
@@ -315,6 +383,82 @@ actor NativeRealtimeSessionDriver: RealtimeSessionDriving {
     func revokeVideoPermission() async {
         videoPermissionRevoked = true
         clearVideoMailbox()
+    }
+
+    /// Splits one proven 16-kHz capture span at a caption's half-open boundaries.
+    /// Prefix frames are already older than this caption; only the exact overlap is
+    /// committed, while the suffix remains queued for a later caption.
+    private func slicedPCM(
+        _ chunk: RealtimeAudioChunk,
+        for interval: Range<UInt64>
+    ) -> (committed: RealtimeAudioChunk?, later: RealtimeAudioChunk?)? {
+        guard isValidPreciseSampleSpan(chunk),
+              interval.upperBound > interval.lowerBound else {
+            return nil
+        }
+
+        let frameCount = chunk.pcm16LEData.count / 2
+        let nanosecondsPerFrame = Self.audioFrameDurationNanoseconds
+
+        func piece(from start: UInt64, through end: UInt64) -> RealtimeAudioChunk? {
+            guard start < end,
+                  start >= chunk.startMonotonicNanoseconds,
+                  end <= chunk.endMonotonicNanoseconds,
+                  (start - chunk.startMonotonicNanoseconds).isMultiple(of: nanosecondsPerFrame),
+                  (end - chunk.startMonotonicNanoseconds).isMultiple(of: nanosecondsPerFrame) else {
+                return nil
+            }
+            let firstFrame = Int((start - chunk.startMonotonicNanoseconds) / nanosecondsPerFrame)
+            let endFrame = Int((end - chunk.startMonotonicNanoseconds) / nanosecondsPerFrame)
+            guard firstFrame < endFrame, endFrame <= frameCount else { return nil }
+            return RealtimeAudioChunk(
+                sourceAlias: chunk.sourceAlias,
+                generation: chunk.generation,
+                capturedAtMonotonicNanoseconds: chunk.capturedAtMonotonicNanoseconds,
+                startMonotonicNanoseconds: start,
+                endMonotonicNanoseconds: end,
+                pcm16LEData: Data(chunk.pcm16LEData[(firstFrame * 2)..<(endFrame * 2)]),
+                sampleRate: chunk.sampleRate
+            )
+        }
+
+        let committedStart = max(chunk.startMonotonicNanoseconds, interval.lowerBound)
+        let committedEnd = min(chunk.endMonotonicNanoseconds, interval.upperBound)
+        let committed: RealtimeAudioChunk?
+        if committedStart < committedEnd {
+            guard let exactPiece = piece(from: committedStart, through: committedEnd) else { return nil }
+            committed = exactPiece
+        } else {
+            committed = nil
+        }
+
+        let laterStart = max(chunk.startMonotonicNanoseconds, interval.upperBound)
+        let later: RealtimeAudioChunk?
+        if laterStart < chunk.endMonotonicNanoseconds {
+            guard let suffix = piece(from: laterStart, through: chunk.endMonotonicNanoseconds) else {
+                return nil
+            }
+            later = suffix
+        } else {
+            later = nil
+        }
+        return (committed, later)
+    }
+
+    private func isValidPreciseSampleSpan(_ chunk: RealtimeAudioChunk) -> Bool {
+        guard chunk.hasPreciseSampleSpan,
+              !chunk.hasIncompleteSampleSpan,
+              chunk.sampleRate == 16_000,
+              !chunk.pcm16LEData.isEmpty,
+              chunk.pcm16LEData.count.isMultiple(of: 2),
+              chunk.endMonotonicNanoseconds > chunk.startMonotonicNanoseconds else {
+            return false
+        }
+        let frameCount = UInt64(chunk.pcm16LEData.count / 2)
+        let (expectedDuration, overflow) = frameCount.multipliedReportingOverflow(
+            by: Self.audioFrameDurationNanoseconds
+        )
+        return !overflow && chunk.endMonotonicNanoseconds - chunk.startMonotonicNanoseconds == expectedDuration
     }
 
     func events() async -> AsyncStream<RealtimeProviderEvent> {
