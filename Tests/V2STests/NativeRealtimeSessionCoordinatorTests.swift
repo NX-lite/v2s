@@ -43,6 +43,8 @@ import Testing
             sourceAlias: "audio-1",
             generation: started[0].generation,
             capturedAtMonotonicNanoseconds: 101,
+            startMonotonicNanoseconds: 0,
+            endMonotonicNanoseconds: 62_500,
             pcm16LEData: Data([1, 0]),
             sampleRate: 16_000
         )])
@@ -50,6 +52,8 @@ import Testing
             sourceAlias: "audio-2",
             generation: started[1].generation,
             capturedAtMonotonicNanoseconds: 202,
+            startMonotonicNanoseconds: 0,
+            endMonotonicNanoseconds: 62_500,
             pcm16LEData: Data([2, 0]),
             sampleRate: 16_000
         )])
@@ -166,6 +170,8 @@ import Testing
 
         try offer([1, 0], to: capture)
         #expect(offerResult([2, 0], to: capture) == .backpressureExceeded)
+        try await waitForCoordinatorCondition { failures.all().count == 1 }
+        #expect(bag.all().isEmpty)
         await backend.releaseLookup(with: "fake-secret")
         let started = await startTask.value
 
@@ -175,6 +181,786 @@ import Testing
         #expect(failures.all().count == 1)
         #expect(failures.all().first?.0 == "source-a")
         #expect(failures.all().first?.1 == .backpressure)
+    }
+
+    @Test func cancellingReservedStartupSuppressesQueuedInputFailureAfterObserverHop() async throws {
+        let bag = CoordinatorDriverBag()
+        let failures = CoordinatorFailureBag()
+        let inputGate = CoordinatorReleaseGate()
+        let cleanupGate = CoordinatorReleaseGate()
+        let inputDidFinishReturned = CoordinatorTestSignal()
+        let startCompleted = CoordinatorCompletionFlag()
+        var settings = NativeRealtimeSettings.default
+        settings.isEnabled = true
+        settings.credentialReference = "fake-ref"
+        settings.enabledSourceIDs = ["source-a"]
+        let coordinator = NativeRealtimeSessionCoordinator(
+            credentialStore: RealtimeCredentialStore(backend: CoordinatorCredentialBackend(secret: "fake-secret")),
+            driverFactory: { _, _, _ in
+                let driver = CoordinatorFakeDriver(suspendStartUntilStop: true)
+                bag.append(driver)
+                return driver
+            },
+            sourceFailureHandler: { sourceID, code in failures.append(sourceID, code) }
+        )
+        await coordinator.setInputDidFinishTestingHooks(
+            before: { await inputGate.suspend() },
+            after: { inputDidFinishReturned.signal() }
+        )
+        await coordinator.setBeforeCancellationCleanupForTesting {
+            await cleanupGate.suspend()
+        }
+        let capture = makeCoordinatorCapture(sourceID: "source-a", maximumBufferedFrames: 1)
+        let startTask = Task {
+            let result = await coordinator.start(captures: [capture.source], settings: settings)
+            await startCompleted.markComplete()
+            return result
+        }
+        var deferredError: Error?
+        do {
+            try await requireCoordinatorCondition("reserved driver creation") { bag.all().count == 1 }
+            guard let driver = bag.all().first else { throw CoordinatorFixtureError.offerRejected }
+            try await requireCoordinatorCondition("reserved driver start suspension") {
+                let starts = await driver.startInvocationCount()
+                let suspended = await driver.isStartSuspended()
+                return starts == 1 && suspended
+            }
+            try offer([1, 0], to: capture)
+            #expect(offerResult([2, 0], to: capture) == .backpressureExceeded)
+            try await requireCoordinatorCondition("input observer gate") { await inputGate.hasSuspended() }
+
+            startTask.cancel()
+            try await requireCoordinatorCondition("startup cleanup gate") { await cleanupGate.hasSuspended() }
+            #expect(capture.source.input.terminationError == .backpressureExceeded)
+            await inputGate.resume()
+            try await requireCoordinatorCondition("input observer actor return") { inputDidFinishReturned.isSignaled() }
+            #expect(failures.all().isEmpty)
+            #expect(await startCompleted.hasCompleted() == false)
+
+            await driver.releaseStartSuccessfully()
+            await cleanupGate.resume()
+            _ = await startTask.value
+            #expect(failures.all().isEmpty)
+        } catch {
+            deferredError = error
+        }
+        await inputGate.resume()
+        await cleanupGate.resume()
+        await coordinator.setInputDidFinishTestingHooks(before: nil, after: nil)
+        await coordinator.setBeforeCancellationCleanupForTesting(nil)
+        for driver in bag.all() {
+            await driver.releaseStartSuccessfully()
+            await driver.releaseSendSuccessfully()
+            await driver.releaseSuspendedStop()
+        }
+        _ = await startTask.value
+        await coordinator.stop()
+        if let deferredError { throw deferredError }
+    }
+
+    @Test func cancellingReplacementDuringPriorStopSuppressesQueuedInputFailure() async throws {
+        let bag = CoordinatorDriverBag()
+        let failures = CoordinatorFailureBag()
+        let inputGate = CoordinatorReleaseGate()
+        let inputDidFinishReturned = CoordinatorTestSignal()
+        var settings = NativeRealtimeSettings.default
+        settings.isEnabled = true
+        settings.credentialReference = "fake-ref"
+        settings.enabledSourceIDs = ["source-a"]
+        let coordinator = NativeRealtimeSessionCoordinator(
+            credentialStore: RealtimeCredentialStore(backend: CoordinatorCredentialBackend(secret: "fake-secret")),
+            driverFactory: { _, _, _ in
+                let driver = CoordinatorFakeDriver(suspendStopUntilReleased: bag.all().isEmpty)
+                bag.append(driver)
+                return driver
+            },
+            sourceFailureHandler: { sourceID, code in failures.append(sourceID, code) }
+        )
+        let originalCapture = makeCoordinatorCapture(sourceID: "source-a")
+        _ = await coordinator.start(captures: [originalCapture.source], settings: settings)
+        guard let originalDriver = bag.all().first else { throw CoordinatorFixtureError.offerRejected }
+        await coordinator.setInputDidFinishTestingHooks(
+            before: { await inputGate.suspend() },
+            after: { inputDidFinishReturned.signal() }
+        )
+        let replacementCapture = makeCoordinatorCapture(sourceID: "source-a", maximumBufferedFrames: 1)
+        let replacementTask = Task {
+            await coordinator.start(captures: [replacementCapture.source], settings: settings)
+        }
+        var deferredError: Error?
+        do {
+            try await requireCoordinatorCondition("prior driver stop suspension") { await originalDriver.isStopSuspended() }
+            try await requireCoordinatorCondition("replacement startup publication") {
+                await coordinator.startupSourceIDsForTesting() == ["source-a"]
+            }
+            try offer([1, 0], to: replacementCapture)
+            #expect(offerResult([2, 0], to: replacementCapture) == .backpressureExceeded)
+            try await requireCoordinatorCondition("input observer gate") { await inputGate.hasSuspended() }
+
+            replacementTask.cancel()
+            await inputGate.resume()
+            try await requireCoordinatorCondition("input observer actor return") { inputDidFinishReturned.isSignaled() }
+            #expect(replacementCapture.source.input.terminationError == .backpressureExceeded)
+            #expect(failures.all().isEmpty)
+            #expect(replacementTask.isCancelled)
+            #expect(await coordinator.activeSourceIDs().isEmpty)
+
+            await originalDriver.releaseSuspendedStop()
+            _ = await replacementTask.value
+            #expect(failures.all().isEmpty)
+        } catch {
+            deferredError = error
+        }
+        await inputGate.resume()
+        await originalDriver.releaseSuspendedStop()
+        await coordinator.setInputDidFinishTestingHooks(before: nil, after: nil)
+        _ = await replacementTask.value
+        await coordinator.stop()
+        if let deferredError { throw deferredError }
+    }
+
+    @Test func cancellingCredentialWaitSuppressesInputFailureWithoutPendingDriver() async throws {
+        let backend = SuspendingCoordinatorCredentialBackend()
+        let bag = CoordinatorDriverBag()
+        let failures = CoordinatorFailureBag()
+        let inputGate = CoordinatorReleaseGate()
+        let cleanupGate = CoordinatorReleaseGate()
+        let inputDidFinishReturned = CoordinatorTestSignal()
+        let startCompleted = CoordinatorCompletionFlag()
+        var settings = NativeRealtimeSettings.default
+        settings.isEnabled = true
+        settings.credentialReference = "fake-ref"
+        settings.enabledSourceIDs = ["source-a"]
+        let coordinator = NativeRealtimeSessionCoordinator(
+            credentialStore: RealtimeCredentialStore(backend: backend),
+            driverFactory: { _, _, _ in
+                let driver = CoordinatorFakeDriver()
+                bag.append(driver)
+                return driver
+            },
+            sourceFailureHandler: { sourceID, code in failures.append(sourceID, code) }
+        )
+        await coordinator.setInputDidFinishTestingHooks(
+            before: { await inputGate.suspend() },
+            after: { inputDidFinishReturned.signal() }
+        )
+        await coordinator.setBeforeCancellationCleanupForTesting {
+            await cleanupGate.suspend()
+        }
+        let capture = makeCoordinatorCapture(sourceID: "source-a", maximumBufferedFrames: 1)
+        let startTask = Task {
+            let result = await coordinator.start(captures: [capture.source], settings: settings)
+            await startCompleted.markComplete()
+            return result
+        }
+        var deferredError: Error?
+        do {
+            try await requireCoordinatorCondition("credential lookup start") { await backend.lookupCount() == 1 }
+            try offer([1, 0], to: capture)
+            #expect(offerResult([2, 0], to: capture) == .backpressureExceeded)
+            try await requireCoordinatorCondition("input observer gate") { await inputGate.hasSuspended() }
+
+            startTask.cancel()
+            try await requireCoordinatorCondition("credential cleanup gate") { await cleanupGate.hasSuspended() }
+            #expect(capture.source.input.terminationError == .backpressureExceeded)
+            await inputGate.resume()
+            try await requireCoordinatorCondition("input observer actor return") { inputDidFinishReturned.isSignaled() }
+            #expect(failures.all().isEmpty)
+            #expect(bag.all().isEmpty)
+            #expect(await startCompleted.hasCompleted() == false)
+
+            await backend.releaseLookup(with: "fake-secret")
+            await cleanupGate.resume()
+            let started = await startTask.value
+            #expect(started.isEmpty)
+            #expect(failures.all().isEmpty)
+            #expect(bag.all().isEmpty)
+        } catch {
+            deferredError = error
+        }
+        await inputGate.resume()
+        await cleanupGate.resume()
+        await backend.releaseLookup(with: "fake-secret")
+        await coordinator.setInputDidFinishTestingHooks(before: nil, after: nil)
+        await coordinator.setBeforeCancellationCleanupForTesting(nil)
+        for driver in bag.all() {
+            await driver.releaseStartSuccessfully()
+            await driver.releaseSendSuccessfully()
+            await driver.releaseSuspendedStop()
+        }
+        _ = await startTask.value
+        await coordinator.stop()
+        if let deferredError { throw deferredError }
+    }
+
+    @Test func cancelledStartupSuppressesSiblingReaderFailureAfterHeldStop() async throws {
+        let bag = CoordinatorDriverBag()
+        let failures = CoordinatorFailureBag()
+        let cleanupGate = CoordinatorReleaseGate()
+        let startCompleted = CoordinatorCompletionFlag()
+        var settings = NativeRealtimeSettings.default
+        settings.isEnabled = true
+        settings.credentialReference = "fake-ref"
+        settings.enabledSourceIDs = ["source-a", "source-b"]
+        let coordinator = NativeRealtimeSessionCoordinator(
+            credentialStore: RealtimeCredentialStore(backend: CoordinatorCredentialBackend(secret: "fake-secret")),
+            driverFactory: { _, _, _ in
+                let index = bag.all().count
+                let driver = CoordinatorFakeDriver(
+                    sendFailure: index == 1 ? .backpressure : nil,
+                    suspendStartUntilStop: index == 0,
+                    suspendStopUntilReleased: index == 1
+                )
+                bag.append(driver)
+                return driver
+            },
+            sourceFailureHandler: { sourceID, code in failures.append(sourceID, code) }
+        )
+        await coordinator.setBeforeCancellationCleanupForTesting {
+            await cleanupGate.suspend()
+        }
+        let pendingCapture = makeCoordinatorCapture(sourceID: "source-a")
+        let siblingCapture = makeCoordinatorCapture(sourceID: "source-b")
+        let startTask = Task {
+            let result = await coordinator.start(
+                captures: [pendingCapture.source, siblingCapture.source],
+                settings: settings
+            )
+            await startCompleted.markComplete()
+            return result
+        }
+        var deferredError: Error?
+        do {
+            try await requireCoordinatorCondition("two driver creation") { bag.all().count == 2 }
+            let drivers = bag.all()
+            guard drivers.count == 2 else { throw CoordinatorFixtureError.offerRejected }
+            let pendingDriver = drivers[0]
+            let siblingDriver = drivers[1]
+            try await requireCoordinatorCondition("pending and sibling reader activation") {
+                let pendingSuspended = await pendingDriver.isStartSuspended()
+                let siblingStarted = await siblingDriver.successfulStartCount()
+                let activeSources = await coordinator.activeSourceIDs()
+                return pendingSuspended && siblingStarted == 1 && activeSources == ["source-b"]
+            }
+            try offer([1, 0], to: siblingCapture)
+            try await requireCoordinatorCondition("sibling read failure and held stop") {
+                let sends = await siblingDriver.sendInvocationCount()
+                let stopping = await siblingDriver.isStopSuspended()
+                return sends == 1 && stopping
+            }
+            #expect(failures.all().isEmpty)
+
+            startTask.cancel()
+            try await requireCoordinatorCondition("reader cleanup gate") { await cleanupGate.hasSuspended() }
+            await siblingDriver.releaseSuspendedStop()
+            try await requireCoordinatorCondition("sibling reader completion") { await coordinator.activeSourceIDs().isEmpty }
+            #expect(failures.all().isEmpty)
+            #expect(await startCompleted.hasCompleted() == false)
+
+            await pendingDriver.releaseStartSuccessfully()
+            await cleanupGate.resume()
+            _ = await startTask.value
+            #expect(failures.all().isEmpty)
+        } catch {
+            deferredError = error
+        }
+        await cleanupGate.resume()
+        for driver in bag.all() {
+            await driver.releaseStartSuccessfully()
+            await driver.releaseSendSuccessfully()
+            await driver.releaseSuspendedStop()
+        }
+        _ = await startTask.value
+        await coordinator.stop()
+        if let deferredError { throw deferredError }
+    }
+
+    @Test func audioUsesNormalizedSampleSpansKeepsGapsAndRejectsOverlapPerSource() async throws {
+        let bag = CoordinatorDriverBag()
+        let failures = CoordinatorFailureBag()
+        var settings = NativeRealtimeSettings.default
+        settings.isEnabled = true
+        settings.credentialReference = "fake-ref"
+        settings.enabledSourceIDs = ["source-a", "source-b"]
+        let coordinator = NativeRealtimeSessionCoordinator(
+            credentialStore: RealtimeCredentialStore(backend: CoordinatorCredentialBackend(secret: "fake-secret")),
+            driverFactory: { _, _, _ in
+                let driver = CoordinatorFakeDriver()
+                bag.append(driver)
+                return driver
+            },
+            sourceFailureHandler: { sourceID, code in failures.append(sourceID, code) }
+        )
+        let first = makeCoordinatorCapture(sourceID: "source-a")
+        let sibling = makeCoordinatorCapture(sourceID: "source-b")
+        let started = await coordinator.start(captures: [first.source, sibling.source], settings: settings)
+        #expect(started.map(\.sourceID) == ["source-a", "source-b"])
+        let drivers = bag.all()
+
+        try offer([1, 0, 1, 0], to: first, sampleInterval: 8..<10, captureTimestampNanoseconds: 11)
+        try offer([2, 0], to: first, sampleInterval: 14..<15, captureTimestampNanoseconds: 12)
+        try offer([3, 0], to: first, sampleInterval: 14..<15, captureTimestampNanoseconds: 13)
+        try offer([4, 0], to: sibling, sampleInterval: 32_000..<32_001, captureTimestampNanoseconds: 1)
+
+        try await waitForCoordinatorCondition {
+            let active = await coordinator.activeSourceIDs()
+            let firstChunks = await drivers[0].audioChunks().count
+            let siblingChunks = await drivers[1].audioChunks().count
+            let receivedFailures = failures.all()
+            return active == ["source-b"]
+                && firstChunks == 2
+                && siblingChunks == 1
+                && receivedFailures.contains(where: { $0.0 == "source-a" && $0.1 == .malformedResponse })
+        }
+
+        let firstChunks = await drivers[0].audioChunks()
+        let siblingChunks = await drivers[1].audioChunks()
+        #expect(firstChunks == [
+            RealtimeAudioChunk(
+                sourceAlias: "audio-1",
+                generation: started[0].generation,
+                capturedAtMonotonicNanoseconds: 11,
+                startMonotonicNanoseconds: 500_000,
+                endMonotonicNanoseconds: 625_000,
+                pcm16LEData: Data([1, 0, 1, 0]),
+                sampleRate: 16_000
+            ),
+            RealtimeAudioChunk(
+                sourceAlias: "audio-1",
+                generation: started[0].generation,
+                capturedAtMonotonicNanoseconds: 12,
+                startMonotonicNanoseconds: 875_000,
+                endMonotonicNanoseconds: 937_500,
+                pcm16LEData: Data([2, 0]),
+                sampleRate: 16_000
+            ),
+        ])
+        #expect(firstChunks[0].endMonotonicNanoseconds < firstChunks[1].startMonotonicNanoseconds)
+        #expect(siblingChunks == [RealtimeAudioChunk(
+            sourceAlias: "audio-2",
+            generation: started[1].generation,
+            capturedAtMonotonicNanoseconds: 1,
+            startMonotonicNanoseconds: 2_000_000_000,
+            endMonotonicNanoseconds: 2_000_062_500,
+            pcm16LEData: Data([4, 0]),
+            sampleRate: 16_000
+        )])
+        #expect(failures.all().count == 1)
+        #expect(failures.all().first?.0 == "source-a")
+        #expect(failures.all().first?.1 == .malformedResponse)
+        await coordinator.stop()
+    }
+
+    @Test func malformedAndOverflowSampleSpansFailOnlyTheirOwnSources() async throws {
+        let bag = CoordinatorDriverBag()
+        let failures = CoordinatorFailureBag()
+        var settings = NativeRealtimeSettings.default
+        settings.isEnabled = true
+        settings.credentialReference = "fake-ref"
+        settings.enabledSourceIDs = ["malformed", "overflow", "healthy"]
+        let coordinator = NativeRealtimeSessionCoordinator(
+            credentialStore: RealtimeCredentialStore(backend: CoordinatorCredentialBackend(secret: "fake-secret")),
+            driverFactory: { _, _, _ in
+                let driver = CoordinatorFakeDriver()
+                bag.append(driver)
+                return driver
+            },
+            sourceFailureHandler: { sourceID, code in failures.append(sourceID, code) }
+        )
+        let malformed = makeCoordinatorCapture(sourceID: "malformed")
+        let overflow = makeCoordinatorCapture(sourceID: "overflow")
+        let healthy = makeCoordinatorCapture(sourceID: "healthy")
+        let started = await coordinator.start(
+            captures: [malformed.source, overflow.source, healthy.source],
+            settings: settings
+        )
+        #expect(started.map(\.sourceID) == ["malformed", "overflow", "healthy"])
+
+        #expect(offerResult(
+            [1, 0],
+            to: malformed,
+            sampleInterval: -1..<0,
+            captureTimestampNanoseconds: 101
+        ) == .invalidAudioChunk)
+        #expect(offerResult(
+            [2, 0],
+            to: overflow,
+            sampleInterval: (Int64.max - 1)..<Int64.max,
+            captureTimestampNanoseconds: 202
+        ) == .enqueued)
+        try offer([3, 0], to: healthy, sampleInterval: 7..<8, captureTimestampNanoseconds: 1)
+
+        try await waitForCoordinatorCondition {
+            let active = await coordinator.activeSourceIDs()
+            let healthyChunks = await bag.all()[2].audioChunks().count
+            let receivedFailures = failures.all()
+            return active == ["healthy"]
+                && healthyChunks == 1
+                && receivedFailures.count == 2
+        }
+        let receivedFailures = failures.all()
+        #expect(Set(receivedFailures.map(\.0)) == Set(["malformed", "overflow"]))
+        #expect(receivedFailures.allSatisfy { $0.1 == .malformedResponse })
+        #expect(await coordinator.activeSourceIDs() == ["healthy"])
+        await coordinator.stop()
+    }
+
+    @Test func siblingReaderRunsWhileFirstStartIsHeldAndLateRemovedStartCannotRevive() async throws {
+        let bag = CoordinatorDriverBag()
+        var settings = NativeRealtimeSettings.default
+        settings.isEnabled = true
+        settings.credentialReference = "fake-ref"
+        settings.enabledSourceIDs = ["source-a", "source-b"]
+        let coordinator = NativeRealtimeSessionCoordinator(
+            credentialStore: RealtimeCredentialStore(backend: CoordinatorCredentialBackend(secret: "fake-secret")),
+            driverFactory: { _, _, _ in
+                let shouldHoldStart = bag.all().isEmpty
+                let driver = CoordinatorFakeDriver(
+                    suspendStartUntilStop: shouldHoldStart,
+                    stopReleasesStart: !shouldHoldStart,
+                    suspendFirstStopUntilSecondCall: shouldHoldStart
+                )
+                bag.append(driver)
+                return driver
+            }
+        )
+        let firstCapture = makeCoordinatorCapture(sourceID: "source-a")
+        let siblingCapture = makeCoordinatorCapture(sourceID: "source-b")
+        let startTask = Task {
+            await coordinator.start(captures: [firstCapture.source, siblingCapture.source], settings: settings)
+        }
+        var removalTask: Task<Void, Never>?
+        var deferredError: Error?
+        do {
+            try await waitForCoordinatorCondition { bag.all().count == 2 }
+            let drivers = bag.all()
+            guard drivers.count == 2 else { throw CoordinatorFixtureError.offerRejected }
+            let firstDriver = drivers[0]
+            let siblingDriver = drivers[1]
+            try await waitForCoordinatorCondition {
+                let firstStarts = await firstDriver.startInvocationCount()
+                let siblingStarts = await siblingDriver.successfulStartCount()
+                return firstStarts == 1 && siblingStarts == 1
+            }
+
+            try offer([2, 0], to: siblingCapture)
+            try await waitForCoordinatorCondition {
+                let siblingChunks = await siblingDriver.audioChunks().count
+                let activeSources = await coordinator.activeSourceIDs()
+                return siblingChunks == 1 && activeSources == ["source-b"]
+            }
+            #expect(await firstDriver.isStartSuspended())
+            #expect(await firstDriver.successfulStartCount() == 0)
+
+            removalTask = Task { await coordinator.removeSource(sourceID: "source-a") }
+            try await waitForCoordinatorCondition { await firstDriver.isStopSuspended() }
+            #expect(await coordinator.activeSourceIDs() == ["source-b"])
+            #expect(offerResult([1, 0], to: firstCapture) == .closed)
+
+            await firstDriver.releaseStartSuccessfully()
+            try await waitForCoordinatorCondition { await firstDriver.stopInvocationCount() >= 2 }
+            #expect(await firstDriver.stopInvocationCount() >= 2)
+            await firstDriver.releaseSuspendedStop()
+            await removalTask?.value
+            let started = await startTask.value
+            #expect(started.map(\.sourceID) == ["source-b"])
+            #expect(started.first?.alias == "audio-2")
+            #expect(await coordinator.activeSourceIDs() == ["source-b"])
+            #expect(await siblingDriver.audioChunks().count == 1)
+            #expect(await firstDriver.stopInvocationCount() >= 2)
+        } catch {
+            deferredError = error
+        }
+        for driver in bag.all() {
+            await driver.releaseStartSuccessfully()
+            await driver.releaseSuspendedStop()
+        }
+        if let removalTask { await removalTask.value }
+        _ = await startTask.value
+        await coordinator.stop()
+        if let deferredError { throw deferredError }
+    }
+
+    @Test func lateRevokedStartDoesNotJoinNewerSameIDStopBarrier() async throws {
+        let bag = CoordinatorDriverBag()
+        var settings = NativeRealtimeSettings.default
+        settings.isEnabled = true
+        settings.credentialReference = "fake-ref"
+        settings.enabledSourceIDs = ["source-a"]
+        let coordinator = NativeRealtimeSessionCoordinator(
+            credentialStore: RealtimeCredentialStore(backend: CoordinatorCredentialBackend(secret: "fake-secret")),
+            driverFactory: { _, _, _ in
+                let index = bag.all().count
+                let driver = CoordinatorFakeDriver(
+                    suspendStartUntilStop: index == 0,
+                    stopReleasesStart: false,
+                    suspendStopUntilReleased: index == 1
+                )
+                bag.append(driver)
+                return driver
+            }
+        )
+        let originalCapture = makeCoordinatorCapture(sourceID: "source-a")
+        let replacementCapture = makeCoordinatorCapture(sourceID: "source-a")
+        let originalStartCompleted = CoordinatorCompletionFlag()
+        let originalStartTask = Task {
+            let result = await coordinator.start(captures: [originalCapture.source], settings: settings)
+            await originalStartCompleted.markComplete()
+            return result
+        }
+        var originalRemovalTask: Task<Void, Never>?
+        var replacementStartTask: Task<[NativeRealtimeStartedSource], Never>?
+        var replacementRemovalTask: Task<Void, Never>?
+        var deferredError: Error?
+        do {
+            try await waitForCoordinatorCondition { bag.all().count == 1 }
+            guard let originalDriver = bag.all().first else {
+                throw CoordinatorFixtureError.offerRejected
+            }
+            try await waitForCoordinatorCondition {
+                let startCount = await originalDriver.startInvocationCount()
+                let startIsSuspended = await originalDriver.isStartSuspended()
+                return startCount == 1 && startIsSuspended
+            }
+
+            originalRemovalTask = Task { await coordinator.removeSource(sourceID: "source-a") }
+            await originalRemovalTask?.value
+            #expect(await originalDriver.stopInvocationCount() == 1)
+            #expect(await originalDriver.isStartSuspended())
+            #expect(await originalStartCompleted.hasCompleted() == false)
+
+            replacementStartTask = Task {
+                await coordinator.start(captures: [replacementCapture.source], settings: settings)
+            }
+            let replacement = await replacementStartTask?.value ?? []
+            #expect(replacement.map(\.sourceID) == ["source-a"])
+            #expect(await coordinator.activeSourceIDs() == ["source-a"])
+            guard bag.all().count == 2 else { throw CoordinatorFixtureError.offerRejected }
+            let replacementDriver = bag.all()[1]
+            #expect(await replacementDriver.successfulStartCount() == 1)
+
+            replacementRemovalTask = Task { await coordinator.removeSource(sourceID: "source-a") }
+            try await waitForCoordinatorCondition { await replacementDriver.isStopSuspended() }
+            #expect(await coordinator.activeSourceIDs().isEmpty)
+
+            await originalDriver.releaseStartSuccessfully()
+            try await waitForCoordinatorCondition {
+                let originalStopCount = await originalDriver.stopInvocationCount()
+                let replacementStopIsSuspended = await replacementDriver.isStopSuspended()
+                let originalStartDidComplete = await originalStartCompleted.hasCompleted()
+                return originalStopCount == 2
+                    && replacementStopIsSuspended
+                    && originalStartDidComplete
+            }
+            #expect(await originalDriver.stopInvocationCount() == 2)
+            #expect(await replacementDriver.isStopSuspended())
+            #expect(await originalStartCompleted.hasCompleted())
+            #expect(await coordinator.activeSourceIDs().isEmpty)
+        } catch {
+            deferredError = error
+        }
+        for driver in bag.all() {
+            await driver.releaseStartSuccessfully()
+            await driver.releaseSuspendedStop()
+        }
+        if let originalRemovalTask { await originalRemovalTask.value }
+        if let replacementRemovalTask { await replacementRemovalTask.value }
+        _ = await originalStartTask.value
+        if let replacementStartTask { _ = await replacementStartTask.value }
+        await coordinator.stop()
+        if let deferredError { throw deferredError }
+    }
+
+    @Test func cancellingStartupImmediatelyRevokesReservedAndActiveSources() async throws {
+        let bag = CoordinatorDriverBag()
+        let failures = CoordinatorFailureBag()
+        let cleanupGate = CoordinatorReleaseGate()
+        var settings = NativeRealtimeSettings.default
+        settings.isEnabled = true
+        settings.credentialReference = "fake-ref"
+        settings.enabledSourceIDs = ["source-a", "source-b", "source-c"]
+        let coordinator = NativeRealtimeSessionCoordinator(
+            credentialStore: RealtimeCredentialStore(backend: CoordinatorCredentialBackend(secret: "fake-secret")),
+            driverFactory: { _, _, _ in
+                let index = bag.all().count
+                let isPendingStart = index == 0 || index == 2
+                let driver = CoordinatorFakeDriver(
+                    startFailure: index == 2,
+                    suspendSendUntilStop: index == 1,
+                    suspendStartUntilStop: isPendingStart,
+                    stopReleasesStart: false,
+                    suspendFirstStopUntilSecondCall: isPendingStart
+                )
+                bag.append(driver)
+                return driver
+            },
+            sourceFailureHandler: { sourceID, code in failures.append(sourceID, code) }
+        )
+        await coordinator.setBeforeCancellationCleanupForTesting {
+            await cleanupGate.suspend()
+        }
+        let pendingCapture = makeCoordinatorCapture(sourceID: "source-a")
+        let activeCapture = makeCoordinatorCapture(sourceID: "source-b")
+        let failingCapture = makeCoordinatorCapture(sourceID: "source-c")
+        let startCompleted = CoordinatorCompletionFlag()
+        let startTask = Task {
+            let result = await coordinator.start(
+                captures: [pendingCapture.source, activeCapture.source, failingCapture.source],
+                settings: settings
+            )
+            await startCompleted.markComplete()
+            return result
+        }
+        var deferredError: Error?
+        do {
+            try await requireCoordinatorCondition("three source reservations") { bag.all().count == 3 }
+            let drivers = bag.all()
+            guard drivers.count == 3 else { throw CoordinatorFixtureError.offerRejected }
+            let pendingDriver = drivers[0]
+            let activeDriver = drivers[1]
+            let failingDriver = drivers[2]
+            try await requireCoordinatorCondition("startup driver states") {
+                let pendingStarted = await pendingDriver.startInvocationCount()
+                let pendingSuspended = await pendingDriver.isStartSuspended()
+                let failingStarted = await failingDriver.startInvocationCount()
+                let failingSuspended = await failingDriver.isStartSuspended()
+                let activeStarts = await activeDriver.successfulStartCount()
+                return pendingStarted == 1 && pendingSuspended
+                    && failingStarted == 1 && failingSuspended
+                    && activeStarts == 1
+            }
+            try offer([1, 0], to: activeCapture)
+            try await requireCoordinatorCondition("active driver send suspension") {
+                await activeDriver.isSendSuspended()
+            }
+            try offer([2, 0], to: activeCapture)
+            #expect(await activeDriver.sendInvocationCount() == 1)
+
+            startTask.cancel()
+            try await requireCoordinatorCondition("startup cleanup gate") { await cleanupGate.hasSuspended() }
+            #expect(offerResult([3, 0], to: pendingCapture) == .closed)
+            #expect(offerResult([4, 0], to: activeCapture) == .closed)
+            #expect(offerResult([5, 0], to: failingCapture) == .closed)
+            #expect(failures.all().isEmpty)
+            await pendingDriver.releaseStartSuccessfully()
+            await failingDriver.releaseStartSuccessfully()
+            try await requireCoordinatorCondition("post-start reserved driver cleanup") {
+                let pendingSuccesses = await pendingDriver.successfulStartCount()
+                let pendingPostStartStops = await pendingDriver.postStartResultStopCount()
+                let failingPostStartStops = await failingDriver.postStartResultStopCount()
+                let pendingStopSuspended = await pendingDriver.isStopSuspended()
+                let failingStopSuspended = await failingDriver.isStopSuspended()
+                let activeIDs = await coordinator.activeSourceIDs()
+                return pendingSuccesses == 1
+                    && pendingPostStartStops >= 1
+                    && failingPostStartStops >= 1
+                    && pendingStopSuspended
+                    && failingStopSuspended
+                    && !activeIDs.contains("source-a")
+                    && failures.all().isEmpty
+            }
+            #expect(await coordinator.activeSourceIDs().contains("source-a") == false)
+            #expect(await pendingDriver.postStartResultStopCount() >= 1)
+            #expect(await failingDriver.postStartResultStopCount() >= 1)
+            #expect(failures.all().isEmpty)
+
+            await activeDriver.releaseSendSuccessfully()
+            try await requireCoordinatorCondition("active driver stop") {
+                await activeDriver.stopInvocationCount() == 1
+            }
+            #expect(await activeDriver.sendInvocationCount() == 1)
+            #expect(await activeDriver.audioChunks().count == 1)
+            #expect(await activeDriver.stopInvocationCount() == 1)
+            #expect(failures.all().isEmpty)
+            #expect(await startCompleted.hasCompleted() == false)
+        } catch {
+            deferredError = error
+        }
+        for driver in bag.all() {
+            await driver.releaseStartSuccessfully()
+            await driver.releaseSendSuccessfully()
+            await driver.releaseSuspendedStop()
+        }
+        await cleanupGate.resume()
+        await coordinator.setBeforeCancellationCleanupForTesting(nil)
+        _ = await startTask.value
+        await coordinator.stop()
+        if let deferredError { throw deferredError }
+    }
+
+    @Test func failedStartReportsToItsHandlerBeforeHeldStopAndReplacement() async throws {
+        let bag = CoordinatorDriverBag()
+        let oldFailures = CoordinatorFailureBag()
+        let newFailures = CoordinatorFailureBag()
+        var settings = NativeRealtimeSettings.default
+        settings.isEnabled = true
+        settings.credentialReference = "fake-ref"
+        settings.enabledSourceIDs = ["source-a"]
+        let coordinator = NativeRealtimeSessionCoordinator(
+            credentialStore: RealtimeCredentialStore(backend: CoordinatorCredentialBackend(secret: "fake-secret")),
+            driverFactory: { _, _, _ in
+                let isFirst = bag.all().isEmpty
+                let driver = CoordinatorFakeDriver(
+                    startFailure: isFirst,
+                    suspendStopUntilReleased: isFirst
+                )
+                bag.append(driver)
+                return driver
+            },
+            sourceFailureHandler: { sourceID, code in oldFailures.append(sourceID, code) }
+        )
+        let firstCapture = makeCoordinatorCapture(sourceID: "source-a")
+        let firstStartTask = Task {
+            await coordinator.start(captures: [firstCapture.source], settings: settings)
+        }
+        var replacementTask: Task<[NativeRealtimeStartedSource], Never>?
+        var deferredError: Error?
+        do {
+            try await waitForCoordinatorCondition { bag.all().count == 1 }
+            guard let failingDriver = bag.all().first else {
+                throw CoordinatorFixtureError.offerRejected
+            }
+            try await waitForCoordinatorCondition { await failingDriver.startInvocationCount() == 1 }
+            try await waitForCoordinatorCondition { await failingDriver.isStopSuspended() }
+
+            #expect(oldFailures.all().count == 1)
+            #expect(oldFailures.all().first?.0 == "source-a")
+            #expect(oldFailures.all().first?.1 == .connectionFailed)
+
+            await coordinator.setSourceFailureHandler { sourceID, code in
+                newFailures.append(sourceID, code)
+            }
+            var replacementSettings = settings
+            replacementSettings.enabledSourceIDs = ["source-b"]
+            let replacementCapture = makeCoordinatorCapture(sourceID: "source-b")
+            replacementTask = Task {
+                await coordinator.start(captures: [replacementCapture.source], settings: replacementSettings)
+            }
+            try await waitForCoordinatorCondition {
+                await coordinator.startupSourceIDsForTesting() == ["source-b"]
+            }
+            #expect(bag.all().count == 1)
+            #expect(await coordinator.activeSourceIDs().isEmpty)
+            await failingDriver.releaseSuspendedStop()
+
+            let failedStart = await firstStartTask.value
+            let replacement = await replacementTask?.value ?? []
+            #expect(failedStart.isEmpty)
+            #expect(replacement.map(\.sourceID) == ["source-b"])
+            #expect(oldFailures.all().count == 1)
+            #expect(newFailures.all().isEmpty)
+            await coordinator.stop()
+        } catch {
+            deferredError = error
+        }
+        for driver in bag.all() {
+            await driver.releaseStartSuccessfully()
+            await driver.releaseSuspendedStop()
+        }
+        _ = await firstStartTask.value
+        if let replacementTask { _ = await replacementTask.value }
+        await coordinator.stop()
+        if let deferredError { throw deferredError }
     }
 
     @Test func cancellingWhileDriverStartIsSuspendedStopsPendingDriver() async throws {
@@ -746,6 +1532,8 @@ import Testing
             sourceAlias: "audio-2",
             generation: started[1].generation,
             capturedAtMonotonicNanoseconds: 202,
+            startMonotonicNanoseconds: 0,
+            endMonotonicNanoseconds: 62_500,
             pcm16LEData: Data([2, 0]),
             sampleRate: 16_000
         )])
@@ -1023,9 +1811,11 @@ import Testing
         let startTask = Task {
             await coordinator.start(captures: [first.source, second.source], settings: settings)
         }
-        try await waitForCoordinatorCondition { bag.all().count == 1 }
+        try await waitForCoordinatorCondition { bag.all().count == 2 }
         let firstDriver = bag.all()[0]
+        let siblingDriver = bag.all()[1]
         try await waitForCoordinatorCondition { await firstDriver.startInvocationCount() == 1 }
+        try await waitForCoordinatorCondition { await siblingDriver.successfulStartCount() == 1 }
 
         await coordinator.removeSource(sourceID: "source-a")
         let started = await startTask.value
@@ -1050,7 +1840,7 @@ import Testing
         let coordinator = NativeRealtimeSessionCoordinator(
             credentialStore: RealtimeCredentialStore(backend: CoordinatorCredentialBackend(secret: "fake-secret")),
             driverFactory: { _, _, _ in
-                let driver = CoordinatorFakeDriver(suspendStartUntilStop: bag.all().isEmpty)
+                let driver = CoordinatorFakeDriver(suspendStartUntilStop: bag.all().count < 2)
                 bag.append(driver)
                 return driver
             },
@@ -1061,18 +1851,22 @@ import Testing
         let startTask = Task {
             await coordinator.start(captures: [first.source, second.source], settings: settings)
         }
-        try await waitForCoordinatorCondition { bag.all().count == 1 }
+        try await waitForCoordinatorCondition { bag.all().count == 2 }
         let firstDriver = bag.all()[0]
+        let removedDriver = bag.all()[1]
         try await waitForCoordinatorCondition { await firstDriver.startInvocationCount() == 1 }
+        try await waitForCoordinatorCondition { await removedDriver.startInvocationCount() == 1 }
 
         await coordinator.removeSource(sourceID: "source-b")
 
         #expect(offerResult([2, 0], to: second) == .closed)
+        #expect(await coordinator.activeSourceIDs().isEmpty)
+        #expect(await removedDriver.stopInvocationCount() >= 1)
         await firstDriver.releaseStartSuccessfully()
         let firstRun = await startTask.value
         #expect(firstRun.count == 1)
         #expect(firstRun.first?.sourceID == "source-a")
-        #expect(bag.all().count == 1)
+        #expect(bag.all().count == 2)
         #expect(await coordinator.activeSourceIDs() == ["source-a"])
         #expect(failures.all().isEmpty)
 
@@ -1123,6 +1917,31 @@ import Testing
 private struct CoordinatorCaptureFixture {
     let source: NativeRealtimeCaptureSource
     let fanout: RealtimePCM16AudioFanout
+    let sampleClock: CoordinatorSampleClock
+}
+
+private final class CoordinatorSampleClock: @unchecked Sendable {
+    private let lock = NSLock()
+    private var nextSample: Int64 = 0
+
+    func reserve(frameCount: Int, explicit: Range<Int64>?) -> Range<Int64> {
+        lock.lock()
+        defer { lock.unlock() }
+        guard frameCount > 0, let sampleCount = Int64(exactly: frameCount) else {
+            return nextSample..<nextSample
+        }
+        if let explicit {
+            if explicit.lowerBound >= 0, explicit.upperBound > nextSample {
+                nextSample = explicit.upperBound
+            }
+            return explicit
+        }
+        let (upperBound, overflow) = nextSample.addingReportingOverflow(sampleCount)
+        guard !overflow else { return nextSample..<nextSample }
+        let interval = nextSample..<upperBound
+        nextSample = upperBound
+        return interval
+    }
 }
 
 private func makeCoordinatorCapture(
@@ -1142,41 +1961,76 @@ private func makeCoordinatorCapture(
             role: .microphone,
             input: input
         ),
-        fanout: fanout
+        fanout: fanout,
+        sampleClock: CoordinatorSampleClock()
     )
 }
 
-private func offer(_ bytes: [UInt8], to capture: CoordinatorCaptureFixture) throws {
-    let result = offerResult(bytes, to: capture)
+private func offer(
+    _ bytes: [UInt8],
+    to capture: CoordinatorCaptureFixture,
+    sampleInterval: Range<Int64>? = nil,
+    captureTimestampNanoseconds: UInt64? = nil
+) throws {
+    let result = offerResult(
+        bytes,
+        to: capture,
+        sampleInterval: sampleInterval,
+        captureTimestampNanoseconds: captureTimestampNanoseconds
+    )
     guard result == .enqueued else { throw CoordinatorFixtureError.offerRejected }
 }
 
 private func offerResult(
     _ bytes: [UInt8],
-    to capture: CoordinatorCaptureFixture
+    to capture: CoordinatorCaptureFixture,
+    sampleInterval: Range<Int64>? = nil,
+    captureTimestampNanoseconds: UInt64? = nil
 ) -> RealtimePCM16AudioOfferResult {
-    capture.fanout.offer(
+    let frameCount = bytes.count / 2
+    let reservedInterval = capture.sampleClock.reserve(frameCount: frameCount, explicit: sampleInterval)
+    return capture.fanout.offer(
         pcm16LE: Data(bytes),
-        frameCount: bytes.count / 2,
-        sampleInterval: 0..<Int64(bytes.count / 2),
+        frameCount: frameCount,
+        sampleInterval: reservedInterval,
         sourceToken: capture.source.input.sourceToken,
         generation: capture.source.input.generation,
-        captureTimestampNanoseconds: bytes.first == 1 ? 101 : 202
+        captureTimestampNanoseconds: captureTimestampNanoseconds ?? (bytes.first == 1 ? 101 : 202)
     )
 }
 
 private func waitForCoordinatorCondition(
+    _ label: String = "coordinator reader",
     _ condition: @escaping @Sendable () async -> Bool
 ) async throws {
+    guard try await coordinatorConditionIsMet(condition) else {
+        Issue.record("Timed out waiting for \(label)")
+        return
+    }
+}
+
+private func requireCoordinatorCondition(
+    _ label: String,
+    _ condition: @escaping @Sendable () async -> Bool
+) async throws {
+    guard try await coordinatorConditionIsMet(condition) else {
+        throw CoordinatorFixtureError.conditionTimedOut(label)
+    }
+}
+
+private func coordinatorConditionIsMet(
+    _ condition: @escaping @Sendable () async -> Bool
+) async throws -> Bool {
     for _ in 0..<100 {
-        if await condition() { return }
+        if await condition() { return true }
         try await Task.sleep(for: .milliseconds(5))
     }
-    Issue.record("Timed out waiting for coordinator reader")
+    return false
 }
 
 private enum CoordinatorFixtureError: Error {
     case offerRejected
+    case conditionTimedOut(String)
 }
 
 private actor CoordinatorCredentialBackend: RealtimeCredentialBackend {
@@ -1249,11 +2103,61 @@ private final class CoordinatorFailureBag: @unchecked Sendable {
     }
 }
 
+private actor CoordinatorCompletionFlag {
+    private var completed = false
+
+    func markComplete() { completed = true }
+    func hasCompleted() -> Bool { completed }
+}
+
+private final class CoordinatorTestSignal: @unchecked Sendable {
+    private let lock = NSLock()
+    private var signaled = false
+
+    func signal() {
+        lock.lock()
+        signaled = true
+        lock.unlock()
+    }
+
+    func isSignaled() -> Bool {
+        lock.lock()
+        defer { lock.unlock() }
+        return signaled
+    }
+}
+
+private actor CoordinatorReleaseGate {
+    private var didRelease = false
+    private var suspensionCount = 0
+    private var suspensionContinuations: [CheckedContinuation<Void, Never>] = []
+
+    func suspend() async {
+        guard !didRelease else { return }
+        suspensionCount += 1
+        await withCheckedContinuation { continuation in
+            suspensionContinuations.append(continuation)
+        }
+    }
+
+    func hasSuspended() -> Bool {
+        suspensionCount > 0 && !didRelease
+    }
+
+    func resume() {
+        didRelease = true
+        let continuations = suspensionContinuations
+        suspensionContinuations.removeAll()
+        continuations.forEach { $0.resume() }
+    }
+}
+
 private actor CoordinatorFakeDriver: RealtimeSessionDriving {
     private let startFailure: Bool
     private let sendFailure: RealtimeFailureCode?
     private let suspendSendUntilStop: Bool
     private let suspendStartUntilStop: Bool
+    private let stopReleasesStart: Bool
     private let suspendFirstStopUntilSecondCall: Bool
     private let suspendStopUntilReleased: Bool
     private let factoryEnabledSourceIDs: [String]
@@ -1264,14 +2168,18 @@ private actor CoordinatorFakeDriver: RealtimeSessionDriving {
     private var explicitlySuspendedStopContinuations: [CheckedContinuation<Void, Never>] = []
     private var hasReleasedExplicitStop = false
     private var startInvocationCountStorage = 0
+    private var successfulStartCountStorage = 0
     private var sendInvocationCountStorage = 0
     private var stopInvocationCountStorage = 0
+    private var didCompleteStartStorage = false
+    private var postStartResultStopCountStorage = 0
 
     init(
         startFailure: Bool = false,
         sendFailure: RealtimeFailureCode? = nil,
         suspendSendUntilStop: Bool = false,
         suspendStartUntilStop: Bool = false,
+        stopReleasesStart: Bool = true,
         suspendFirstStopUntilSecondCall: Bool = false,
         suspendStopUntilReleased: Bool = false,
         factoryEnabledSourceIDs: [String] = []
@@ -1280,6 +2188,7 @@ private actor CoordinatorFakeDriver: RealtimeSessionDriving {
         self.sendFailure = sendFailure
         self.suspendSendUntilStop = suspendSendUntilStop
         self.suspendStartUntilStop = suspendStartUntilStop
+        self.stopReleasesStart = stopReleasesStart
         self.suspendFirstStopUntilSecondCall = suspendFirstStopUntilSecondCall
         self.suspendStopUntilReleased = suspendStopUntilReleased
         self.factoryEnabledSourceIDs = factoryEnabledSourceIDs
@@ -1287,17 +2196,28 @@ private actor CoordinatorFakeDriver: RealtimeSessionDriving {
 
     func start(sourceAlias: String, generation: Int) async throws {
         startInvocationCountStorage += 1
+        defer { didCompleteStartStorage = true }
         if suspendStartUntilStop {
             try await withCheckedThrowingContinuation { continuation in
                 startContinuation = continuation
             }
         }
         if startFailure { throw RealtimeFailureCode.connectionFailed }
+        successfulStartCountStorage += 1
     }
 
     func releaseStartSuccessfully() {
         guard let continuation = startContinuation else { return }
         startContinuation = nil
+        continuation.resume()
+    }
+    func isStartSuspended() -> Bool { startContinuation != nil }
+    func successfulStartCount() -> Int { successfulStartCountStorage }
+    func postStartResultStopCount() -> Int { postStartResultStopCountStorage }
+    func isSendSuspended() -> Bool { sendContinuation != nil }
+    func releaseSendSuccessfully() {
+        guard let continuation = sendContinuation else { return }
+        sendContinuation = nil
         continuation.resume()
     }
     func sendAudioChunk(_ chunk: RealtimeAudioChunk) async throws {
@@ -1316,7 +2236,8 @@ private actor CoordinatorFakeDriver: RealtimeSessionDriving {
     func events() async -> AsyncStream<RealtimeProviderEvent> { AsyncStream { _ in } }
     func stop() async {
         stopInvocationCountStorage += 1
-        if let continuation = startContinuation {
+        if didCompleteStartStorage { postStartResultStopCountStorage += 1 }
+        if stopReleasesStart, let continuation = startContinuation {
             startContinuation = nil
             continuation.resume(throwing: RealtimeFailureCode.connectionFailed)
         }

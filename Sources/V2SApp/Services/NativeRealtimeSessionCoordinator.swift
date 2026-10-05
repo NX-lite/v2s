@@ -12,6 +12,23 @@ struct NativeRealtimeStartedSource: Equatable, Sendable {
     let generation: Int
 }
 
+private final class StartupCancellationToken: @unchecked Sendable {
+    private let lock = NSLock()
+    private var cancelled = false
+
+    func cancel() {
+        lock.lock()
+        cancelled = true
+        lock.unlock()
+    }
+
+    var isCancelled: Bool {
+        lock.lock()
+        defer { lock.unlock() }
+        return cancelled
+    }
+}
+
 actor NativeRealtimeSessionCoordinator {
     typealias DriverFactory = @Sendable (
         NativeRealtimeSettings,
@@ -37,12 +54,35 @@ actor NativeRealtimeSessionCoordinator {
 
     private struct StoppingSource {
         let generation: Int
+        let driverGeneration: Int
         let task: Task<Void, Never>
+    }
+
+    private struct StartupReservation: Sendable {
+        let capture: NativeRealtimeCaptureSource
+        let alias: String
+        let generation: Int
+        let driver: any RealtimeSessionDriving
+        let lease: RealtimeReaderLease
+
+        var startingSource: StartingSource {
+            StartingSource(
+                capture: capture,
+                generation: generation,
+                driver: driver,
+                lease: lease
+            )
+        }
     }
 
     private let credentialStore: RealtimeCredentialStore
     private let driverFactory: DriverFactory
     private var sourceFailureHandler: SourceFailureHandler
+    #if DEBUG
+    private var beforeCancellationCleanupForTesting: (@Sendable () async -> Void)?
+    private var beforeInputDidFinishForTesting: (@Sendable () async -> Void)?
+    private var afterInputDidFinishForTesting: (@Sendable () -> Void)?
+    #endif
     private var lifecycleGeneration = 0
     private var nextDriverGeneration = 0
     private var runningSources: [String: RunningSource] = [:]
@@ -72,6 +112,20 @@ actor NativeRealtimeSessionCoordinator {
         sourceFailureHandler = handler
     }
 
+    #if DEBUG
+    func setBeforeCancellationCleanupForTesting(_ operation: (@Sendable () async -> Void)?) {
+        beforeCancellationCleanupForTesting = operation
+    }
+
+    func setInputDidFinishTestingHooks(
+        before: (@Sendable () async -> Void)?,
+        after: (@Sendable () -> Void)?
+    ) {
+        beforeInputDidFinishForTesting = before
+        afterInputDidFinishForTesting = after
+    }
+    #endif
+
     /// Replaces the current set with isolated drivers for enabled, successfully captured sources.
     /// A replacement using an already-consumed PCM input is rejected and tears down the old set.
     /// The caller gates this operation on session-specific disclosure. It streams PCM
@@ -97,6 +151,7 @@ actor NativeRealtimeSessionCoordinator {
         let inputsAreInvalid = reusesExistingInput || containsSharedInput
         lifecycleGeneration &+= 1
         let startupGeneration = lifecycleGeneration
+        let cancellationToken = StartupCancellationToken()
         let supersededStartupCaptures = Array(startupCapturesBySourceID.values)
         startupCapturesBySourceID = Dictionary(
             optedIn.map { ($0.sourceID, $0) },
@@ -106,10 +161,11 @@ actor NativeRealtimeSessionCoordinator {
         let finishObservers = optedIn.filter { !inputsAreInvalid && !$0.input.isConsumed }.map { capture in
             Task { [weak self] in
                 let error = await capture.input.waitUntilFinished()
-                guard !Task.isCancelled else { return }
+                guard !Task.isCancelled, !cancellationToken.isCancelled else { return }
                 await self?.inputDidFinish(
                     sourceID: capture.sourceID,
                     startupGeneration: startupGeneration,
+                    cancellationToken: cancellationToken,
                     error: error
                 )
             }
@@ -117,6 +173,11 @@ actor NativeRealtimeSessionCoordinator {
         defer { finishObservers.forEach { $0.cancel() } }
         for capture in supersededStartupCaptures {
             capture.input.finish(error: .sourceSuperseded)
+        }
+        let cancelStartupSynchronously: @Sendable () -> Void = {
+            cancellationToken.cancel()
+            optedIn.forEach { $0.input.finish(error: .sourceSuperseded) }
+            Task { await self.cancelStartup(generation: startupGeneration) }
         }
         defer {
             if lifecycleGeneration == startupGeneration {
@@ -130,8 +191,12 @@ actor NativeRealtimeSessionCoordinator {
         // previous source able to continue sending audio during replacement.
         let previous = detachAllSources()
         scheduleStops(for: previous)
-        await waitForAllStoppingSources()
-        guard !Task.isCancelled else {
+        await withTaskCancellationHandler {
+            await waitForAllStoppingSources()
+        } onCancel: {
+            cancelStartupSynchronously()
+        }
+        guard !Task.isCancelled, !cancellationToken.isCancelled else {
             await cancelStartup(generation: startupGeneration)
             return []
         }
@@ -162,9 +227,9 @@ actor NativeRealtimeSessionCoordinator {
             credential = try await withTaskCancellationHandler {
                 try await credentialStore.load(reference: reference)
             } onCancel: {
-                Task { await self.cancelStartup(generation: startupGeneration) }
+                cancelStartupSynchronously()
             }
-            guard !Task.isCancelled else {
+            guard !Task.isCancelled, !cancellationToken.isCancelled else {
                 await cancelStartup(generation: startupGeneration)
                 return []
             }
@@ -179,7 +244,7 @@ actor NativeRealtimeSessionCoordinator {
                 return []
             }
         } catch {
-            if Task.isCancelled {
+            if Task.isCancelled || cancellationToken.isCancelled {
                 await cancelStartup(generation: startupGeneration)
                 return []
             }
@@ -192,11 +257,13 @@ actor NativeRealtimeSessionCoordinator {
         }
 
         let aliases = RealtimeSourceAliases(sourceIDs: optedIn.map(\.sourceID))
-        var started: [NativeRealtimeStartedSource] = []
         var driverSettings = settings
         driverSettings.enabledSourceIDs = []
+        var reservations: [StartupReservation] = []
         for capture in optedIn {
-            guard lifecycleGeneration == startupGeneration else { break }
+            guard !Task.isCancelled,
+                  !cancellationToken.isCancelled,
+                  lifecycleGeneration == startupGeneration else { break }
             guard !removedSourceIDsDuringStartup.contains(capture.sourceID) else {
                 capture.input.finish(error: .sourceSuperseded)
                 continue
@@ -205,105 +272,190 @@ actor NativeRealtimeSessionCoordinator {
             guard let alias = aliases.alias(for: capture.sourceID) else { continue }
             let sourceGeneration = nextDriverGeneration
             nextDriverGeneration &+= 1
-            let driver = driverFactory(driverSettings, credential, capture.role)
-            let lease = RealtimeReaderLease()
-            startingSources[capture.sourceID] = StartingSource(
+            let reservation = StartupReservation(
                 capture: capture,
-                generation: sourceGeneration,
-                driver: driver,
-                lease: lease
-            )
-            do {
-                try await withTaskCancellationHandler {
-                    try await driver.start(sourceAlias: alias, generation: sourceGeneration)
-                } onCancel: {
-                    Task { await self.cancelStartup(generation: startupGeneration) }
-                }
-            } catch {
-                if Task.isCancelled {
-                    await cancelStartup(generation: startupGeneration)
-                    return []
-                }
-                await driver.stop()
-                capture.input.finish(error: .sourceSuperseded)
-                guard lifecycleGeneration == startupGeneration else { break }
-                guard let pending = startingSources[capture.sourceID],
-                      pending.generation == sourceGeneration,
-                      pending.lease.isActive else { continue }
-                startingSources.removeValue(forKey: capture.sourceID)
-                lease.deactivate()
-                sourceFailureHandler(capture.sourceID, Self.failureCode(for: error))
-                continue
-            }
-
-            guard !Task.isCancelled else {
-                await cancelStartup(generation: startupGeneration)
-                return []
-            }
-            guard lifecycleGeneration == startupGeneration else {
-                capture.input.finish(error: .sourceSuperseded)
-                await driver.stop()
-                break
-            }
-            guard let pending = startingSources[capture.sourceID],
-                  pending.generation == sourceGeneration,
-                  pending.lease.isActive else {
-                capture.input.finish(error: .sourceSuperseded)
-                await driver.stop()
-                continue
-            }
-            guard !capture.input.isConsumed,
-                  capture.input.terminationError == nil else {
-                startingSources.removeValue(forKey: capture.sourceID)
-                lease.deactivate()
-                removedSourceIDsDuringStartup.insert(capture.sourceID)
-                capture.input.finish(error: .sourceSuperseded)
-                await driver.stop()
-                if let failure = Self.failureCode(for: capture.input.terminationError) {
-                    sourceFailureHandler(capture.sourceID, failure)
-                }
-                continue
-            }
-            startingSources.removeValue(forKey: capture.sourceID)
-
-            let reader = Task { [weak self] in
-                let failure = await Self.readAudio(
-                    from: capture,
-                    alias: alias,
-                    generation: sourceGeneration,
-                    driver: driver,
-                    lease: lease
-                )
-                lease.deactivate()
-                capture.input.finish(error: failure == nil ? nil : .sourceSuperseded)
-                await driver.stop()
-                await self?.readerDidFinish(
-                    sourceID: capture.sourceID,
-                    generation: sourceGeneration,
-                    failure: failure
-                )
-            }
-            runningSources[capture.sourceID] = RunningSource(
-                capture: capture,
-                generation: sourceGeneration,
-                driver: driver,
-                lease: lease,
-                reader: reader
-            )
-            started.append(NativeRealtimeStartedSource(
-                sourceID: capture.sourceID,
                 alias: alias,
-                generation: sourceGeneration
-            ))
+                generation: sourceGeneration,
+                driver: driverFactory(driverSettings, credential, capture.role),
+                lease: RealtimeReaderLease()
+            )
+            startingSources[capture.sourceID] = reservation.startingSource
+            reservations.append(reservation)
+        }
+        guard !Task.isCancelled, !cancellationToken.isCancelled else {
+            await cancelStartup(generation: startupGeneration)
+            return []
+        }
+        guard lifecycleGeneration == startupGeneration else {
+            optedIn.forEach { $0.input.finish(error: .sourceSuperseded) }
+            return []
+        }
+
+        // Start every reserved driver independently. Each task activates its own
+        // reader as soon as that driver's setup finishes, while this call gathers
+        // results in reservation order for a deterministic return value.
+        let sourceStartTasks = reservations.map { reservation in
+            Task { [self] in
+                await startReservedSource(
+                    reservation,
+                    startupGeneration: startupGeneration,
+                    cancellationToken: cancellationToken
+                )
+            }
+        }
+        let cancellationReservations = reservations
+        let started = await withTaskCancellationHandler {
+            var results: [NativeRealtimeStartedSource] = []
+            for task in sourceStartTasks {
+                if let result = await task.value {
+                    results.append(result)
+                }
+            }
+            return results
+        } onCancel: {
+            cancellationToken.cancel()
+            optedIn.forEach { $0.input.finish(error: .sourceSuperseded) }
+            for reservation in cancellationReservations {
+                reservation.lease.deactivate()
+                reservation.capture.input.finish(error: .sourceSuperseded)
+            }
+            sourceStartTasks.forEach { $0.cancel() }
+            Task { await self.cancelStartup(generation: startupGeneration) }
         }
         if lifecycleGeneration != startupGeneration {
             optedIn.forEach { $0.input.finish(error: .sourceSuperseded) }
         }
-        guard !Task.isCancelled else {
+        guard !Task.isCancelled, !cancellationToken.isCancelled else {
             await cancelStartup(generation: startupGeneration)
             return []
         }
         return started.filter { runningSources[$0.sourceID]?.generation == $0.generation }
+    }
+
+    private func startReservedSource(
+        _ reservation: StartupReservation,
+        startupGeneration: Int,
+        cancellationToken: StartupCancellationToken
+    ) async -> NativeRealtimeStartedSource? {
+        let capture = reservation.capture
+        let sourceID = capture.sourceID
+
+        guard !Task.isCancelled,
+              !cancellationToken.isCancelled,
+              lifecycleGeneration == startupGeneration,
+              !removedSourceIDsDuringStartup.contains(sourceID),
+              isCurrentReservation(reservation),
+              !capture.input.isConsumed,
+              capture.input.terminationError == nil else {
+            capture.input.finish(error: .sourceSuperseded)
+            await stopRevokedStart(reservation)
+            return nil
+        }
+
+        do {
+            try await reservation.driver.start(
+                sourceAlias: reservation.alias,
+                generation: reservation.generation
+            )
+        } catch {
+            guard !Task.isCancelled,
+                  !cancellationToken.isCancelled,
+                  lifecycleGeneration == startupGeneration,
+                  !removedSourceIDsDuringStartup.contains(sourceID),
+                  isCurrentReservation(reservation) else {
+                capture.input.finish(error: .sourceSuperseded)
+                await stopRevokedStart(reservation)
+                return nil
+            }
+            startingSources.removeValue(forKey: sourceID)
+            reservation.lease.deactivate()
+            removedSourceIDsDuringStartup.insert(sourceID)
+            capture.input.finish(error: .sourceSuperseded)
+            let stopping = scheduleStop(sourceID: sourceID, starting: reservation.startingSource)
+            // Report while this startup identity is still current; a stop barrier
+            // may allow a replacement to install a different failure handler.
+            sourceFailureHandler(sourceID, Self.failureCode(for: error))
+            await waitForStoppingSource(sourceID: sourceID, stopping)
+            return nil
+        }
+
+        guard !Task.isCancelled,
+              !cancellationToken.isCancelled,
+              lifecycleGeneration == startupGeneration,
+              !removedSourceIDsDuringStartup.contains(sourceID),
+              isCurrentReservation(reservation),
+              reservation.lease.isActive else {
+            capture.input.finish(error: .sourceSuperseded)
+            await stopRevokedStart(reservation)
+            return nil
+        }
+        guard !capture.input.isConsumed,
+              capture.input.terminationError == nil else {
+            let terminalError = capture.input.terminationError
+            startingSources.removeValue(forKey: sourceID)
+            reservation.lease.deactivate()
+            removedSourceIDsDuringStartup.insert(sourceID)
+            capture.input.finish(error: .sourceSuperseded)
+            let stopping = scheduleStop(sourceID: sourceID, starting: reservation.startingSource)
+            if let failure = Self.failureCode(for: terminalError) {
+                sourceFailureHandler(sourceID, failure)
+            }
+            await waitForStoppingSource(sourceID: sourceID, stopping)
+            return nil
+        }
+
+        startingSources.removeValue(forKey: sourceID)
+        let reader = Task { [weak self] in
+            let failure = await Self.readAudio(
+                from: capture,
+                alias: reservation.alias,
+                generation: reservation.generation,
+                driver: reservation.driver,
+                lease: reservation.lease
+            )
+            reservation.lease.deactivate()
+            capture.input.finish(error: failure == nil ? nil : .sourceSuperseded)
+            await reservation.driver.stop()
+            await self?.readerDidFinish(
+                sourceID: sourceID,
+                generation: reservation.generation,
+                cancellationToken: cancellationToken,
+                failure: failure
+            )
+        }
+        runningSources[sourceID] = RunningSource(
+            capture: capture,
+            generation: reservation.generation,
+            driver: reservation.driver,
+            lease: reservation.lease,
+            reader: reader
+        )
+        return NativeRealtimeStartedSource(
+            sourceID: sourceID,
+            alias: reservation.alias,
+            generation: reservation.generation
+        )
+    }
+
+    private func isCurrentReservation(_ reservation: StartupReservation) -> Bool {
+        guard let pending = startingSources[reservation.capture.sourceID] else { return false }
+        return pending.generation == reservation.generation
+            && pending.lease === reservation.lease
+            && pending.lease.isActive
+    }
+
+    private func stopRevokedStart(_ reservation: StartupReservation) async {
+        let stopping = stoppingSources[reservation.capture.sourceID].flatMap {
+            $0.driverGeneration == reservation.generation ? $0 : nil
+        }
+        // Cancel a late setup acknowledgement immediately. A removal may already
+        // have an in-flight stop for this driver; waiting for that stop first can
+        // deadlock drivers that only finish stopping after this post-ACK stop.
+        await reservation.driver.stop()
+        // Still join the removal/replacement stop that revoked this reservation so
+        // neither caller can cross the shared lifecycle barrier early. Capture its
+        // identity before the await so a replacement stop cannot be joined by ID.
+        await waitForStoppingSource(sourceID: reservation.capture.sourceID, stopping)
     }
 
     func removeSource(sourceID: String) async {
@@ -349,9 +501,19 @@ actor NativeRealtimeSessionCoordinator {
     private func inputDidFinish(
         sourceID: String,
         startupGeneration: Int,
+        cancellationToken: StartupCancellationToken,
         error: RealtimePCM16AudioStreamError?
     ) async {
-        guard lifecycleGeneration == startupGeneration,
+        #if DEBUG
+        let beforeProcessing = beforeInputDidFinishForTesting
+        let afterProcessing = afterInputDidFinishForTesting
+        defer { afterProcessing?() }
+        if let beforeProcessing {
+            await beforeProcessing()
+        }
+        #endif
+        guard !cancellationToken.isCancelled,
+              lifecycleGeneration == startupGeneration,
               let capture = startupCapturesBySourceID[sourceID],
               runningSources[sourceID] == nil,
               removedSourceIDsDuringStartup.insert(sourceID).inserted else { return }
@@ -407,6 +569,13 @@ actor NativeRealtimeSessionCoordinator {
 
     private func cancelStartup(generation cancelledGeneration: Int) async {
         guard lifecycleGeneration == cancelledGeneration else { return }
+        #if DEBUG
+        if let beforeCancellationCleanupForTesting {
+            await beforeCancellationCleanupForTesting()
+        }
+        #endif
+        // The test hook may suspend while another lifecycle operation advances.
+        guard lifecycleGeneration == cancelledGeneration else { return }
         lifecycleGeneration &+= 1
         let captures = Array(startupCapturesBySourceID.values)
         startupCapturesBySourceID.removeAll()
@@ -436,7 +605,7 @@ actor NativeRealtimeSessionCoordinator {
         if let existing = stoppingSources[sourceID] {
             return existing
         }
-        guard running != nil || starting != nil else { return nil }
+        guard let driverGeneration = running?.generation ?? starting?.generation else { return nil }
 
         // Revocation is synchronous at the coordinator boundary. The shared task
         // below owns only the potentially slow driver shutdown and reader join.
@@ -460,7 +629,11 @@ actor NativeRealtimeSessionCoordinator {
                 await Self.stop([starting])
             }
         }
-        let stopping = StoppingSource(generation: generation, task: task)
+        let stopping = StoppingSource(
+            generation: generation,
+            driverGeneration: driverGeneration,
+            task: task
+        )
         stoppingSources[sourceID] = stopping
         return stopping
     }
@@ -516,12 +689,13 @@ actor NativeRealtimeSessionCoordinator {
     private func readerDidFinish(
         sourceID: String,
         generation finishedGeneration: Int,
+        cancellationToken: StartupCancellationToken,
         failure: RealtimeFailureCode?
     ) {
         guard runningSources[sourceID]?.generation == finishedGeneration else { return }
         removedSourceIDsDuringStartup.insert(sourceID)
         runningSources.removeValue(forKey: sourceID)
-        if let failure {
+        if !cancellationToken.isCancelled, let failure {
             sourceFailureHandler(sourceID, failure)
         }
     }
@@ -547,28 +721,47 @@ actor NativeRealtimeSessionCoordinator {
         lease: RealtimeReaderLease
     ) async -> RealtimeFailureCode? {
         var previousTimestamp: UInt64?
+        var previousSampleEnd: UInt64?
         do {
             while !Task.isCancelled, lease.isActive {
                 guard let chunk = try await capture.input.nextChunk() else { return nil }
                 guard lease.isActive else { return nil }
-                // Preserve the capture timestamp as provenance; this only fences ordering
-                // within one source and does not align chunks to Speech captions.
-                guard chunk.sourceToken == capture.input.sourceToken,
+                let (pcmByteCount, pcmByteCountOverflow) = chunk.frameCount.multipliedReportingOverflow(by: 2)
+                guard !pcmByteCountOverflow,
+                      chunk.sourceToken == capture.input.sourceToken,
                       chunk.generation == capture.input.generation,
                       chunk.sampleRate == 16_000,
                       chunk.frameCount > 0,
-                      chunk.pcm16LE.count == chunk.frameCount * 2,
-                      previousTimestamp.map({ chunk.captureTimestampNanoseconds >= $0 }) ?? true else {
+                      chunk.pcm16LE.count == pcmByteCount,
+                      previousTimestamp.map({ chunk.captureTimestampNanoseconds >= $0 }) ?? true,
+                      chunk.sampleInterval.lowerBound >= 0,
+                      chunk.sampleInterval.upperBound > chunk.sampleInterval.lowerBound,
+                      let expectedFrameCount = Int64(exactly: chunk.frameCount),
+                      chunk.sampleInterval.upperBound - chunk.sampleInterval.lowerBound == expectedFrameCount,
+                      let startSample = UInt64(exactly: chunk.sampleInterval.lowerBound),
+                      let endSample = UInt64(exactly: chunk.sampleInterval.upperBound),
+                      previousSampleEnd.map({ startSample >= $0 }) ?? true else {
                     return .malformedResponse
                 }
+                let (startNanoseconds, startOverflow) = startSample.multipliedReportingOverflow(by: 62_500)
+                let (endNanoseconds, endOverflow) = endSample.multipliedReportingOverflow(by: 62_500)
+                guard !startOverflow, !endOverflow else { return .malformedResponse }
+
+                // Arrival timestamps are retained as provenance only. Sample-clock
+                // boundaries come exclusively from the normalized PCM interval.
                 previousTimestamp = chunk.captureTimestampNanoseconds
-                try await driver.sendAudioChunk(RealtimeAudioChunk(
+                previousSampleEnd = endSample
+                let audio = RealtimeAudioChunk(
                     sourceAlias: alias,
                     generation: generation,
                     capturedAtMonotonicNanoseconds: chunk.captureTimestampNanoseconds,
+                    startMonotonicNanoseconds: startNanoseconds,
+                    endMonotonicNanoseconds: endNanoseconds,
                     pcm16LEData: chunk.pcm16LE,
                     sampleRate: chunk.sampleRate
-                ))
+                )
+                guard !Task.isCancelled, lease.isActive else { return nil }
+                try await driver.sendAudioChunk(audio)
             }
             return nil
         } catch let error as RealtimePCM16AudioStreamError {

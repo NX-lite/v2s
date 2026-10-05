@@ -213,6 +213,8 @@ import Testing
             sourceAlias: "audio-1",
             generation: generation,
             capturedAtMonotonicNanoseconds: chunks[0].capturedAtMonotonicNanoseconds,
+            startMonotonicNanoseconds: 0,
+            endMonotonicNanoseconds: 125_000,
             pcm16LEData: Data([0x00, 0x40, 0x00, 0xc0]),
             sampleRate: 16_000
         )])
