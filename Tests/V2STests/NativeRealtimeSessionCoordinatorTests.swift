@@ -60,6 +60,1056 @@ import Testing
         await coordinator.stop()
     }
 
+    @Test func captionQueuedDuringCredentialLookupWaitsForExactSendAdmission() async throws {
+        let backend = SuspendingCoordinatorCredentialBackend()
+        let bag = CoordinatorDriverBag()
+        var settings = NativeRealtimeSettings.default
+        settings.isEnabled = true
+        settings.credentialReference = "fake-ref"
+        settings.enabledSourceIDs = ["source-a"]
+        let coordinator = NativeRealtimeSessionCoordinator(
+            credentialStore: RealtimeCredentialStore(backend: backend),
+            driverFactory: { _, _, _ in
+                let driver = CoordinatorFakeDriver(suspendSendUntilStop: true)
+                bag.append(driver)
+                return driver
+            }
+        )
+        let capture = makeCoordinatorCapture(sourceID: "source-a")
+        let caption = RealtimeAcceptedCaptionMetadata(
+            sourceID: capture.source.sourceID,
+            sourceToken: capture.source.input.sourceToken,
+            captureGeneration: capture.source.input.generation,
+            captionID: UUID(),
+            utteranceID: "utterance-1",
+            sourceLanguageID: "en",
+            targetLanguageID: "zh-Hans",
+            sampleInterval: 2..<5
+        )
+        let startTask = Task {
+            await coordinator.start(captures: [capture.source], settings: settings)
+        }
+        var deferredError: Error?
+        do {
+            try await requireCoordinatorCondition("credential lookup") {
+                await backend.lookupCount() == 1
+            }
+            #expect(await coordinator.submitAcceptedCaption(caption) == .queued)
+            try offer(
+                [1, 0, 2, 0, 3, 0, 4, 0, 5, 0, 6, 0, 7, 0, 8, 0],
+                to: capture,
+                sampleInterval: 0..<8,
+                captureTimestampNanoseconds: 17
+            )
+            await backend.releaseLookup(with: "fake-secret")
+            let started = await startTask.value
+            #expect(started.count == 1)
+            guard let driver = bag.all().first else {
+                throw CoordinatorFixtureError.offerRejected
+            }
+            try await requireCoordinatorCondition("held first audio send") {
+                await driver.isSendSuspended()
+            }
+            #expect(await driver.committedUtterances().isEmpty)
+
+            await driver.releaseSendSuccessfully()
+            try await requireCoordinatorCondition("admitted caption commit") {
+                await driver.committedUtterances().count == 1
+            }
+            let commits = await driver.committedUtterances()
+            #expect(commits.count == 1)
+            #expect(commits.first?.captionID == caption.captionID)
+            #expect(commits.first?.utteranceID == caption.utteranceID)
+            #expect(commits.first?.startMonotonicNanoseconds == 125_000)
+            #expect(commits.first?.endMonotonicNanoseconds == 312_500)
+            #expect(commits.first?.requiresPreciseSampleCoverage == true)
+            await coordinator.stop()
+        } catch {
+            deferredError = error
+        }
+        await backend.releaseLookup(with: "fake-secret")
+        for driver in bag.all() {
+            await driver.releaseSendSuccessfully()
+            await driver.releaseSuspendedStop()
+        }
+        _ = await startTask.value
+        await coordinator.stop()
+        if let deferredError { throw deferredError }
+    }
+
+    @Test func committedCaptionIsNotReportedLocalOnlyWhenAudioReaderFailsBeforeTerminal() async throws {
+        let bag = CoordinatorDriverBag()
+        let dispositions = CoordinatorCaptionDispositionBag()
+        let events = CoordinatorCaptionEventBag()
+        let failures = CoordinatorFailureBag()
+        var settings = NativeRealtimeSettings.default
+        settings.isEnabled = true
+        settings.credentialReference = "fake-ref"
+        settings.enabledSourceIDs = ["source-a"]
+        let coordinator = NativeRealtimeSessionCoordinator(
+            credentialStore: RealtimeCredentialStore(
+                backend: CoordinatorCredentialBackend(secret: "fake-secret")
+            ),
+            driverFactory: { _, _, _ in
+                let driver = CoordinatorFakeDriver()
+                bag.append(driver)
+                return driver
+            },
+            sourceFailureHandler: { sourceID, code in failures.append(sourceID, code) }
+        )
+        await coordinator.setCaptionDispositionHandler { metadata, disposition in
+            dispositions.append(metadata, disposition)
+        }
+        await coordinator.setCaptionEventHandler { events.append($0) }
+        let capture = makeCoordinatorCapture(sourceID: "source-a")
+        let started = await coordinator.start(captures: [capture.source], settings: settings)
+        guard let driver = bag.all().first, let active = started.first else {
+            await coordinator.stop()
+            throw CoordinatorFixtureError.offerRejected
+        }
+        let caption = RealtimeAcceptedCaptionMetadata(
+            sourceID: "source-a",
+            sourceToken: capture.source.input.sourceToken,
+            captureGeneration: capture.source.input.generation,
+            captionID: UUID(),
+            utteranceID: "committed-without-terminal",
+            sourceLanguageID: "en",
+            targetLanguageID: "zh-Hans",
+            sampleInterval: 0..<1
+        )
+        var deferredError: Error?
+        do {
+            try await requireCoordinatorCondition("event reader subscription before correction") {
+                await driver.hasEventSubscriber()
+            }
+            #expect(await coordinator.submitAcceptedCaption(caption) == .queued)
+            try offer([1, 0], to: capture, sampleInterval: 0..<1)
+            try await requireCoordinatorCondition("caption commit succeeds before terminal") {
+                let commits = await driver.committedUtterances()
+                return commits.count == 1 && commits.first?.captionID == caption.captionID
+            }
+            await driver.yieldEvent(.correctedText(
+                sourceAlias: active.alias,
+                generation: active.generation,
+                captionID: caption.captionID,
+                utteranceID: caption.utteranceID,
+                text: "committed correction"
+            ))
+            try await requireCoordinatorCondition("correction proves commit success") {
+                events.all().count == 1
+            }
+
+            capture.source.input.finish(error: .invalidAudioChunk)
+            try await requireCoordinatorCondition("audio failure tears down the source") {
+                failures.all().count == 1
+            }
+            #expect(failures.all().first?.0 == "source-a")
+            #expect(failures.all().first?.1 == .malformedResponse)
+            #expect(events.all().map(\.kind) == [.correctedText("committed correction")])
+            #expect(dispositions.all().isEmpty)
+        } catch {
+            deferredError = error
+        }
+        await coordinator.stop()
+        if let deferredError { throw deferredError }
+    }
+
+    @Test func knownPreInputAndAudioGapsAreRejectedBeforeCaptionEndArrives() async throws {
+        let bag = CoordinatorDriverBag()
+        let dispositions = CoordinatorCaptionDispositionBag()
+        var settings = NativeRealtimeSettings.default
+        settings.isEnabled = true
+        settings.credentialReference = "fake-ref"
+        settings.enabledSourceIDs = ["pre-input", "gap"]
+        let coordinator = NativeRealtimeSessionCoordinator(
+            credentialStore: RealtimeCredentialStore(
+                backend: CoordinatorCredentialBackend(secret: "fake-secret")
+            ),
+            driverFactory: { _, _, _ in
+                let driver = CoordinatorFakeDriver()
+                bag.append(driver)
+                return driver
+            }
+        )
+        await coordinator.setCaptionDispositionHandler { metadata, disposition in
+            dispositions.append(metadata, disposition)
+        }
+        let preInput = makeCoordinatorCapture(sourceID: "pre-input")
+        let gap = makeCoordinatorCapture(sourceID: "gap")
+        let preInputCaption = RealtimeAcceptedCaptionMetadata(
+            sourceID: "pre-input",
+            sourceToken: preInput.source.input.sourceToken,
+            captureGeneration: preInput.source.input.generation,
+            captionID: UUID(),
+            utteranceID: "pre-input-utterance",
+            sourceLanguageID: "en",
+            targetLanguageID: "zh-Hans",
+            sampleInterval: 0..<8
+        )
+        let gapCaption = RealtimeAcceptedCaptionMetadata(
+            sourceID: "gap",
+            sourceToken: gap.source.input.sourceToken,
+            captureGeneration: gap.source.input.generation,
+            captionID: UUID(),
+            utteranceID: "gap-utterance",
+            sourceLanguageID: "en",
+            targetLanguageID: "zh-Hans",
+            sampleInterval: 1..<7
+        )
+        var deferredError: Error?
+        do {
+            let started = await coordinator.start(
+                captures: [preInput.source, gap.source],
+                settings: settings
+            )
+            #expect(started.count == 2)
+            #expect(await coordinator.submitAcceptedCaption(preInputCaption) == .queued)
+            #expect(await coordinator.submitAcceptedCaption(gapCaption) == .queued)
+            try offer([1, 0], to: preInput, sampleInterval: 5..<6, captureTimestampNanoseconds: 19)
+            try offer([2, 0, 3, 0], to: gap, sampleInterval: 0..<2, captureTimestampNanoseconds: 20)
+            try offer([4, 0, 5, 0], to: gap, sampleInterval: 4..<6, captureTimestampNanoseconds: 23)
+            try await requireCoordinatorCondition("known uncovered caption spans") {
+                dispositions.all().count == 2
+            }
+            let observed = dispositions.all()
+            #expect(observed.contains(where: {
+                $0.metadata.captionID == preInputCaption.captionID
+                    && $0.disposition == .localOnly(.missingAudioCoverage)
+            }))
+            #expect(observed.contains(where: {
+                $0.metadata.captionID == gapCaption.captionID
+                    && $0.disposition == .localOnly(.missingAudioCoverage)
+            }))
+            #expect(bag.all().count == 2)
+            for driver in bag.all() {
+                #expect(await driver.committedUtterances().isEmpty)
+            }
+            await coordinator.stop()
+        } catch {
+            deferredError = error
+        }
+        await coordinator.stop()
+        if let deferredError { throw deferredError }
+    }
+
+    @Test func contiguousReaderLagWaitsForTheRemainingAudioSamples() async throws {
+        let bag = CoordinatorDriverBag()
+        var settings = NativeRealtimeSettings.default
+        settings.isEnabled = true
+        settings.credentialReference = "fake-ref"
+        settings.enabledSourceIDs = ["source-a"]
+        let coordinator = NativeRealtimeSessionCoordinator(
+            credentialStore: RealtimeCredentialStore(
+                backend: CoordinatorCredentialBackend(secret: "fake-secret")
+            ),
+            driverFactory: { _, _, _ in
+                let driver = CoordinatorFakeDriver()
+                bag.append(driver)
+                return driver
+            }
+        )
+        let capture = makeCoordinatorCapture(sourceID: "source-a")
+        let started = await coordinator.start(captures: [capture.source], settings: settings)
+        var deferredError: Error?
+        do {
+            try await requireCoordinatorCondition("reader-lag source starts") {
+                started.count == 1 && bag.all().count == 1
+            }
+            let driver = bag.all()[0]
+            let caption = RealtimeAcceptedCaptionMetadata(
+                sourceID: "source-a",
+                sourceToken: capture.source.input.sourceToken,
+                captureGeneration: capture.source.input.generation,
+                captionID: UUID(),
+                utteranceID: "reader-lag-span",
+                sourceLanguageID: "en",
+                targetLanguageID: "zh-Hans",
+                sampleInterval: 0..<4
+            )
+            #expect(await coordinator.submitAcceptedCaption(caption) == .queued)
+            try offer([1, 0, 2, 0], to: capture, sampleInterval: 0..<2)
+            try await requireCoordinatorCondition("first half is admitted while caption still waits") {
+                let ranges = await coordinator.admittedAudioRangeCountForTesting(sourceID: "source-a")
+                let chunks = await driver.audioChunks()
+                return ranges == 1 && chunks.count == 1
+            }
+            #expect(await driver.commitInvocationCount() == 0)
+            #expect(await driver.committedUtterances().isEmpty)
+
+            try offer([3, 0, 4, 0], to: capture, sampleInterval: 2..<4)
+            try await requireCoordinatorCondition("remaining adjacent samples complete coverage") {
+                let attempts = await driver.commitInvocationCount()
+                let commits = await driver.committedUtterances()
+                return attempts == 1 && commits.count == 1
+            }
+            let committed = await driver.committedUtterances()[0]
+            #expect(committed.captionID == caption.captionID)
+            #expect(committed.utteranceID == caption.utteranceID)
+            #expect(committed.startMonotonicNanoseconds == 0)
+            #expect(committed.endMonotonicNanoseconds == 250_000)
+            #expect(committed.requiresPreciseSampleCoverage)
+            #expect(await driver.commitInvocationCount() == 1)
+        } catch {
+            deferredError = error
+        }
+        for driver in bag.all() {
+            await driver.releaseSendSuccessfully()
+            await driver.releaseCommitSuccessfully()
+            await driver.releaseSuspendedStop()
+        }
+        await coordinator.stop()
+        if let deferredError { throw deferredError }
+    }
+
+    @Test func captionEventsRequireExactIdentityAndOnlyExactTerminalReleasesNextCaption() async throws {
+        let bag = CoordinatorDriverBag()
+        let events = CoordinatorCaptionEventBag()
+        var settings = NativeRealtimeSettings.default
+        settings.isEnabled = true
+        settings.credentialReference = "fake-ref"
+        settings.enabledSourceIDs = ["source-a"]
+        let coordinator = NativeRealtimeSessionCoordinator(
+            credentialStore: RealtimeCredentialStore(
+                backend: CoordinatorCredentialBackend(secret: "fake-secret")
+            ),
+            driverFactory: { _, _, _ in
+                let driver = CoordinatorFakeDriver()
+                bag.append(driver)
+                return driver
+            }
+        )
+        await coordinator.setCaptionEventHandler { events.append($0) }
+        let capture = makeCoordinatorCapture(sourceID: "source-a")
+        let started = await coordinator.start(captures: [capture.source], settings: settings)
+        #expect(started.count == 1)
+        guard let driver = bag.all().first, let active = started.first else {
+            await coordinator.stop()
+            throw CoordinatorFixtureError.offerRejected
+        }
+
+        let first = RealtimeAcceptedCaptionMetadata(
+            sourceID: "source-a",
+            sourceToken: capture.source.input.sourceToken,
+            captureGeneration: capture.source.input.generation,
+            captionID: UUID(),
+            utteranceID: "utterance-first",
+            sourceLanguageID: "en",
+            targetLanguageID: "zh-Hans",
+            sampleInterval: 0..<2
+        )
+        let second = RealtimeAcceptedCaptionMetadata(
+            sourceID: "source-a",
+            sourceToken: capture.source.input.sourceToken,
+            captureGeneration: capture.source.input.generation,
+            captionID: UUID(),
+            utteranceID: "utterance-second",
+            sourceLanguageID: "en",
+            targetLanguageID: "zh-Hans",
+            sampleInterval: 2..<4
+        )
+        var deferredError: Error?
+        do {
+            #expect(await coordinator.submitAcceptedCaption(first) == .queued)
+            #expect(await coordinator.submitAcceptedCaption(second) == .queued)
+            try offer([1, 0, 2, 0, 3, 0, 4, 0], to: capture, sampleInterval: 0..<4)
+            try await requireCoordinatorCondition("first caption commit and event reader") {
+                let invocations = await driver.commitInvocationCount()
+                let commits = await driver.committedUtterances()
+                let hasSubscriber = await driver.hasEventSubscriber()
+                return invocations == 1 && commits.count == 1 && hasSubscriber
+            }
+
+            let alias = active.alias
+            let generation = active.generation
+            await driver.yieldEvent(.correctedText(
+                sourceAlias: "wrong-alias",
+                generation: generation,
+                captionID: first.captionID,
+                utteranceID: first.utteranceID,
+                text: "wrong alias"
+            ))
+            await driver.yieldEvent(.correctedText(
+                sourceAlias: alias,
+                generation: generation + 1,
+                captionID: first.captionID,
+                utteranceID: first.utteranceID,
+                text: "wrong generation"
+            ))
+            await driver.yieldEvent(.correctedText(
+                sourceAlias: alias,
+                generation: generation,
+                captionID: UUID(),
+                utteranceID: first.utteranceID,
+                text: "wrong caption"
+            ))
+            await driver.yieldEvent(.correctedText(
+                sourceAlias: alias,
+                generation: generation,
+                captionID: first.captionID,
+                utteranceID: "wrong-utterance",
+                text: "wrong utterance"
+            ))
+            await driver.yieldEvent(.utteranceCompleted(
+                sourceAlias: "wrong-alias",
+                generation: generation,
+                captionID: first.captionID,
+                utteranceID: first.utteranceID
+            ))
+            await driver.yieldEvent(.utteranceCompleted(
+                sourceAlias: alias,
+                generation: generation + 1,
+                captionID: first.captionID,
+                utteranceID: first.utteranceID
+            ))
+            await driver.yieldEvent(.utteranceCompleted(
+                sourceAlias: alias,
+                generation: generation,
+                captionID: UUID(),
+                utteranceID: first.utteranceID
+            ))
+            await driver.yieldEvent(.correctedText(
+                sourceAlias: alias,
+                generation: generation,
+                captionID: first.captionID,
+                utteranceID: first.utteranceID,
+                text: "corrected first"
+            ))
+            try await requireCoordinatorCondition("exact correction delivery after stale events") {
+                events.all().count == 1
+            }
+            let corrected = events.all().first
+            #expect(corrected?.sourceID == first.sourceID)
+            #expect(corrected?.sourceToken == first.sourceToken)
+            #expect(corrected?.captureGeneration == first.captureGeneration)
+            #expect(corrected?.sourceAlias == alias)
+            #expect(corrected?.driverGeneration == generation)
+            #expect(corrected?.captionID == first.captionID)
+            #expect(corrected?.utteranceID == first.utteranceID)
+            #expect(corrected?.sourceLanguageID == first.sourceLanguageID)
+            #expect(corrected?.targetLanguageID == first.targetLanguageID)
+            #expect(corrected?.kind == .correctedText("corrected first"))
+            #expect(await driver.commitInvocationCount() == 1)
+            #expect(await driver.committedUtterances().count == 1)
+
+            await driver.yieldEvent(.utteranceCompleted(
+                sourceAlias: alias,
+                generation: generation,
+                captionID: first.captionID,
+                utteranceID: "wrong-utterance"
+            ))
+            await driver.yieldEvent(.suggestion(
+                sourceAlias: alias,
+                generation: generation,
+                text: "suggestion does not release"
+            ))
+            try await requireCoordinatorCondition("suggestion delivery without releasing first caption") {
+                events.all().count == 2
+            }
+            #expect(events.all().last?.kind == .suggestion("suggestion does not release"))
+            #expect(await driver.commitInvocationCount() == 1)
+
+            await driver.yieldEvent(.utteranceCompleted(
+                sourceAlias: alias,
+                generation: generation,
+                captionID: first.captionID,
+                utteranceID: first.utteranceID
+            ))
+            try await requireCoordinatorCondition("exact terminal advances second caption") {
+                let invocations = await driver.commitInvocationCount()
+                let commits = await driver.committedUtterances()
+                return invocations == 2 && commits.count == 2
+            }
+            let commits = await driver.committedUtterances()
+            #expect(commits.map(\.captionID) == [first.captionID, second.captionID])
+            #expect(commits.map(\.utteranceID) == [first.utteranceID, second.utteranceID])
+            #expect(commits.map(\.startMonotonicNanoseconds) == [0, 125_000])
+            #expect(commits.map(\.endMonotonicNanoseconds) == [125_000, 250_000])
+            #expect(events.all().last?.kind == .utteranceCompleted)
+        } catch {
+            deferredError = error
+        }
+        await driver.releaseCommitSuccessfully()
+        await coordinator.stop()
+        if let deferredError { throw deferredError }
+    }
+
+    @Test func terminalReceivedDuringHeldCommitWaitsForCommitSuccessBeforeDeliveryAndRelease() async throws {
+        let bag = CoordinatorDriverBag()
+        let events = CoordinatorCaptionEventBag()
+        var settings = NativeRealtimeSettings.default
+        settings.isEnabled = true
+        settings.credentialReference = "fake-ref"
+        settings.enabledSourceIDs = ["source-a"]
+        let coordinator = NativeRealtimeSessionCoordinator(
+            credentialStore: RealtimeCredentialStore(
+                backend: CoordinatorCredentialBackend(secret: "fake-secret")
+            ),
+            driverFactory: { _, _, _ in
+                let driver = CoordinatorFakeDriver(suspendCommitUntilReleased: true)
+                bag.append(driver)
+                return driver
+            }
+        )
+        await coordinator.setCaptionEventHandler { events.append($0) }
+        let capture = makeCoordinatorCapture(sourceID: "source-a")
+        let started = await coordinator.start(captures: [capture.source], settings: settings)
+        #expect(started.count == 1)
+        guard let driver = bag.all().first, let active = started.first else {
+            await coordinator.stop()
+            throw CoordinatorFixtureError.offerRejected
+        }
+        let first = RealtimeAcceptedCaptionMetadata(
+            sourceID: "source-a",
+            sourceToken: capture.source.input.sourceToken,
+            captureGeneration: capture.source.input.generation,
+            captionID: UUID(),
+            utteranceID: "held-first",
+            sourceLanguageID: "en",
+            targetLanguageID: "zh-Hans",
+            sampleInterval: 0..<2
+        )
+        let second = RealtimeAcceptedCaptionMetadata(
+            sourceID: "source-a",
+            sourceToken: capture.source.input.sourceToken,
+            captureGeneration: capture.source.input.generation,
+            captionID: UUID(),
+            utteranceID: "held-second",
+            sourceLanguageID: "en",
+            targetLanguageID: "zh-Hans",
+            sampleInterval: 2..<4
+        )
+        var deferredError: Error?
+        do {
+            #expect(await coordinator.submitAcceptedCaption(first) == .queued)
+            #expect(await coordinator.submitAcceptedCaption(second) == .queued)
+            try offer([1, 0, 2, 0, 3, 0, 4, 0], to: capture, sampleInterval: 0..<4)
+            try await requireCoordinatorCondition("held first commit and subscribed event reader") {
+                let invocations = await driver.commitInvocationCount()
+                let held = await driver.isCommitSuspended()
+                let subscribed = await driver.hasEventSubscriber()
+                return invocations == 1 && held && subscribed
+            }
+            await driver.yieldEvent(.correctedText(
+                sourceAlias: active.alias,
+                generation: active.generation,
+                captionID: first.captionID,
+                utteranceID: first.utteranceID,
+                text: "held correction"
+            ))
+            await driver.yieldEvent(.utteranceCompleted(
+                sourceAlias: active.alias,
+                generation: active.generation,
+                captionID: first.captionID,
+                utteranceID: first.utteranceID
+            ))
+            try await requireCoordinatorCondition("both events stashed behind held commit") {
+                await coordinator.stashedCaptionEventsForTesting(
+                    sourceID: "source-a",
+                    captionID: first.captionID
+                ) == 2
+            }
+            #expect(events.all().isEmpty)
+            #expect(await driver.commitInvocationCount() == 1)
+            #expect(await driver.committedUtterances().isEmpty)
+
+            await driver.releaseCommitSuccessfully()
+            try await requireCoordinatorCondition("commit success releases stashed events and next caption") {
+                let invocations = await driver.commitInvocationCount()
+                let commits = await driver.committedUtterances()
+                return events.all().count == 2 && invocations == 2 && commits.count == 2
+            }
+            let delivered = events.all()
+            #expect(delivered.map(\.captionID) == [first.captionID, first.captionID])
+            #expect(delivered.map(\.utteranceID) == [first.utteranceID, first.utteranceID])
+            #expect(delivered.map(\.kind) == [.correctedText("held correction"), .utteranceCompleted])
+            #expect(await driver.committedUtterances().map(\.captionID) == [first.captionID, second.captionID])
+        } catch {
+            deferredError = error
+        }
+        await driver.releaseCommitSuccessfully()
+        await coordinator.stop()
+        if let deferredError { throw deferredError }
+    }
+
+    @Test func failedHeldCommitDropsStashedEventsAndKeepsSiblingSourceRunning() async throws {
+        let bag = CoordinatorDriverBag()
+        let failures = CoordinatorFailureBag()
+        let events = CoordinatorCaptionEventBag()
+        var settings = NativeRealtimeSettings.default
+        settings.isEnabled = true
+        settings.credentialReference = "fake-ref"
+        settings.enabledSourceIDs = ["source-a", "source-b"]
+        let coordinator = NativeRealtimeSessionCoordinator(
+            credentialStore: RealtimeCredentialStore(
+                backend: CoordinatorCredentialBackend(secret: "fake-secret")
+            ),
+            driverFactory: { _, _, _ in
+                let driver = CoordinatorFakeDriver(suspendCommitUntilReleased: bag.all().isEmpty)
+                bag.append(driver)
+                return driver
+            },
+            sourceFailureHandler: { sourceID, code in failures.append(sourceID, code) }
+        )
+        await coordinator.setCaptionEventHandler { events.append($0) }
+        let firstCapture = makeCoordinatorCapture(sourceID: "source-a")
+        let secondCapture = makeCoordinatorCapture(sourceID: "source-b")
+        let started = await coordinator.start(
+            captures: [firstCapture.source, secondCapture.source],
+            settings: settings
+        )
+        #expect(started.map(\.sourceID) == ["source-a", "source-b"])
+        guard bag.all().count == 2, let firstStarted = started.first else {
+            await coordinator.stop()
+            throw CoordinatorFixtureError.offerRejected
+        }
+        let failedDriver = bag.all()[0]
+        let healthyDriver = bag.all()[1]
+        let first = RealtimeAcceptedCaptionMetadata(
+            sourceID: "source-a",
+            sourceToken: firstCapture.source.input.sourceToken,
+            captureGeneration: firstCapture.source.input.generation,
+            captionID: UUID(),
+            utteranceID: "failed-commit-utterance",
+            sourceLanguageID: "en",
+            targetLanguageID: "zh-Hans",
+            sampleInterval: 0..<2
+        )
+        let sibling = RealtimeAcceptedCaptionMetadata(
+            sourceID: "source-b",
+            sourceToken: secondCapture.source.input.sourceToken,
+            captureGeneration: secondCapture.source.input.generation,
+            captionID: UUID(),
+            utteranceID: "sibling-utterance",
+            sourceLanguageID: "yue",
+            targetLanguageID: "zh-Hans",
+            sampleInterval: 0..<2
+        )
+        var deferredError: Error?
+        do {
+            #expect(await coordinator.submitAcceptedCaption(first) == .queued)
+            #expect(await coordinator.submitAcceptedCaption(sibling) == .queued)
+            try offer([1, 0, 2, 0], to: firstCapture, sampleInterval: 0..<2)
+            try offer([3, 0, 4, 0], to: secondCapture, sampleInterval: 0..<2)
+            try await requireCoordinatorCondition("source-a held commit and both event readers") {
+                let firstHeld = await failedDriver.isCommitSuspended()
+                let firstSubscribed = await failedDriver.hasEventSubscriber()
+                let secondCommits = await healthyDriver.committedUtterances()
+                let secondSubscribed = await healthyDriver.hasEventSubscriber()
+                return firstHeld && firstSubscribed && secondCommits.count == 1 && secondSubscribed
+            }
+            await failedDriver.yieldEvent(.correctedText(
+                sourceAlias: firstStarted.alias,
+                generation: firstStarted.generation,
+                captionID: first.captionID,
+                utteranceID: first.utteranceID,
+                text: "must be dropped"
+            ))
+            await failedDriver.yieldEvent(.utteranceCompleted(
+                sourceAlias: firstStarted.alias,
+                generation: firstStarted.generation,
+                captionID: first.captionID,
+                utteranceID: first.utteranceID
+            ))
+            try await requireCoordinatorCondition("failed source stashes early events") {
+                await coordinator.stashedCaptionEventsForTesting(
+                    sourceID: "source-a",
+                    captionID: first.captionID
+                ) == 2
+            }
+            #expect(events.all().isEmpty)
+
+            await failedDriver.releaseCommitFailure(.connectionFailed)
+            try await requireCoordinatorCondition("failed source isolates after commit error") {
+                let active = await coordinator.activeSourceIDs()
+                let seenFailures = failures.all()
+                return active == ["source-b"]
+                    && seenFailures.count == 1
+                    && seenFailures.first?.0 == "source-a"
+                    && seenFailures.first?.1 == .connectionFailed
+            }
+            #expect(events.all().isEmpty)
+            #expect(await failedDriver.committedUtterances().isEmpty)
+            try offer([5, 0], to: secondCapture, sampleInterval: 2..<3)
+            try await requireCoordinatorCondition("sibling keeps streaming after source-a commit failure") {
+                await healthyDriver.audioChunks().count == 2
+            }
+            #expect(await coordinator.activeSourceIDs() == ["source-b"])
+        } catch {
+            deferredError = error
+        }
+        await failedDriver.releaseCommitFailure(.connectionFailed)
+        await failedDriver.releaseCommitSuccessfully()
+        await healthyDriver.releaseCommitSuccessfully()
+        await coordinator.stop()
+        if let deferredError { throw deferredError }
+    }
+
+    @Test func ninthEarlyEventBackpressuresOnlyItsSourceAndDropsStashedCallbacks() async throws {
+        let bag = CoordinatorDriverBag()
+        let failures = CoordinatorFailureBag()
+        let events = CoordinatorCaptionEventBag()
+        var settings = NativeRealtimeSettings.default
+        settings.isEnabled = true
+        settings.credentialReference = "fake-ref"
+        settings.enabledSourceIDs = ["source-a", "source-b"]
+        let coordinator = NativeRealtimeSessionCoordinator(
+            credentialStore: RealtimeCredentialStore(
+                backend: CoordinatorCredentialBackend(secret: "fake-secret")
+            ),
+            driverFactory: { _, _, _ in
+                let isFirst = bag.all().isEmpty
+                let driver = CoordinatorFakeDriver(
+                    suspendCommitUntilReleased: isFirst,
+                    suspendStopUntilReleased: isFirst
+                )
+                bag.append(driver)
+                return driver
+            },
+            sourceFailureHandler: { sourceID, code in failures.append(sourceID, code) }
+        )
+        await coordinator.setCaptionEventHandler { events.append($0) }
+        let firstCapture = makeCoordinatorCapture(sourceID: "source-a")
+        let siblingCapture = makeCoordinatorCapture(sourceID: "source-b")
+        let started = await coordinator.start(
+            captures: [firstCapture.source, siblingCapture.source],
+            settings: settings
+        )
+        var deferredError: Error?
+        do {
+            guard started.count == 2, bag.all().count == 2 else {
+                throw CoordinatorFixtureError.offerRejected
+            }
+            let firstStarted = started[0]
+            let failingDriver = bag.all()[0]
+            let siblingDriver = bag.all()[1]
+            let first = RealtimeAcceptedCaptionMetadata(
+                sourceID: "source-a",
+                sourceToken: firstCapture.source.input.sourceToken,
+                captureGeneration: firstCapture.source.input.generation,
+                captionID: UUID(),
+                utteranceID: "event-overflow-first",
+                sourceLanguageID: "en",
+                targetLanguageID: "zh-Hans",
+                sampleInterval: 0..<1
+            )
+            try await requireCoordinatorCondition("both event streams subscribe before overflow") {
+                let firstSubscribed = await failingDriver.hasEventSubscriber()
+                let siblingSubscribed = await siblingDriver.hasEventSubscriber()
+                return firstSubscribed && siblingSubscribed
+            }
+            #expect(await coordinator.submitAcceptedCaption(first) == .queued)
+            try offer([1, 0], to: firstCapture, sampleInterval: 0..<1)
+            try await requireCoordinatorCondition("source-a commit is held while events arrive") {
+                await failingDriver.isCommitSuspended()
+            }
+
+            for index in 0..<8 {
+                if index.isMultiple(of: 2) {
+                    await failingDriver.yieldEvent(.correctedText(
+                        sourceAlias: firstStarted.alias,
+                        generation: firstStarted.generation,
+                        captionID: first.captionID,
+                        utteranceID: first.utteranceID,
+                        text: "held correction \(index)"
+                    ))
+                } else {
+                    await failingDriver.yieldEvent(.suggestion(
+                        sourceAlias: firstStarted.alias,
+                        generation: firstStarted.generation,
+                        text: "held suggestion \(index)"
+                    ))
+                }
+            }
+            try await requireCoordinatorCondition("exactly eight events are stashed") {
+                await coordinator.stashedCaptionEventsForTesting(
+                    sourceID: "source-a",
+                    captionID: first.captionID
+                ) == 8
+            }
+            await failingDriver.yieldEvent(.suggestion(
+                sourceAlias: firstStarted.alias,
+                generation: firstStarted.generation,
+                text: "ninth event exceeds bounded stash"
+            ))
+            try await requireCoordinatorCondition("ninth event revokes and holds source-a stop") {
+                let active = await coordinator.activeSourceIDs()
+                let stopped = await failingDriver.isStopSuspended()
+                let seenFailures = failures.all()
+                return active == ["source-b"]
+                    && stopped
+                    && seenFailures.count == 1
+                    && seenFailures.first?.0 == "source-a"
+                    && seenFailures.first?.1 == .backpressure
+            }
+            #expect(events.all().isEmpty)
+
+            let sibling = RealtimeAcceptedCaptionMetadata(
+                sourceID: "source-b",
+                sourceToken: siblingCapture.source.input.sourceToken,
+                captureGeneration: siblingCapture.source.input.generation,
+                captionID: UUID(),
+                utteranceID: "sibling-after-event-overflow",
+                sourceLanguageID: "yue",
+                targetLanguageID: "en",
+                sampleInterval: 0..<1
+            )
+            #expect(await coordinator.submitAcceptedCaption(sibling) == .queued)
+            try offer([2, 0], to: siblingCapture, sampleInterval: 0..<1)
+            try await requireCoordinatorCondition("sibling continues during source-a event backpressure") {
+                let commits = await siblingDriver.committedUtterances()
+                return commits.count == 1 && commits.first?.captionID == sibling.captionID
+            }
+            #expect(await coordinator.activeSourceIDs() == ["source-b"])
+            #expect(events.all().isEmpty)
+        } catch {
+            deferredError = error
+        }
+        for driver in bag.all() {
+            await driver.releaseSendSuccessfully()
+            await driver.releaseCommitSuccessfully()
+            await driver.releaseSuspendedStop()
+        }
+        await coordinator.stop()
+        #expect(events.all().isEmpty)
+        if let deferredError { throw deferredError }
+    }
+
+    @Test func acceptedCaptionMetadataRejectsMissingInvalidDuplicateAndOutOfOrderIdentity() async {
+        var settings = NativeRealtimeSettings.default
+        settings.isEnabled = true
+        settings.credentialReference = "fake-ref"
+        settings.enabledSourceIDs = ["source-a"]
+        let coordinator = NativeRealtimeSessionCoordinator(
+            credentialStore: RealtimeCredentialStore(
+                backend: CoordinatorCredentialBackend(secret: "fake-secret")
+            ),
+            driverFactory: { _, _, _ in CoordinatorFakeDriver() }
+        )
+        let capture = makeCoordinatorCapture(sourceID: "source-a")
+        _ = await coordinator.start(captures: [capture.source], settings: settings)
+
+        func metadata(
+            sourceID: String = "source-a",
+            sourceToken: UUID? = nil,
+            captureGeneration: UInt64? = nil,
+            captionID: UUID = UUID(),
+            utteranceID: String = "accepted-utterance",
+            sourceLanguageID: String = "en",
+            interval: Range<Int64>? = 10..<12
+        ) -> RealtimeAcceptedCaptionMetadata {
+            RealtimeAcceptedCaptionMetadata(
+                sourceID: sourceID,
+                sourceToken: sourceToken ?? capture.source.input.sourceToken,
+                captureGeneration: captureGeneration ?? capture.source.input.generation,
+                captionID: captionID,
+                utteranceID: utteranceID,
+                sourceLanguageID: sourceLanguageID,
+                targetLanguageID: "zh-Hans",
+                sampleInterval: interval
+            )
+        }
+
+        let firstID = UUID()
+        let first = metadata(captionID: firstID, utteranceID: "ordered-first")
+        #expect(await coordinator.submitAcceptedCaption(metadata(interval: nil)) == .localOnly(.missingProvenance))
+        #expect(await coordinator.submitAcceptedCaption(metadata(sourceID: "source\nA")) == .localOnly(.invalidMetadata))
+        #expect(await coordinator.submitAcceptedCaption(metadata(sourceLanguageID: "")) == .localOnly(.invalidMetadata))
+        #expect(await coordinator.submitAcceptedCaption(metadata(utteranceID: String(repeating: "x", count: 129))) == .localOnly(.invalidMetadata))
+        #expect(await coordinator.submitAcceptedCaption(metadata(interval: -1..<1)) == .localOnly(.invalidMetadata))
+        #expect(await coordinator.submitAcceptedCaption(metadata(interval: 4..<4)) == .localOnly(.invalidMetadata))
+        #expect(await coordinator.submitAcceptedCaption(metadata(
+            interval: (Int64.max - 1)..<Int64.max
+        )) == .localOnly(.invalidMetadata))
+        #expect(await coordinator.submitAcceptedCaption(metadata(sourceToken: UUID())) == .localOnly(.unavailableSource))
+        #expect(await coordinator.submitAcceptedCaption(metadata(
+            captureGeneration: capture.source.input.generation &+ 1
+        )) == .localOnly(.unavailableSource))
+
+        #expect(await coordinator.submitAcceptedCaption(first) == .queued)
+        #expect(await coordinator.submitAcceptedCaption(metadata(
+            captionID: firstID,
+            utteranceID: "duplicate-caption",
+            interval: 12..<14
+        )) == .localOnly(.duplicateIdentity))
+        #expect(await coordinator.submitAcceptedCaption(metadata(
+            captionID: UUID(),
+            utteranceID: first.utteranceID,
+            interval: 12..<14
+        )) == .localOnly(.duplicateIdentity))
+        #expect(await coordinator.submitAcceptedCaption(metadata(
+            captionID: UUID(),
+            utteranceID: "out-of-order",
+            interval: 9..<10
+        )) == .localOnly(.outOfOrderInterval))
+        await coordinator.stop()
+    }
+
+    @Test func perSourceCaptionQueueLimitIsEightAndOverflowLeavesSiblingRunning() async throws {
+        let bag = CoordinatorDriverBag()
+        let failures = CoordinatorFailureBag()
+        var settings = NativeRealtimeSettings.default
+        settings.isEnabled = true
+        settings.credentialReference = "fake-ref"
+        settings.enabledSourceIDs = ["source-a", "source-b"]
+        let coordinator = NativeRealtimeSessionCoordinator(
+            credentialStore: RealtimeCredentialStore(
+                backend: CoordinatorCredentialBackend(secret: "fake-secret")
+            ),
+            driverFactory: { _, _, _ in
+                let driver = CoordinatorFakeDriver()
+                bag.append(driver)
+                return driver
+            },
+            sourceFailureHandler: { sourceID, code in failures.append(sourceID, code) }
+        )
+        let firstCapture = makeCoordinatorCapture(sourceID: "source-a")
+        let siblingCapture = makeCoordinatorCapture(sourceID: "source-b")
+        let started = await coordinator.start(
+            captures: [firstCapture.source, siblingCapture.source],
+            settings: settings
+        )
+        #expect(started.map(\.sourceID) == ["source-a", "source-b"])
+        guard started.count == 2, bag.all().count == 2 else {
+            await coordinator.stop()
+            throw CoordinatorFixtureError.offerRejected
+        }
+        var deferredError: Error?
+        do {
+            for index in 0..<8 {
+                let metadata = RealtimeAcceptedCaptionMetadata(
+                    sourceID: "source-a",
+                    sourceToken: firstCapture.source.input.sourceToken,
+                    captureGeneration: firstCapture.source.input.generation,
+                    captionID: UUID(),
+                    utteranceID: "queued-\(index)",
+                    sourceLanguageID: "en",
+                    targetLanguageID: "zh-Hans",
+                    sampleInterval: Int64(index)..<Int64(index + 1)
+                )
+                #expect(await coordinator.submitAcceptedCaption(metadata) == .queued)
+            }
+            let rejected = await coordinator.submitAcceptedCaption(RealtimeAcceptedCaptionMetadata(
+                sourceID: "source-a",
+                sourceToken: firstCapture.source.input.sourceToken,
+                captureGeneration: firstCapture.source.input.generation,
+                captionID: UUID(),
+                utteranceID: "queued-overflow",
+                sourceLanguageID: "en",
+                targetLanguageID: "zh-Hans",
+                sampleInterval: 8..<9
+            ))
+            #expect(rejected == .localOnly(.backpressure))
+            try await requireCoordinatorCondition("caption queue overflow isolates source-a") {
+                let active = await coordinator.activeSourceIDs()
+                let seenFailures = failures.all()
+                return active == ["source-b"]
+                    && seenFailures.count == 1
+                    && seenFailures.first?.0 == "source-a"
+                    && seenFailures.first?.1 == .backpressure
+            }
+
+            #expect(await coordinator.submitAcceptedCaption(RealtimeAcceptedCaptionMetadata(
+                sourceID: "source-b",
+                sourceToken: siblingCapture.source.input.sourceToken,
+                captureGeneration: siblingCapture.source.input.generation,
+                captionID: UUID(),
+                utteranceID: "sibling-after-overflow",
+                sourceLanguageID: "en",
+                targetLanguageID: "zh-Hans",
+                sampleInterval: 0..<1
+            )) == .queued)
+            try offer([9, 0], to: siblingCapture, sampleInterval: 0..<1)
+            try await requireCoordinatorCondition("sibling caption commits after queue overflow") {
+                await bag.all()[1].committedUtterances().count == 1
+            }
+            #expect(await bag.all()[0].committedUtterances().isEmpty)
+            #expect(await bag.all()[1].committedUtterances().first?.utteranceID == "sibling-after-overflow")
+        } catch {
+            deferredError = error
+        }
+        await coordinator.stop()
+        if let deferredError { throw deferredError }
+    }
+
+    @Test func audioCoverageLedgerCapsAt128DisjointRangesAndBackpressuresOnlyThatSource() async throws {
+        let bag = CoordinatorDriverBag()
+        let failures = CoordinatorFailureBag()
+        var settings = NativeRealtimeSettings.default
+        settings.isEnabled = true
+        settings.credentialReference = "fake-ref"
+        settings.enabledSourceIDs = ["source-a", "source-b"]
+        let coordinator = NativeRealtimeSessionCoordinator(
+            credentialStore: RealtimeCredentialStore(
+                backend: CoordinatorCredentialBackend(secret: "fake-secret")
+            ),
+            driverFactory: { _, _, _ in
+                let driver = CoordinatorFakeDriver()
+                bag.append(driver)
+                return driver
+            },
+            sourceFailureHandler: { sourceID, code in failures.append(sourceID, code) }
+        )
+        let firstCapture = makeCoordinatorCapture(sourceID: "source-a", maximumBufferedFrames: 512)
+        let siblingCapture = makeCoordinatorCapture(sourceID: "source-b")
+        let started = await coordinator.start(
+            captures: [firstCapture.source, siblingCapture.source],
+            settings: settings
+        )
+        #expect(started.map(\.sourceID) == ["source-a", "source-b"])
+        guard started.count == 2, bag.all().count == 2 else {
+            await coordinator.stop()
+            throw CoordinatorFixtureError.offerRejected
+        }
+        let firstDriver = bag.all()[0]
+        let siblingDriver = bag.all()[1]
+        var deferredError: Error?
+        do {
+            for index in 0..<128 {
+                let lower = Int64(index * 2)
+                let upper = lower + 1
+                try offer(
+                    [1, 0],
+                    to: firstCapture,
+                    sampleInterval: lower..<upper,
+                    captureTimestampNanoseconds: UInt64(index + 1)
+                )
+                let expectedCount = index + 1
+                try await requireCoordinatorCondition("admitted disjoint audio range \(expectedCount)") {
+                    let chunks = await firstDriver.audioChunks()
+                    let ranges = await coordinator.admittedAudioRangeCountForTesting(sourceID: "source-a")
+                    return chunks.count == expectedCount && ranges == expectedCount
+                }
+            }
+
+            let overflowLower: Int64 = 256
+            try offer(
+                [1, 0],
+                to: firstCapture,
+                sampleInterval: overflowLower..<(overflowLower + 1),
+                captureTimestampNanoseconds: 129
+            )
+            try await requireCoordinatorCondition("129th disjoint range isolates source-a") {
+                let active = await coordinator.activeSourceIDs()
+                let seenFailures = failures.all()
+                return active == ["source-b"]
+                    && seenFailures.count == 1
+                    && seenFailures.first?.0 == "source-a"
+                    && seenFailures.first?.1 == .backpressure
+            }
+            #expect(await firstDriver.audioChunks().count == 129)
+
+            try offer([2, 0], to: siblingCapture, sampleInterval: 0..<1)
+            try await requireCoordinatorCondition("sibling remains usable after ledger overflow") {
+                await siblingDriver.audioChunks().count == 1
+            }
+            #expect(await coordinator.activeSourceIDs() == ["source-b"])
+        } catch {
+            deferredError = error
+        }
+        await coordinator.stop()
+        if let deferredError { throw deferredError }
+    }
+
     @Test func noOptedInCaptureDoesNotLoadCredentialOrCreateDriver() async {
         let backend = CoordinatorCredentialBackend(secret: "fake-secret")
         let bag = CoordinatorDriverBag()
@@ -1757,6 +2807,733 @@ import Testing
         await coordinator.stop()
     }
 
+    @Test func lateSuccessfulOldSendCannotAdmitAudioIntoReplacementCaptionLedger() async throws {
+        let bag = CoordinatorDriverBag()
+        var settings = NativeRealtimeSettings.default
+        settings.isEnabled = true
+        settings.credentialReference = "fake-ref"
+        settings.enabledSourceIDs = ["source-a"]
+        let coordinator = NativeRealtimeSessionCoordinator(
+            credentialStore: RealtimeCredentialStore(
+                backend: CoordinatorCredentialBackend(secret: "fake-secret")
+            ),
+            driverFactory: { _, _, _ in
+                let driver = CoordinatorFakeDriver(suspendSendUntilReleased: bag.all().isEmpty)
+                bag.append(driver)
+                return driver
+            }
+        )
+        let oldCapture = makeCoordinatorCapture(sourceID: "source-a")
+        let oldStarted = await coordinator.start(captures: [oldCapture.source], settings: settings)
+        #expect(oldStarted.count == 1)
+        guard let oldDriver = bag.all().first else {
+            await coordinator.stop()
+            throw CoordinatorFixtureError.offerRejected
+        }
+        let oldCaption = RealtimeAcceptedCaptionMetadata(
+            sourceID: "source-a",
+            sourceToken: oldCapture.source.input.sourceToken,
+            captureGeneration: oldCapture.source.input.generation,
+            captionID: UUID(),
+            utteranceID: "old-lifecycle-caption",
+            sourceLanguageID: "en",
+            targetLanguageID: "zh-Hans",
+            sampleInterval: 0..<1
+        )
+        let removalFinished = CoordinatorCompletionFlag()
+        var removeTask: Task<Void, Never>?
+        var deferredError: Error?
+        do {
+            #expect(await coordinator.submitAcceptedCaption(oldCaption) == .queued)
+            try offer([1, 0], to: oldCapture, sampleInterval: 0..<1)
+            try await requireCoordinatorCondition("old driver send is held") {
+                await oldDriver.isSendSuspended()
+            }
+            removeTask = Task {
+                await coordinator.removeSource(sourceID: "source-a")
+                await removalFinished.markComplete()
+            }
+            try await requireCoordinatorCondition("removal joins held old send") {
+                let stops = await oldDriver.stopInvocationCount()
+                let removed = await removalFinished.hasCompleted()
+                return stops == 1 && !removed
+            }
+            await oldDriver.releaseSendSuccessfully()
+            try await requireCoordinatorCondition("removal completes after old send acknowledgement") {
+                await removalFinished.hasCompleted()
+            }
+            await removeTask?.value
+            #expect(await removalFinished.hasCompleted())
+
+            let newCapture = makeCoordinatorCapture(sourceID: "source-a")
+            let restarted = await coordinator.start(captures: [newCapture.source], settings: settings)
+            #expect(restarted.count == 1)
+            #expect((restarted.first?.generation ?? 0) > (oldStarted.first?.generation ?? 0))
+            let newDriver = bag.all()[1]
+            #expect(await coordinator.submitAcceptedCaption(oldCaption) == .localOnly(.unavailableSource))
+            let newCaption = RealtimeAcceptedCaptionMetadata(
+                sourceID: "source-a",
+                sourceToken: newCapture.source.input.sourceToken,
+                captureGeneration: newCapture.source.input.generation,
+                captionID: UUID(),
+                utteranceID: "new-lifecycle-caption",
+                sourceLanguageID: "en",
+                targetLanguageID: "zh-Hans",
+                sampleInterval: 0..<1
+            )
+            #expect(await coordinator.submitAcceptedCaption(newCaption) == .queued)
+            try offer([2, 0], to: newCapture, sampleInterval: 0..<1)
+            try await requireCoordinatorCondition("new lifecycle commits only its own caption") {
+                await newDriver.committedUtterances().count == 1
+            }
+            #expect(await newDriver.committedUtterances().first?.captionID == newCaption.captionID)
+            #expect(await oldDriver.committedUtterances().isEmpty)
+            #expect(await oldDriver.audioChunks().count == 1)
+            #expect(await newDriver.audioChunks().count == 1)
+        } catch {
+            deferredError = error
+        }
+        await oldDriver.releaseSendSuccessfully()
+        if let removeTask {
+            do {
+                try await requireCoordinatorCondition("removal task joins held old send") {
+                    await removalFinished.hasCompleted()
+                }
+                await removeTask.value
+            } catch {
+                if deferredError == nil { deferredError = error }
+            }
+        }
+        await coordinator.stop()
+        if let deferredError { throw deferredError }
+    }
+
+    @Test func staleProviderEventHeldAcrossRemovalCannotAffectReplacementCapture() async throws {
+        let bag = CoordinatorDriverBag()
+        let events = CoordinatorCaptionEventBag()
+        let deliveryGate = CoordinatorReleaseGate()
+        var settings = NativeRealtimeSettings.default
+        settings.isEnabled = true
+        settings.credentialReference = "fake-ref"
+        settings.enabledSourceIDs = ["source-a"]
+        let coordinator = NativeRealtimeSessionCoordinator(
+            credentialStore: RealtimeCredentialStore(
+                backend: CoordinatorCredentialBackend(secret: "fake-secret")
+            ),
+            driverFactory: { _, _, _ in
+                let driver = CoordinatorFakeDriver()
+                bag.append(driver)
+                return driver
+            }
+        )
+        await coordinator.setCaptionEventHandler { events.append($0) }
+        await coordinator.setBeforeProviderEventDeliveryForTesting {
+            await deliveryGate.suspend()
+        }
+        let oldCapture = makeCoordinatorCapture(sourceID: "source-a")
+        let oldStarted = await coordinator.start(captures: [oldCapture.source], settings: settings)
+        let removalFinished = CoordinatorCompletionFlag()
+        var removeTask: Task<Void, Never>?
+        var deferredError: Error?
+        do {
+            guard oldStarted.count == 1, bag.all().count == 1 else {
+                throw CoordinatorFixtureError.offerRejected
+            }
+            let oldActive = oldStarted[0]
+            let oldDriver = bag.all()[0]
+            try await requireCoordinatorCondition("old event reader subscribes") {
+                await oldDriver.hasEventSubscriber()
+            }
+            let oldCaption = RealtimeAcceptedCaptionMetadata(
+                sourceID: "source-a",
+                sourceToken: oldCapture.source.input.sourceToken,
+                captureGeneration: oldCapture.source.input.generation,
+                captionID: UUID(),
+                utteranceID: "old-held-event",
+                sourceLanguageID: "en",
+                targetLanguageID: "zh-Hans",
+                sampleInterval: 0..<1
+            )
+            #expect(await coordinator.submitAcceptedCaption(oldCaption) == .queued)
+            try offer([1, 0], to: oldCapture, sampleInterval: 0..<1)
+            try await requireCoordinatorCondition("old caption commits before its correction") {
+                await oldDriver.committedUtterances().count == 1
+            }
+            await oldDriver.yieldEvent(.correctedText(
+                sourceAlias: oldActive.alias,
+                generation: oldActive.generation,
+                captionID: oldCaption.captionID,
+                utteranceID: oldCaption.utteranceID,
+                text: "stale correction held before delivery"
+            ))
+            try await requireCoordinatorCondition("old correction is held between stream and actor delivery") {
+                await deliveryGate.hasSuspended()
+            }
+
+            removeTask = Task {
+                await coordinator.removeSource(sourceID: "source-a")
+                await removalFinished.markComplete()
+            }
+            try await requireCoordinatorCondition("removal revokes source while stale event is held") {
+                let active = await coordinator.activeSourceIDs()
+                let stops = await oldDriver.stopInvocationCount()
+                let removed = await removalFinished.hasCompleted()
+                return active.isEmpty && stops == 1 && !removed
+            }
+            #expect(events.all().isEmpty)
+
+            await deliveryGate.resume()
+            try await requireCoordinatorCondition("removal joins the canceled held event reader") {
+                await removalFinished.hasCompleted()
+            }
+            await removeTask?.value
+            #expect(events.all().isEmpty)
+            await coordinator.setBeforeProviderEventDeliveryForTesting(nil)
+
+            let newCapture = makeCoordinatorCapture(sourceID: "source-a")
+            let newStarted = await coordinator.start(captures: [newCapture.source], settings: settings)
+            guard newStarted.count == 1, bag.all().count == 2 else {
+                throw CoordinatorFixtureError.offerRejected
+            }
+            let newActive = newStarted[0]
+            let newDriver = bag.all()[1]
+            let newCaption = RealtimeAcceptedCaptionMetadata(
+                sourceID: "source-a",
+                sourceToken: newCapture.source.input.sourceToken,
+                captureGeneration: newCapture.source.input.generation,
+                captionID: UUID(),
+                utteranceID: "replacement-current-event",
+                sourceLanguageID: "yue",
+                targetLanguageID: "en",
+                sampleInterval: 0..<1
+            )
+            try await requireCoordinatorCondition("replacement event reader subscribes") {
+                await newDriver.hasEventSubscriber()
+            }
+            #expect(await coordinator.submitAcceptedCaption(newCaption) == .queued)
+            try offer([2, 0], to: newCapture, sampleInterval: 0..<1)
+            try await requireCoordinatorCondition("replacement commits its own caption") {
+                await newDriver.committedUtterances().count == 1
+            }
+            await newDriver.yieldEvent(.correctedText(
+                sourceAlias: newActive.alias,
+                generation: newActive.generation,
+                captionID: newCaption.captionID,
+                utteranceID: newCaption.utteranceID,
+                text: "current replacement correction"
+            ))
+            try await requireCoordinatorCondition("replacement event remains deliverable") {
+                events.all().count == 1
+            }
+            let delivered = events.all()[0]
+            #expect(delivered.sourceToken == newCapture.source.input.sourceToken)
+            #expect(delivered.captureGeneration == newCapture.source.input.generation)
+            #expect(delivered.sourceAlias == newActive.alias)
+            #expect(delivered.driverGeneration == newActive.generation)
+            #expect(delivered.captionID == newCaption.captionID)
+            #expect(delivered.utteranceID == newCaption.utteranceID)
+            #expect(delivered.sourceLanguageID == "yue")
+            #expect(delivered.targetLanguageID == "en")
+            #expect(delivered.kind == .correctedText("current replacement correction"))
+        } catch {
+            deferredError = error
+        }
+        await deliveryGate.resume()
+        await coordinator.setBeforeProviderEventDeliveryForTesting(nil)
+        if let removeTask {
+            do {
+                try await requireCoordinatorCondition("held stale-event removal task finishes") {
+                    await removalFinished.hasCompleted()
+                }
+                await removeTask.value
+            } catch {
+                if deferredError == nil { deferredError = error }
+            }
+        }
+        for driver in bag.all() {
+            await driver.releaseSendSuccessfully()
+            await driver.releaseCommitSuccessfully()
+            await driver.releaseSuspendedStop()
+        }
+        await coordinator.stop()
+        if let deferredError { throw deferredError }
+    }
+
+    @Test func eventFailureExpiryAndUnexpectedEndRevokeThenJoinWithoutBlockingSibling() async throws {
+        let cases: [(String, RealtimeFailureCode)] = [
+            ("failure", .rateLimited),
+            ("expired", .sessionExpired),
+            ("unexpected-end", .connectionFailed),
+        ]
+        for (eventKind, expectedFailure) in cases {
+            let bag = CoordinatorDriverBag()
+            let failures = CoordinatorFailureBag()
+            let events = CoordinatorCaptionEventBag()
+            var settings = NativeRealtimeSettings.default
+            settings.isEnabled = true
+            settings.credentialReference = "fake-ref"
+            settings.enabledSourceIDs = ["source-a", "source-b"]
+            let coordinator = NativeRealtimeSessionCoordinator(
+                credentialStore: RealtimeCredentialStore(
+                    backend: CoordinatorCredentialBackend(secret: "fake-secret")
+                ),
+                driverFactory: { _, _, _ in
+                    let driver = CoordinatorFakeDriver(
+                        suspendStopUntilReleased: bag.all().isEmpty
+                    )
+                    bag.append(driver)
+                    return driver
+                },
+                sourceFailureHandler: { sourceID, code in failures.append(sourceID, code) }
+            )
+            await coordinator.setCaptionEventHandler { events.append($0) }
+            let firstCapture = makeCoordinatorCapture(sourceID: "source-a")
+            let siblingCapture = makeCoordinatorCapture(sourceID: "source-b")
+            let started = await coordinator.start(
+                captures: [firstCapture.source, siblingCapture.source],
+                settings: settings
+            )
+            #expect(started.map(\.sourceID) == ["source-a", "source-b"])
+            guard started.count == 2, bag.all().count == 2 else {
+                for driver in bag.all() { await driver.releaseSuspendedStop() }
+                await coordinator.stop()
+                throw CoordinatorFixtureError.offerRejected
+            }
+            let failingDriver = bag.all()[0]
+            let siblingDriver = bag.all()[1]
+            let failingStarted = started[0]
+            let removalFinished = CoordinatorCompletionFlag()
+            var removalTask: Task<Void, Never>?
+            var deferredError: Error?
+            do {
+                try await requireCoordinatorCondition("both event streams subscribed for \(eventKind)") {
+                    let first = await failingDriver.hasEventSubscriber()
+                    let second = await siblingDriver.hasEventSubscriber()
+                    return first && second
+                }
+                switch eventKind {
+                case "failure":
+                    await failingDriver.yieldEvent(.failure(
+                        sourceAlias: failingStarted.alias,
+                        generation: failingStarted.generation,
+                        expectedFailure
+                    ))
+                case "expired":
+                    await failingDriver.yieldEvent(.expired(
+                        sourceAlias: failingStarted.alias,
+                        generation: failingStarted.generation
+                    ))
+                default:
+                    await failingDriver.finishEvents()
+                }
+                try await requireCoordinatorCondition("event failure revokes source and holds its stop for \(eventKind)") {
+                    let stopHeld = await failingDriver.isStopSuspended()
+                    let active = await coordinator.activeSourceIDs()
+                    let seenFailures = failures.all()
+                    return stopHeld
+                        && active == ["source-b"]
+                        && seenFailures.count == 1
+                        && seenFailures.first?.0 == "source-a"
+                        && seenFailures.first?.1 == expectedFailure
+                }
+
+                removalTask = Task {
+                    await coordinator.removeSource(sourceID: "source-a")
+                    await removalFinished.markComplete()
+                }
+                let siblingCaption = RealtimeAcceptedCaptionMetadata(
+                    sourceID: "source-b",
+                    sourceToken: siblingCapture.source.input.sourceToken,
+                    captureGeneration: siblingCapture.source.input.generation,
+                    captionID: UUID(),
+                    utteranceID: "sibling-after-\(eventKind)",
+                    sourceLanguageID: "en",
+                    targetLanguageID: "zh-Hans",
+                    sampleInterval: 0..<1
+                )
+                #expect(await coordinator.submitAcceptedCaption(siblingCaption) == .queued)
+                try offer([8, 0], to: siblingCapture, sampleInterval: 0..<1)
+                try await requireCoordinatorCondition("healthy sibling commits during held failed-source stop") {
+                    await siblingDriver.committedUtterances().count == 1
+                }
+                #expect(await removalFinished.hasCompleted() == false)
+                #expect(events.all().isEmpty)
+
+                await failingDriver.releaseSuspendedStop()
+                try await requireCoordinatorCondition("removal joins event reader after stop release") {
+                    await removalFinished.hasCompleted()
+                }
+                await removalTask?.value
+                #expect(await coordinator.activeSourceIDs() == ["source-b"])
+            } catch {
+                deferredError = error
+            }
+
+            await failingDriver.releaseSuspendedStop()
+            if let removalTask {
+                do {
+                    try await requireCoordinatorCondition("failed-source removal task terminates for \(eventKind)") {
+                        await removalFinished.hasCompleted()
+                    }
+                    await removalTask.value
+                } catch {
+                    if deferredError == nil { deferredError = error }
+                }
+            }
+            await coordinator.stop()
+            if let deferredError { throw deferredError }
+        }
+    }
+
+    @Test func seenCaptionIdentitiesStayBoundedAndCommittedFrontierRejectsEvictedOldSpan() async throws {
+        let bag = CoordinatorDriverBag()
+        let events = CoordinatorCaptionEventBag()
+        var settings = NativeRealtimeSettings.default
+        settings.isEnabled = true
+        settings.credentialReference = "fake-ref"
+        settings.enabledSourceIDs = ["source-a"]
+        let coordinator = NativeRealtimeSessionCoordinator(
+            credentialStore: RealtimeCredentialStore(
+                backend: CoordinatorCredentialBackend(secret: "fake-secret")
+            ),
+            driverFactory: { _, _, _ in
+                let driver = CoordinatorFakeDriver()
+                bag.append(driver)
+                return driver
+            }
+        )
+        await coordinator.setCaptionEventHandler { events.append($0) }
+        let capture = makeCoordinatorCapture(sourceID: "source-a")
+        let started = await coordinator.start(captures: [capture.source], settings: settings)
+        #expect(started.count == 1)
+        guard let driver = bag.all().first, let active = started.first else {
+            await coordinator.stop()
+            throw CoordinatorFixtureError.offerRejected
+        }
+        var evictedCandidate: RealtimeAcceptedCaptionMetadata?
+        var deferredError: Error?
+        do {
+            try await requireCoordinatorCondition("caption event reader subscribed before identity loop") {
+                await driver.hasEventSubscriber()
+            }
+            for index in 0..<129 {
+                let lower = Int64(index)
+                let metadata = RealtimeAcceptedCaptionMetadata(
+                    sourceID: "source-a",
+                    sourceToken: capture.source.input.sourceToken,
+                    captureGeneration: capture.source.input.generation,
+                    captionID: UUID(),
+                    utteranceID: "bounded-\(index)",
+                    sourceLanguageID: "en",
+                    targetLanguageID: "zh-Hans",
+                    sampleInterval: lower..<(lower + 1)
+                )
+                if index == 0 { evictedCandidate = metadata }
+                #expect(await coordinator.submitAcceptedCaption(metadata) == .queued)
+                try offer(
+                    [1, 0],
+                    to: capture,
+                    sampleInterval: lower..<(lower + 1),
+                    captureTimestampNanoseconds: UInt64(index + 1)
+                )
+                let expectedCount = index + 1
+                try await requireCoordinatorCondition("caption \(expectedCount) commits in FIFO order") {
+                    let attempts = await driver.commitInvocationCount()
+                    let commits = await driver.committedUtterances()
+                    return attempts == expectedCount && commits.count == expectedCount
+                }
+                let committed = await driver.committedUtterances().last
+                #expect(committed?.utteranceID == metadata.utteranceID)
+                await driver.yieldEvent(.utteranceCompleted(
+                    sourceAlias: active.alias,
+                    generation: active.generation,
+                    captionID: metadata.captionID,
+                    utteranceID: metadata.utteranceID
+                ))
+                try await requireCoordinatorCondition("caption \(expectedCount) exact terminal processed") {
+                    events.all().count == expectedCount
+                }
+            }
+            #expect(await coordinator.seenCaptionIdentityCountForTesting(sourceID: "source-a") == 128)
+            guard let evictedCandidate else { throw CoordinatorFixtureError.offerRejected }
+            #expect(await coordinator.submitAcceptedCaption(evictedCandidate) == .localOnly(.consumedAudio))
+            #expect(await coordinator.submitAcceptedCaption(RealtimeAcceptedCaptionMetadata(
+                sourceID: "source-a",
+                sourceToken: capture.source.input.sourceToken,
+                captureGeneration: capture.source.input.generation,
+                captionID: UUID(),
+                utteranceID: "evicted-old-span",
+                sourceLanguageID: "en",
+                targetLanguageID: "zh-Hans",
+                sampleInterval: 0..<1
+            )) == .localOnly(.consumedAudio))
+            #expect(await driver.commitInvocationCount() == 129)
+            #expect(await coordinator.seenCaptionIdentityCountForTesting(sourceID: "source-a") == 128)
+        } catch {
+            deferredError = error
+        }
+        await coordinator.stop()
+        if let deferredError { throw deferredError }
+    }
+
+    @Test func interleavedSourcesKeepStartupQueueCorrectionsAndTerminalIdentityIsolated() async throws {
+        let bag = CoordinatorDriverBag()
+        let events = CoordinatorCaptionEventBag()
+        var settings = NativeRealtimeSettings.default
+        settings.isEnabled = true
+        settings.credentialReference = "fake-ref"
+        settings.enabledSourceIDs = ["source-a", "source-b"]
+        let coordinator = NativeRealtimeSessionCoordinator(
+            credentialStore: RealtimeCredentialStore(
+                backend: CoordinatorCredentialBackend(secret: "fake-secret")
+            ),
+            driverFactory: { _, _, _ in
+                let driver = CoordinatorFakeDriver(
+                    suspendStartUntilStop: bag.all().isEmpty
+                )
+                bag.append(driver)
+                return driver
+            }
+        )
+        await coordinator.setCaptionEventHandler { events.append($0) }
+        let firstCapture = makeCoordinatorCapture(sourceID: "source-a")
+        let secondCapture = makeCoordinatorCapture(sourceID: "source-b")
+        let startFinished = CoordinatorCompletionFlag()
+        let startTask = Task {
+            let started = await coordinator.start(
+                captures: [firstCapture.source, secondCapture.source],
+                settings: settings
+            )
+            await startFinished.markComplete()
+            return started
+        }
+        var deferredError: Error?
+        do {
+            try await requireCoordinatorCondition("source-a setup held while source-b becomes ready") {
+                guard bag.all().count == 2 else { return false }
+                let first = bag.all()[0]
+                let second = bag.all()[1]
+                let firstHeld = await first.isStartSuspended()
+                let secondStarted = await second.successfulStartCount() == 1
+                let active = await coordinator.activeSourceIDs()
+                return firstHeld && secondStarted && active == ["source-b"]
+            }
+            guard bag.all().count == 2 else { throw CoordinatorFixtureError.offerRejected }
+            let firstDriver = bag.all()[0]
+            let secondDriver = bag.all()[1]
+
+            let firstCaptions = [
+                RealtimeAcceptedCaptionMetadata(
+                    sourceID: "source-a",
+                    sourceToken: firstCapture.source.input.sourceToken,
+                    captureGeneration: firstCapture.source.input.generation,
+                    captionID: UUID(),
+                    utteranceID: "a-first",
+                    sourceLanguageID: "en",
+                    targetLanguageID: "zh-Hans",
+                    sampleInterval: 0..<1
+                ),
+                RealtimeAcceptedCaptionMetadata(
+                    sourceID: "source-a",
+                    sourceToken: firstCapture.source.input.sourceToken,
+                    captureGeneration: firstCapture.source.input.generation,
+                    captionID: UUID(),
+                    utteranceID: "a-second",
+                    sourceLanguageID: "en",
+                    targetLanguageID: "zh-Hans",
+                    sampleInterval: 1..<2
+                ),
+            ]
+            let siblingCaptions = [
+                RealtimeAcceptedCaptionMetadata(
+                    sourceID: "source-b",
+                    sourceToken: secondCapture.source.input.sourceToken,
+                    captureGeneration: secondCapture.source.input.generation,
+                    captionID: UUID(),
+                    utteranceID: "b-first",
+                    sourceLanguageID: "yue",
+                    targetLanguageID: "en",
+                    sampleInterval: 0..<1
+                ),
+                RealtimeAcceptedCaptionMetadata(
+                    sourceID: "source-b",
+                    sourceToken: secondCapture.source.input.sourceToken,
+                    captureGeneration: secondCapture.source.input.generation,
+                    captionID: UUID(),
+                    utteranceID: "b-second",
+                    sourceLanguageID: "yue",
+                    targetLanguageID: "en",
+                    sampleInterval: 1..<2
+                ),
+            ]
+            for caption in firstCaptions + siblingCaptions {
+                #expect(await coordinator.submitAcceptedCaption(caption) == .queued)
+            }
+            try offer([1, 0, 2, 0], to: firstCapture, sampleInterval: 0..<2, captureTimestampNanoseconds: 101)
+            try offer([3, 0, 4, 0], to: secondCapture, sampleInterval: 0..<2, captureTimestampNanoseconds: 202)
+
+            try await requireCoordinatorCondition("ready source-b delivers its first caption before source-a setup") {
+                let attempts = await secondDriver.commitInvocationCount()
+                let commits = await secondDriver.committedUtterances()
+                let subscribed = await secondDriver.hasEventSubscriber()
+                return attempts == 1 && commits.count == 1 && subscribed
+            }
+            #expect(await firstDriver.sendInvocationCount() == 0)
+            #expect(await startFinished.hasCompleted() == false)
+            let bFirstCommit = await secondDriver.committedUtterances()[0]
+            await secondDriver.yieldEvent(.correctedText(
+                sourceAlias: bFirstCommit.sourceAlias,
+                generation: bFirstCommit.generation,
+                captionID: bFirstCommit.captionID,
+                utteranceID: bFirstCommit.utteranceID,
+                text: "b first corrected"
+            ))
+            try await requireCoordinatorCondition("source-b first correction is delivered locally") {
+                events.all().count == 1
+            }
+            await secondDriver.yieldEvent(.utteranceCompleted(
+                sourceAlias: bFirstCommit.sourceAlias,
+                generation: bFirstCommit.generation,
+                captionID: bFirstCommit.captionID,
+                utteranceID: bFirstCommit.utteranceID
+            ))
+            try await requireCoordinatorCondition("source-b exact terminal releases its second caption") {
+                await secondDriver.commitInvocationCount() == 2
+            }
+            let bSecondCommit = await secondDriver.committedUtterances()[1]
+            await secondDriver.yieldEvent(.correctedText(
+                sourceAlias: bSecondCommit.sourceAlias,
+                generation: bSecondCommit.generation,
+                captionID: firstCaptions[0].captionID,
+                utteranceID: firstCaptions[0].utteranceID,
+                text: "cross-source stale correction"
+            ))
+            await secondDriver.yieldEvent(.correctedText(
+                sourceAlias: bSecondCommit.sourceAlias,
+                generation: bSecondCommit.generation,
+                captionID: bSecondCommit.captionID,
+                utteranceID: bSecondCommit.utteranceID,
+                text: "b second corrected"
+            ))
+            try await requireCoordinatorCondition("source-b second exact correction ignores source-a identity") {
+                events.all().count == 3
+            }
+            await secondDriver.yieldEvent(.utteranceCompleted(
+                sourceAlias: bSecondCommit.sourceAlias,
+                generation: bSecondCommit.generation,
+                captionID: bSecondCommit.captionID,
+                utteranceID: bSecondCommit.utteranceID
+            ))
+            try await requireCoordinatorCondition("source-b terminal delivered before releasing source-a setup") {
+                events.all().count == 4
+            }
+            #expect(await startFinished.hasCompleted() == false)
+            #expect(events.all()[0].sourceID == "source-b")
+            #expect(events.all()[0].sourceLanguageID == "yue")
+            #expect(events.all()[0].targetLanguageID == "en")
+            #expect(events.all()[0].kind == .correctedText("b first corrected"))
+            #expect(events.all()[2].captionID == siblingCaptions[1].captionID)
+            #expect(events.all()[2].kind == .correctedText("b second corrected"))
+            #expect(events.all()[3].kind == .utteranceCompleted)
+
+            await firstDriver.releaseStartSuccessfully()
+            try await requireCoordinatorCondition("source-a setup release activates its independent readers") {
+                await startFinished.hasCompleted()
+            }
+            let started = await startTask.value
+            #expect(started.map(\.sourceID) == ["source-a", "source-b"])
+            try await requireCoordinatorCondition("source-a first caption waits for its own audio admission") {
+                let attempts = await firstDriver.commitInvocationCount()
+                let commits = await firstDriver.committedUtterances()
+                let subscribed = await firstDriver.hasEventSubscriber()
+                return attempts == 1 && commits.count == 1 && subscribed
+            }
+            let aFirstCommit = await firstDriver.committedUtterances()[0]
+            #expect(aFirstCommit.captionID == firstCaptions[0].captionID)
+            #expect(aFirstCommit.startMonotonicNanoseconds == 0)
+            #expect(aFirstCommit.endMonotonicNanoseconds == 62_500)
+            await firstDriver.yieldEvent(.correctedText(
+                sourceAlias: aFirstCommit.sourceAlias,
+                generation: aFirstCommit.generation,
+                captionID: aFirstCommit.captionID,
+                utteranceID: aFirstCommit.utteranceID,
+                text: "a first corrected"
+            ))
+            try await requireCoordinatorCondition("source-a first exact correction is delivered") {
+                events.all().count == 5
+            }
+            await firstDriver.yieldEvent(.utteranceCompleted(
+                sourceAlias: aFirstCommit.sourceAlias,
+                generation: aFirstCommit.generation,
+                captionID: aFirstCommit.captionID,
+                utteranceID: aFirstCommit.utteranceID
+            ))
+            try await requireCoordinatorCondition("source-a first terminal releases its second caption") {
+                await firstDriver.commitInvocationCount() == 2
+            }
+            let aSecondCommit = await firstDriver.committedUtterances()[1]
+            await firstDriver.yieldEvent(.correctedText(
+                sourceAlias: aSecondCommit.sourceAlias,
+                generation: aSecondCommit.generation,
+                captionID: aFirstCommit.captionID,
+                utteranceID: aFirstCommit.utteranceID,
+                text: "late source-a first correction"
+            ))
+            await firstDriver.yieldEvent(.correctedText(
+                sourceAlias: aSecondCommit.sourceAlias,
+                generation: aSecondCommit.generation,
+                captionID: aSecondCommit.captionID,
+                utteranceID: aSecondCommit.utteranceID,
+                text: "a second corrected"
+            ))
+            try await requireCoordinatorCondition("source-a second correction ignores prior utterance") {
+                events.all().count == 7
+            }
+            await firstDriver.yieldEvent(.utteranceCompleted(
+                sourceAlias: aSecondCommit.sourceAlias,
+                generation: aSecondCommit.generation,
+                captionID: aSecondCommit.captionID,
+                utteranceID: aSecondCommit.utteranceID
+            ))
+            try await requireCoordinatorCondition("all source-a captions complete in FIFO order") {
+                events.all().count == 8
+            }
+            let delivered = events.all()
+            #expect(delivered.map(\.sourceID) == ["source-b", "source-b", "source-b", "source-b", "source-a", "source-a", "source-a", "source-a"])
+            #expect(delivered.map(\.captionID) == [
+                siblingCaptions[0].captionID,
+                siblingCaptions[0].captionID,
+                siblingCaptions[1].captionID,
+                siblingCaptions[1].captionID,
+                firstCaptions[0].captionID,
+                firstCaptions[0].captionID,
+                firstCaptions[1].captionID,
+                firstCaptions[1].captionID,
+            ])
+            #expect(delivered.map(\.sourceLanguageID) == ["yue", "yue", "yue", "yue", "en", "en", "en", "en"])
+            #expect(delivered.map(\.targetLanguageID) == ["en", "en", "en", "en", "zh-Hans", "zh-Hans", "zh-Hans", "zh-Hans"])
+            let aCommits = await firstDriver.committedUtterances()
+            let bCommits = await secondDriver.committedUtterances()
+            #expect(aCommits.map(\.utteranceID) == ["a-first", "a-second"])
+            #expect(aCommits.map(\.startMonotonicNanoseconds) == [0, 62_500])
+            #expect(aCommits.map(\.sourceAlias) == ["audio-1", "audio-1"])
+            #expect(bCommits.map(\.utteranceID) == ["b-first", "b-second"])
+            #expect(bCommits.map(\.startMonotonicNanoseconds) == [0, 62_500])
+            #expect(bCommits.map(\.sourceAlias) == ["audio-2", "audio-2"])
+        } catch {
+            deferredError = error
+        }
+        for driver in bag.all() {
+            await driver.releaseStartSuccessfully()
+            await driver.releaseSendSuccessfully()
+            await driver.releaseCommitSuccessfully()
+            await driver.releaseSuspendedStop()
+        }
+        await coordinator.stop()
+        _ = await startTask.value
+        if let deferredError { throw deferredError }
+    }
+
     @Test func stopRevokesDriverWhoseStartupIsStillSuspended() async throws {
         let bag = CoordinatorDriverBag()
         var settings = NativeRealtimeSettings.default
@@ -1894,7 +3671,7 @@ import Testing
             driverFactory: { _, _, _ in
                 let driver = CoordinatorFakeDriver(
                     sendFailure: .backpressure,
-                    suspendFirstStopUntilSecondCall: true
+                    suspendStopUntilReleased: true
                 )
                 bag.append(driver)
                 return driver
@@ -1905,12 +3682,32 @@ import Testing
         _ = await coordinator.start(captures: [capture.source], settings: settings)
         let driver = bag.all()[0]
         try offer([1, 0], to: capture)
-        try await waitForCoordinatorCondition { await driver.stopInvocationCount() == 1 }
-
-        await coordinator.removeSource(sourceID: "source-a")
-
-        #expect(await coordinator.activeSourceIDs().isEmpty)
-        #expect(failures.all().isEmpty)
+        var removeTask: Task<Void, Never>?
+        var deferredError: Error?
+        do {
+            try await requireCoordinatorCondition("first shared stop suspension") {
+                let stopCount = await driver.stopInvocationCount()
+                let isSuspended = await driver.isStopSuspended()
+                return stopCount == 1 && isSuspended
+            }
+            #expect(await coordinator.audioFailureReportPendingForTesting(sourceID: "source-a"))
+            removeTask = Task { await coordinator.removeSource(sourceID: "source-a") }
+            try await requireCoordinatorCondition("removal revokes pending audio failure") {
+                !(await coordinator.audioFailureReportPendingForTesting(sourceID: "source-a"))
+            }
+            #expect(failures.all().isEmpty)
+            await driver.releaseSuspendedStop()
+            await removeTask?.value
+            await coordinator.waitForAudioFailureReportTasksForTesting()
+            #expect(await coordinator.activeSourceIDs().isEmpty)
+            #expect(failures.all().isEmpty)
+        } catch {
+            deferredError = error
+        }
+        await driver.releaseSuspendedStop()
+        await removeTask?.value
+        await coordinator.stop()
+        if let deferredError { throw deferredError }
     }
 }
 
@@ -2103,6 +3900,43 @@ private final class CoordinatorFailureBag: @unchecked Sendable {
     }
 }
 
+private final class CoordinatorCaptionDispositionBag: @unchecked Sendable {
+    private let lock = NSLock()
+    private var results: [(RealtimeAcceptedCaptionMetadata, RealtimeCaptionSubmissionDisposition)] = []
+
+    func append(
+        _ metadata: RealtimeAcceptedCaptionMetadata,
+        _ disposition: RealtimeCaptionSubmissionDisposition
+    ) {
+        lock.lock()
+        results.append((metadata, disposition))
+        lock.unlock()
+    }
+
+    func all() -> [(metadata: RealtimeAcceptedCaptionMetadata, disposition: RealtimeCaptionSubmissionDisposition)] {
+        lock.lock()
+        defer { lock.unlock() }
+        return results.map { (metadata: $0.0, disposition: $0.1) }
+    }
+}
+
+private final class CoordinatorCaptionEventBag: @unchecked Sendable {
+    private let lock = NSLock()
+    private var events: [RealtimeCaptionEventEnvelope] = []
+
+    func append(_ event: RealtimeCaptionEventEnvelope) {
+        lock.lock()
+        events.append(event)
+        lock.unlock()
+    }
+
+    func all() -> [RealtimeCaptionEventEnvelope] {
+        lock.lock()
+        defer { lock.unlock() }
+        return events
+    }
+}
+
 private actor CoordinatorCompletionFlag {
     private var completed = false
 
@@ -2156,20 +3990,27 @@ private actor CoordinatorFakeDriver: RealtimeSessionDriving {
     private let startFailure: Bool
     private let sendFailure: RealtimeFailureCode?
     private let suspendSendUntilStop: Bool
+    private var shouldSuspendSendUntilReleased: Bool
+    private var shouldSuspendCommitUntilReleased: Bool
     private let suspendStartUntilStop: Bool
     private let stopReleasesStart: Bool
     private let suspendFirstStopUntilSecondCall: Bool
     private let suspendStopUntilReleased: Bool
     private let factoryEnabledSourceIDs: [String]
     private var receivedAudio: [RealtimeAudioChunk] = []
+    private var receivedUtterances: [RealtimeUtterance] = []
+    private var eventContinuation: AsyncStream<RealtimeProviderEvent>.Continuation?
+    private var didStop = false
     private var startContinuation: CheckedContinuation<Void, any Error>?
     private var sendContinuation: CheckedContinuation<Void, any Error>?
+    private var commitContinuation: CheckedContinuation<RealtimeFailureCode?, Never>?
     private var stopContinuation: CheckedContinuation<Void, Never>?
     private var explicitlySuspendedStopContinuations: [CheckedContinuation<Void, Never>] = []
     private var hasReleasedExplicitStop = false
     private var startInvocationCountStorage = 0
     private var successfulStartCountStorage = 0
     private var sendInvocationCountStorage = 0
+    private var commitInvocationCountStorage = 0
     private var stopInvocationCountStorage = 0
     private var didCompleteStartStorage = false
     private var postStartResultStopCountStorage = 0
@@ -2178,6 +4019,8 @@ private actor CoordinatorFakeDriver: RealtimeSessionDriving {
         startFailure: Bool = false,
         sendFailure: RealtimeFailureCode? = nil,
         suspendSendUntilStop: Bool = false,
+        suspendSendUntilReleased: Bool = false,
+        suspendCommitUntilReleased: Bool = false,
         suspendStartUntilStop: Bool = false,
         stopReleasesStart: Bool = true,
         suspendFirstStopUntilSecondCall: Bool = false,
@@ -2187,6 +4030,8 @@ private actor CoordinatorFakeDriver: RealtimeSessionDriving {
         self.startFailure = startFailure
         self.sendFailure = sendFailure
         self.suspendSendUntilStop = suspendSendUntilStop
+        self.shouldSuspendSendUntilReleased = suspendSendUntilReleased
+        self.shouldSuspendCommitUntilReleased = suspendCommitUntilReleased
         self.suspendStartUntilStop = suspendStartUntilStop
         self.stopReleasesStart = stopReleasesStart
         self.suspendFirstStopUntilSecondCall = suspendFirstStopUntilSecondCall
@@ -2216,13 +4061,14 @@ private actor CoordinatorFakeDriver: RealtimeSessionDriving {
     func postStartResultStopCount() -> Int { postStartResultStopCountStorage }
     func isSendSuspended() -> Bool { sendContinuation != nil }
     func releaseSendSuccessfully() {
+        shouldSuspendSendUntilReleased = false
         guard let continuation = sendContinuation else { return }
         sendContinuation = nil
         continuation.resume()
     }
     func sendAudioChunk(_ chunk: RealtimeAudioChunk) async throws {
         sendInvocationCountStorage += 1
-        if suspendSendUntilStop {
+        if shouldSuspendSendUntilReleased || suspendSendUntilStop {
             try await withCheckedThrowingContinuation { continuation in
                 sendContinuation = continuation
             }
@@ -2230,18 +4076,61 @@ private actor CoordinatorFakeDriver: RealtimeSessionDriving {
         if let sendFailure { throw sendFailure }
         receivedAudio.append(chunk)
     }
-    func commit(_ utterance: RealtimeUtterance) async throws {}
+    func commit(_ utterance: RealtimeUtterance) async throws {
+        commitInvocationCountStorage += 1
+        if shouldSuspendCommitUntilReleased {
+            shouldSuspendCommitUntilReleased = false
+            let failure = await withCheckedContinuation { continuation in
+                commitContinuation = continuation
+            }
+            if let failure { throw failure }
+        }
+        receivedUtterances.append(utterance)
+    }
+    func commitInvocationCount() -> Int { commitInvocationCountStorage }
+    func isCommitSuspended() -> Bool { commitContinuation != nil }
+    func releaseCommitSuccessfully() {
+        shouldSuspendCommitUntilReleased = false
+        let continuation = commitContinuation
+        commitContinuation = nil
+        continuation?.resume(returning: nil)
+    }
+    func releaseCommitFailure(_ failure: RealtimeFailureCode) {
+        shouldSuspendCommitUntilReleased = false
+        let continuation = commitContinuation
+        commitContinuation = nil
+        continuation?.resume(returning: failure)
+    }
     func sendVideoFrame(_ frame: RealtimeVideoFrame) async throws {}
     func revokeVideoPermission() async {}
-    func events() async -> AsyncStream<RealtimeProviderEvent> { AsyncStream { _ in } }
+    func events() async -> AsyncStream<RealtimeProviderEvent> {
+        AsyncStream { continuation in
+            if didStop {
+                continuation.finish()
+            } else {
+                eventContinuation = continuation
+            }
+        }
+    }
+    func yieldEvent(_ event: RealtimeProviderEvent) {
+        eventContinuation?.yield(event)
+    }
+    func hasEventSubscriber() -> Bool { eventContinuation != nil }
+    func finishEvents() {
+        let continuation = eventContinuation
+        eventContinuation = nil
+        continuation?.finish()
+    }
     func stop() async {
         stopInvocationCountStorage += 1
+        didStop = true
+        finishEvents()
         if didCompleteStartStorage { postStartResultStopCountStorage += 1 }
         if stopReleasesStart, let continuation = startContinuation {
             startContinuation = nil
             continuation.resume(throwing: RealtimeFailureCode.connectionFailed)
         }
-        if let continuation = sendContinuation {
+        if !shouldSuspendSendUntilReleased, let continuation = sendContinuation {
             sendContinuation = nil
             continuation.resume(throwing: RealtimeFailureCode.connectionFailed)
         }
@@ -2259,6 +4148,7 @@ private actor CoordinatorFakeDriver: RealtimeSessionDriving {
         }
     }
     func audioChunks() -> [RealtimeAudioChunk] { receivedAudio }
+    func committedUtterances() -> [RealtimeUtterance] { receivedUtterances }
     func sendInvocationCount() -> Int { sendInvocationCountStorage }
     func startInvocationCount() -> Int { startInvocationCountStorage }
     func stopInvocationCount() -> Int { stopInvocationCountStorage }

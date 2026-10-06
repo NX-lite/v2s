@@ -1816,6 +1816,8 @@ private actor IntegrationNativeRealtimeDriver: RealtimeSessionDriving {
     private var stopInvocationCountStorage = 0
     private var shouldSuspendNextStop = false
     private var stopContinuation: CheckedContinuation<Void, Never>?
+    private var eventContinuation: AsyncStream<RealtimeProviderEvent>.Continuation?
+    private var didStop = false
 
     func start(sourceAlias: String, generation: Int) async throws {
         startRecordsStorage.append((sourceAlias, generation))
@@ -1827,10 +1829,20 @@ private actor IntegrationNativeRealtimeDriver: RealtimeSessionDriving {
     func sendVideoFrame(_ frame: RealtimeVideoFrame) async throws {}
     func revokeVideoPermission() async {}
     func events() async -> AsyncStream<RealtimeProviderEvent> {
-        AsyncStream { continuation in continuation.finish() }
+        AsyncStream { continuation in
+            if didStop {
+                continuation.finish()
+            } else {
+                eventContinuation = continuation
+            }
+        }
     }
     func stop() async {
         stopInvocationCountStorage += 1
+        didStop = true
+        let eventContinuation = self.eventContinuation
+        self.eventContinuation = nil
+        eventContinuation?.finish()
         guard shouldSuspendNextStop else { return }
         shouldSuspendNextStop = false
         await withCheckedContinuation { continuation in

@@ -103,6 +103,53 @@ struct RealtimeUtterance: Equatable, Sendable {
     }
 }
 
+struct RealtimeAcceptedCaptionMetadata: Equatable, Sendable {
+    let sourceID: String
+    let sourceToken: UUID
+    let captureGeneration: UInt64
+    let captionID: UUID
+    let utteranceID: String
+    let sourceLanguageID: String
+    let targetLanguageID: String
+    let sampleInterval: NormalizedAudioSampleInterval?
+}
+
+enum RealtimeCaptionLocalOnlyReason: Equatable, Sendable {
+    case unavailableSource
+    case invalidMetadata
+    case missingProvenance
+    case duplicateIdentity
+    case outOfOrderInterval
+    case queueFull
+    case missingAudioCoverage
+    case consumedAudio
+    case backpressure
+}
+
+enum RealtimeCaptionSubmissionDisposition: Equatable, Sendable {
+    case queued
+    case localOnly(RealtimeCaptionLocalOnlyReason)
+}
+
+enum RealtimeCaptionEventKind: Equatable, Sendable {
+    case correctedText(String)
+    case suggestion(String)
+    case utteranceCompleted
+}
+
+struct RealtimeCaptionEventEnvelope: Equatable, Sendable {
+    let sourceID: String
+    let sourceToken: UUID
+    let captureGeneration: UInt64
+    let sourceAlias: String
+    let driverGeneration: Int
+    let captionID: UUID
+    let utteranceID: String
+    let sourceLanguageID: String
+    let targetLanguageID: String
+    let kind: RealtimeCaptionEventKind
+}
+
 enum RealtimeFailureCode: String, Error, Equatable, Sendable {
     case invalidConfiguration
     case permissionDenied
