@@ -41,6 +41,8 @@ actor NativeRealtimeSessionCoordinator {
         RealtimeAcceptedCaptionMetadata,
         RealtimeCaptionSubmissionDisposition
     ) -> Void
+    typealias CaptureRegistrationHandler = @Sendable (RealtimeCaptureRegistration) -> Void
+    typealias SourceReadyHandler = @Sendable (RealtimeSourceReadyIdentity) -> Void
 
     private struct RunningSource {
         let capture: NativeRealtimeCaptureSource
@@ -128,6 +130,8 @@ actor NativeRealtimeSessionCoordinator {
     private var sourceFailureHandlerGeneration = 0
     private var captionEventHandler: CaptionEventHandler = { _ in }
     private var captionDispositionHandler: CaptionDispositionHandler = { _, _ in }
+    private var captureRegistrationHandler: CaptureRegistrationHandler = { _ in }
+    private var sourceReadyHandler: SourceReadyHandler = { _ in }
     #if DEBUG
     private var beforeCancellationCleanupForTesting: (@Sendable () async -> Void)?
     private var beforeInputDidFinishForTesting: (@Sendable () async -> Void)?
@@ -175,6 +179,14 @@ actor NativeRealtimeSessionCoordinator {
         captionDispositionHandler = handler
     }
 
+    func setCaptureRegistrationHandler(_ handler: @escaping CaptureRegistrationHandler) {
+        captureRegistrationHandler = handler
+    }
+
+    func setSourceReadyHandler(_ handler: @escaping SourceReadyHandler) {
+        sourceReadyHandler = handler
+    }
+
     #if DEBUG
     func stashedCaptionEventsForTesting(sourceID: String, captionID: UUID) -> Int {
         guard let state = captionSourcesByID[sourceID],
@@ -189,11 +201,29 @@ actor NativeRealtimeSessionCoordinator {
     func seenCaptionIdentityCountForTesting(sourceID: String) -> Int {
         captionSourcesByID[sourceID]?.seen.count ?? 0
     }
+
+    func acceptedCaptionMetadataForTesting(sourceID: String) -> RealtimeAcceptedCaptionMetadata? {
+        guard let state = captionSourcesByID[sourceID] else { return nil }
+        return state.inFlight ?? state.queued.first
+    }
+
+    func inFlightCaptionIDForTesting(sourceID: String) -> UUID? {
+        captionSourcesByID[sourceID]?.inFlight?.captionID
+    }
+
+    func captionCommitSucceededForTesting(sourceID: String, captionID: UUID) -> Bool {
+        guard let state = captionSourcesByID[sourceID],
+              state.inFlight?.captionID == captionID else { return false }
+        return state.commitSucceeded
+    }
     #endif
 
     func submitAcceptedCaption(
         _ metadata: RealtimeAcceptedCaptionMetadata
     ) -> RealtimeCaptionSubmissionDisposition {
+        guard !Task.isCancelled else {
+            return .localOnly(.unavailableSource)
+        }
         guard Self.hasValidTextIdentity(metadata) else {
             return .localOnly(.invalidMetadata)
         }
@@ -212,7 +242,9 @@ actor NativeRealtimeSessionCoordinator {
               runningSources[metadata.sourceID]?.lease.isActive != false else {
             return .localOnly(.unavailableSource)
         }
-
+        guard interval.lowerBound >= capture.input.firstAvailableSampleIndex else {
+            return .localOnly(.missingAudioCoverage)
+        }
         var state = captionSourcesByID[metadata.sourceID] ?? CaptionSourceState(
             sourceToken: metadata.sourceToken,
             captureGeneration: metadata.captureGeneration
@@ -602,6 +634,13 @@ actor NativeRealtimeSessionCoordinator {
             optedIn.map { ($0.sourceID, $0) },
             uniquingKeysWith: { first, _ in first }
         )
+        for capture in optedIn {
+            captureRegistrationHandler(RealtimeCaptureRegistration(
+                sourceID: capture.sourceID,
+                sourceToken: capture.input.sourceToken,
+                captureGeneration: capture.input.generation
+            ))
+        }
         removedSourceIDsDuringStartup.removeAll()
         let finishObservers = optedIn.filter { !inputsAreInvalid && !$0.input.isConsumed }.map { capture in
             Task { [weak self] in
@@ -932,6 +971,13 @@ actor NativeRealtimeSessionCoordinator {
             eventReader: eventReader,
             captionPump: nil
         )
+        sourceReadyHandler(RealtimeSourceReadyIdentity(
+            sourceID: sourceID,
+            sourceToken: capture.input.sourceToken,
+            captureGeneration: capture.input.generation,
+            alias: reservation.alias,
+            driverGeneration: reservation.generation
+        ))
         pumpCaption(sourceID: sourceID)
         return NativeRealtimeStartedSource(
             sourceID: sourceID,

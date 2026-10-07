@@ -49,11 +49,21 @@ final class AppModel: ObservableObject {
     private var sessionLifecycleGeneration: Int = 0
     private var nativeRealtimeDisclosureAcknowledgedForNextSession = false
     private var nativeRealtimeInputsBySourceID: [String: RealtimePCM16AudioInput] = [:]
+    private var nativeRealtimeCaptureContextsBySourceID: [String: NativeRealtimeCaptureContext] = [:]
+    private var nativeRealtimeCaptureRegistrationsBySourceID: [String: RealtimeCaptureRegistration] = [:]
+    private var nativeRealtimeReadyIdentitiesBySourceID: [String: RealtimeSourceReadyIdentity] = [:]
+    private var nativeAcceptedCaptionBindingsByID: [UUID: NativeAcceptedCaptionBinding] = [:]
+    private var nativeAcceptedCaptionIDsBySourceID: [String: [UUID]] = [:]
+    private var nativePendingCaptionTransferIDsBySourceID: [String: [UUID]] = [:]
+    private var nativeCaptionTransferTasksByID: [UUID: Task<Void, Never>] = [:]
     private var nativeRealtimeRevokingSourceIDs = Set<String>()
     private var nativeRealtimeSourceStartupGenerations: [String: Int] = [:]
     private var nativeRealtimeStartupTask: Task<[NativeRealtimeStartedSource], Never>?
     private var nativeRealtimeStartupGeneration: Int = 0
     private var nativeRealtimeSettingsGeneration: Int = 0
+    #if DEBUG
+    private var nativeRegistrationGateForTesting: NativeRegistrationGateForTesting?
+    #endif
     // Sources whose capture actually started. A multi-source session tolerates inputs
     // that fail to open, so this can be a subset of `selectedSources` while running.
     private var activeSources: [InputSource] = []
@@ -95,9 +105,12 @@ final class AppModel: ObservableObject {
     private var sessionResourcePreparationOperationForTesting: (@MainActor () async -> Void)?
     private var liveTranscriptionSessionFactoryForTesting: (@MainActor () -> LiveTranscriptionSession)?
     private var correctionResultReceiptCountForTestingStorage = 0
+    private var acceptedFinalDeliveryCountForTestingStorage = 0
+    private var captionTranslationPauseForTesting: (@MainActor () async -> Void)?
+    private var nativeCaptionTransferPauseForTesting: (@MainActor () async -> Void)?
     #endif
     private var recentRecognizedCaptionTexts: [RecentRecognizedCaption] = []
-    private var recentArchivedCaption: RecentArchivedCaption?
+    private var recentArchivedCaptionsBySourceID: [String: RecentArchivedCaption] = [:]
     private var finalizedDraftPromotionIDs: [(id: UUID, time: Date)] = []
     private var transcriptInputLanguageID: String?
     private var transcriptOutputLanguageID: String?
@@ -319,6 +332,8 @@ final class AppModel: ObservableObject {
 
     isolated deinit {
         nativeRealtimeStartupTask?.cancel()
+        for task in nativeCaptionTransferTasksByID.values { task.cancel() }
+        nativeCaptionTransferTasksByID.removeAll()
         for input in nativeRealtimeInputsBySourceID.values {
             input.finish(error: .sourceSuperseded)
         }
@@ -896,6 +911,7 @@ final class AppModel: ObservableObject {
             sessionState = .running
             let activeSourceName = activeSourceDisplayName
             setStatus(.running(sourceName: activeSourceName))
+            processCaptionQueueIfNeeded()
 
             // Inputs that never opened are tolerated, but not hidden: log every failure
             // and show the first one in the overlay so a partially started session is
@@ -1234,6 +1250,8 @@ final class AppModel: ObservableObject {
             nativeRealtimeSourceStartupGenerations[source.id, default: 0] &+= 1
             let sourceStartupGeneration = nativeRealtimeSourceStartupGenerations[source.id, default: 0]
             nativeRealtimeRevokingSourceIDs.insert(source.id)
+            invalidateNativeAcceptedCaptions(sourceID: source.id)
+            nativeRealtimeCaptureContextsBySourceID.removeValue(forKey: source.id)
             correction.cancel(sourceID: source.id)
             invalidatePendingCorrectionAudio(for: source.id)
             if let input = nativeRealtimeInputsBySourceID.removeValue(forKey: source.id) {
@@ -1297,6 +1315,10 @@ final class AppModel: ObservableObject {
             $0.finish(error: .sourceSuperseded)
         }
         nativeRealtimeInputsBySourceID.removeAll()
+        for sourceID in Array(nativeRealtimeCaptureContextsBySourceID.keys) {
+            invalidateNativeAcceptedCaptions(sourceID: sourceID)
+        }
+        nativeRealtimeCaptureContextsBySourceID.removeAll()
         nativeRealtimeRevokingSourceIDs.removeAll()
         let coordinator = nativeRealtimeSessionCoordinator
         Task { await coordinator.stop() }
@@ -1323,6 +1345,9 @@ final class AppModel: ObservableObject {
             initialSourceStartupGenerations[source.id] =
                 nativeRealtimeSourceStartupGenerations[source.id, default: 0]
         }
+
+        nativeRealtimeStartupGeneration &+= 1
+        let startupGeneration = nativeRealtimeStartupGeneration
 
         var captures: [NativeRealtimeCaptureSource] = []
         for (session, source) in zip(sessions, sources) {
@@ -1372,6 +1397,15 @@ final class AppModel: ObservableObject {
             )
             captures.append(capture)
             nativeRealtimeInputsBySourceID[source.id] = input
+            nativeRealtimeCaptureContextsBySourceID[source.id] = NativeRealtimeCaptureContext(
+                sourceID: source.id,
+                sourceToken: input.sourceToken,
+                captureGeneration: input.generation,
+                lifecycleGeneration: lifecycleGeneration,
+                startupGeneration: startupGeneration,
+                sourceStartupGeneration: sourceStartupGeneration,
+                nativeConfiguration: NativeSourceConfiguration(settingsSnapshot, sourceID: source.id)
+            )
         }
 
         guard sessionLifecycleGeneration == lifecycleGeneration else {
@@ -1380,8 +1414,6 @@ final class AppModel: ObservableObject {
         }
         guard captures.isEmpty == false else { return }
 
-        nativeRealtimeStartupGeneration &+= 1
-        let startupGeneration = nativeRealtimeStartupGeneration
         let sourceStartupGenerations = Dictionary(uniqueKeysWithValues: captures.map {
             ($0.sourceID, initialSourceStartupGenerations[$0.sourceID, default: 0])
         })
@@ -1394,7 +1426,35 @@ final class AppModel: ObservableObject {
                       self.nativeRealtimeSourceStartupGenerations[sourceID, default: 0]
                         == expectedSourceGeneration,
                       !self.nativeRealtimeRevokingSourceIDs.contains(sourceID) else { return }
+                self.invalidateNativeAcceptedCaptions(sourceID: sourceID)
+                self.nativeRealtimeCaptureContextsBySourceID.removeValue(forKey: sourceID)
+                self.nativeRealtimeInputsBySourceID.removeValue(forKey: sourceID)
                 self.recordNativeRealtimeFailure(code, sourceID: sourceID)
+            }
+        }
+        await nativeRealtimeSessionCoordinator.setCaptureRegistrationHandler { [weak self] registration in
+            Task { @MainActor [weak self] in
+                self?.nativeCaptureDidRegister(
+                    registration,
+                    lifecycleGeneration: lifecycleGeneration,
+                    startupGeneration: startupGeneration,
+                    sourceStartupGenerations: sourceStartupGenerations
+                )
+            }
+        }
+        await nativeRealtimeSessionCoordinator.setSourceReadyHandler { [weak self] identity in
+            Task { @MainActor [weak self] in
+                self?.nativeSourceDidBecomeReady(
+                    identity,
+                    lifecycleGeneration: lifecycleGeneration,
+                    startupGeneration: startupGeneration,
+                    sourceStartupGenerations: sourceStartupGenerations
+                )
+            }
+        }
+        await nativeRealtimeSessionCoordinator.setCaptionDispositionHandler { [weak self] metadata, disposition in
+            Task { @MainActor [weak self] in
+                self?.nativeCaptionDispositionDidArrive(metadata, disposition: disposition)
             }
         }
         let eligibleCaptures = captures.filter { capture in
@@ -1421,6 +1481,12 @@ final class AppModel: ObservableObject {
               sessionLifecycleGeneration == lifecycleGeneration,
               nativeRealtimeStartupGeneration == startupGeneration else { return }
         let coordinator = nativeRealtimeSessionCoordinator
+        #if DEBUG
+        if let gate = nativeRegistrationGateForTesting {
+            nativeRegistrationGateForTesting = nil
+            await gate.suspendUntilReleased()
+        }
+        #endif
         let task = Task {
             await coordinator.start(captures: eligibleCaptures, settings: settingsSnapshot)
         }
@@ -1431,6 +1497,7 @@ final class AppModel: ObservableObject {
 
         let startedSourceIDs = Set(started.map(\.sourceID))
         for capture in captures where !startedSourceIDs.contains(capture.sourceID) {
+            invalidateNativeAcceptedCaptions(sourceID: capture.sourceID)
             capture.input.finish(error: .sourceSuperseded)
             if nativeRealtimeInputsBySourceID[capture.sourceID]?.isSameCapture(as: capture.input) == true {
                 nativeRealtimeInputsBySourceID.removeValue(forKey: capture.sourceID)
@@ -2509,6 +2576,7 @@ final class AppModel: ObservableObject {
     private func clearOverlayText() {
         if let currentCaption = currentCommittedCaptionHistoryPayload() {
             rememberArchivedCaption(
+                sourceID: displayedCaption?.sourceID ?? "",
                 sourceText: currentCaption.sourceText,
                 promotionID: displayedCaption?.promotionID
             )
@@ -2534,6 +2602,7 @@ final class AppModel: ObservableObject {
     private func capturePreviousCaption() {
         guard let currentCaption = currentCommittedCaptionHistoryPayload() else { return }
         rememberArchivedCaption(
+            sourceID: displayedCaption?.sourceID ?? "",
             sourceText: currentCaption.sourceText,
             promotionID: displayedCaption?.promotionID
         )
@@ -2655,6 +2724,9 @@ final class AppModel: ObservableObject {
         sourceLanguageID: String,
         targetLanguageID: String
     ) {
+        #if DEBUG
+        acceptedFinalDeliveryCountForTestingStorage += 1
+        #endif
         let sourceText = sanitizedDisplayText(sentence.text)
         guard sourceText.isEmpty == false else {
             return
@@ -2674,7 +2746,7 @@ final class AppModel: ObservableObject {
             markDraftPromotionFinalized(promotionID)
             cancelCommittedCaptionArchive()
 
-            guard shouldEnqueueRecognizedSentence(sourceText, promotionID: promotionID) else {
+            guard shouldEnqueueRecognizedSentence(sourceText, sourceID: source.id, promotionID: promotionID) else {
                 return
             }
 
@@ -2692,13 +2764,14 @@ final class AppModel: ObservableObject {
                 correctionAudioPolicyEpoch: correctionAudioPolicyEpoch
             )
 
-            rememberRecognizedSentence(sourceText)
+            rememberRecognizedSentence(sourceText, sourceID: source.id)
             pendingCaptions.append(caption)
+            bindAcceptedNativeCaption(sentence, caption: caption)
             translateCaption(caption)
         } else {
             cancelCommittedCaptionArchive()
 
-            guard shouldEnqueueRecognizedSentence(sourceText) else {
+            guard shouldEnqueueRecognizedSentence(sourceText, sourceID: source.id) else {
                 return
             }
 
@@ -2716,8 +2789,9 @@ final class AppModel: ObservableObject {
                 correctionAudioPolicyEpoch: correctionAudioPolicyEpoch
             )
 
-            rememberRecognizedSentence(sourceText)
+            rememberRecognizedSentence(sourceText, sourceID: source.id)
             pendingCaptions.append(caption)
+            bindAcceptedNativeCaption(sentence, caption: caption)
             translateCaption(caption)
         }
 
@@ -2726,6 +2800,7 @@ final class AppModel: ObservableObject {
         // into two back-to-back captions.
         while pendingCaptions.count > 3 {
             let dropped = pendingCaptions.remove(at: 1)
+            invalidateNativeAcceptedCaption(id: dropped.id)
             captionTranslationTasks[dropped.id]?.cancel()
             captionTranslationTasks.removeValue(forKey: dropped.id)
             updateReadyCaptionTranslation(nil, for: dropped.id)
@@ -2742,6 +2817,220 @@ final class AppModel: ObservableObject {
         }
 
         setStatus(.running(sourceName: activeSourceDisplayName))
+    }
+
+    private func bindAcceptedNativeCaption(_ sentence: RecognizedSentence, caption: QueuedCaption) {
+        guard let provenance = sentence.audioProvenance,
+              provenance.sampleInterval.lowerBound >= 0,
+              provenance.sampleInterval.upperBound > provenance.sampleInterval.lowerBound,
+              let context = nativeRealtimeCaptureContextsBySourceID[caption.sourceID],
+              let input = nativeRealtimeInputsBySourceID[caption.sourceID],
+              provenance.sampleInterval.lowerBound >= input.firstAvailableSampleIndex,
+              input.sourceToken == provenance.sourceToken,
+              input.generation == provenance.captureGeneration,
+              context.sourceToken == input.sourceToken,
+              context.captureGeneration == input.generation,
+              !input.isConsumed,
+              input.terminationError == nil,
+              nativeContextIsCurrent(context) else { return }
+
+        let metadata = RealtimeAcceptedCaptionMetadata(
+            sourceID: caption.sourceID,
+            sourceToken: provenance.sourceToken,
+            captureGeneration: provenance.captureGeneration,
+            captionID: caption.id,
+            utteranceID: UUID().uuidString,
+            sourceLanguageID: caption.sourceLanguageID,
+            targetLanguageID: caption.targetLanguageID,
+            sampleInterval: provenance.sampleInterval
+        )
+        var binding = NativeAcceptedCaptionBinding(metadata: metadata, context: context)
+        if let readyIdentity = nativeRealtimeReadyIdentitiesBySourceID[caption.sourceID],
+           readyIdentity.sourceToken == metadata.sourceToken,
+           readyIdentity.captureGeneration == metadata.captureGeneration {
+            binding.readyIdentity = readyIdentity
+        }
+        var sourceIDs = nativeAcceptedCaptionIDsBySourceID[caption.sourceID, default: []]
+        while sourceIDs.count >= 128 {
+            guard let evictIndex = sourceIDs.firstIndex(where: {
+                guard let existing = nativeAcceptedCaptionBindingsByID[$0] else { return true }
+                let pendingTransfer = nativePendingCaptionTransferIDsBySourceID[caption.sourceID, default: []].contains($0)
+                let awaitingTerminal = existing.transferDisposition == .queued && existing.terminalDisposition == nil
+                return !pendingTransfer && !awaitingTerminal
+            }) else { return }
+            let evicted = sourceIDs.remove(at: evictIndex)
+            invalidateNativeAcceptedCaption(id: evicted)
+        }
+        sourceIDs.append(caption.id)
+        nativeAcceptedCaptionIDsBySourceID[caption.sourceID] = sourceIDs
+        nativeAcceptedCaptionBindingsByID[caption.id] = binding
+
+        if nativeRealtimeCaptureRegistrationsBySourceID[caption.sourceID] == RealtimeCaptureRegistration(
+            sourceID: caption.sourceID,
+            sourceToken: context.sourceToken,
+            captureGeneration: context.captureGeneration
+        ) {
+            transferNativeAcceptedCaption(id: caption.id)
+        } else {
+            var staged = nativePendingCaptionTransferIDsBySourceID[caption.sourceID, default: []]
+            guard staged.count < 8 else {
+                invalidateNativeAcceptedCaption(id: caption.id)
+                return
+            }
+            staged.append(caption.id)
+            nativePendingCaptionTransferIDsBySourceID[caption.sourceID] = staged
+        }
+    }
+
+    private func nativeContextIsCurrent(_ context: NativeRealtimeCaptureContext) -> Bool {
+        sessionLifecycleGeneration == context.lifecycleGeneration
+            && nativeRealtimeStartupGeneration == context.startupGeneration
+            && nativeRealtimeSourceStartupGenerations[context.sourceID, default: 0]
+                == context.sourceStartupGeneration
+            && NativeSourceConfiguration(nativeRealtimeSettings, sourceID: context.sourceID)
+                == context.nativeConfiguration
+            && !nativeRealtimeRevokingSourceIDs.contains(context.sourceID)
+    }
+
+    private func nativeCaptureDidRegister(
+        _ registration: RealtimeCaptureRegistration,
+        lifecycleGeneration: Int,
+        startupGeneration: Int,
+        sourceStartupGenerations: [String: Int]
+    ) {
+        guard let context = nativeRealtimeCaptureContextsBySourceID[registration.sourceID],
+              registration.sourceToken == context.sourceToken,
+              registration.captureGeneration == context.captureGeneration,
+              context.lifecycleGeneration == lifecycleGeneration,
+              context.startupGeneration == startupGeneration,
+              context.sourceStartupGeneration == sourceStartupGenerations[registration.sourceID],
+              nativeContextIsCurrent(context),
+              nativeRealtimeInputsBySourceID[registration.sourceID]?.isConsumed == false else {
+            return
+        }
+        nativeRealtimeCaptureRegistrationsBySourceID[registration.sourceID] = registration
+        let staged = nativePendingCaptionTransferIDsBySourceID.removeValue(forKey: registration.sourceID) ?? []
+        for id in staged { transferNativeAcceptedCaption(id: id) }
+    }
+
+    private func nativeSourceDidBecomeReady(
+        _ identity: RealtimeSourceReadyIdentity,
+        lifecycleGeneration: Int,
+        startupGeneration: Int,
+        sourceStartupGenerations: [String: Int]
+    ) {
+        guard let context = nativeRealtimeCaptureContextsBySourceID[identity.sourceID],
+              identity.sourceToken == context.sourceToken,
+              identity.captureGeneration == context.captureGeneration,
+              context.lifecycleGeneration == lifecycleGeneration,
+              context.startupGeneration == startupGeneration,
+              context.sourceStartupGeneration == sourceStartupGenerations[identity.sourceID],
+              nativeContextIsCurrent(context) else { return }
+        nativeRealtimeReadyIdentitiesBySourceID[identity.sourceID] = identity
+        for id in nativeAcceptedCaptionIDsBySourceID[identity.sourceID, default: []] {
+            guard var binding = nativeAcceptedCaptionBindingsByID[id],
+                  binding.context.sourceToken == identity.sourceToken,
+                  binding.context.captureGeneration == identity.captureGeneration else { continue }
+            binding.readyIdentity = identity
+            nativeAcceptedCaptionBindingsByID[id] = binding
+        }
+    }
+
+    #if DEBUG
+    func deliverNativeCaptureRegistrationForTesting(_ registration: RealtimeCaptureRegistration) {
+        nativeCaptureDidRegister(
+            registration,
+            lifecycleGeneration: sessionLifecycleGeneration,
+            startupGeneration: nativeRealtimeStartupGeneration,
+            sourceStartupGenerations: nativeRealtimeSourceStartupGenerations
+        )
+    }
+    #endif
+
+    private func nativeCaptionDispositionDidArrive(
+        _ metadata: RealtimeAcceptedCaptionMetadata,
+        disposition: RealtimeCaptionSubmissionDisposition
+    ) {
+        guard var binding = nativeAcceptedCaptionBindingsByID[metadata.captionID],
+              binding.metadata == metadata,
+              nativeContextIsCurrent(binding.context) else { return }
+        binding.terminalDisposition = disposition
+        nativeAcceptedCaptionBindingsByID[metadata.captionID] = binding
+    }
+
+    private func transferNativeAcceptedCaption(id: UUID) {
+        guard nativeCaptionTransferTasksByID[id] == nil,
+              let binding = nativeAcceptedCaptionBindingsByID[id],
+              nativeContextIsCurrent(binding.context),
+              nativeRealtimeCaptureRegistrationsBySourceID[binding.metadata.sourceID] == RealtimeCaptureRegistration(
+                sourceID: binding.metadata.sourceID,
+                sourceToken: binding.metadata.sourceToken,
+                captureGeneration: binding.metadata.captureGeneration
+              ) else { return }
+        var pendingIDs = nativePendingCaptionTransferIDsBySourceID[binding.metadata.sourceID, default: []]
+        guard pendingIDs.contains(id) || pendingIDs.count < 8 else {
+            invalidateNativeAcceptedCaption(id: id)
+            return
+        }
+        if !pendingIDs.contains(id) {
+            pendingIDs.append(id)
+            nativePendingCaptionTransferIDsBySourceID[binding.metadata.sourceID] = pendingIDs
+        }
+        let metadata = binding.metadata
+        let coordinator = nativeRealtimeSessionCoordinator
+        #if DEBUG
+        let pauseForTesting = nativeCaptionTransferPauseForTesting
+        #endif
+        let task = Task { [weak self] in
+            guard !Task.isCancelled else { return }
+            #if DEBUG
+            if let pauseForTesting { await pauseForTesting() }
+            #endif
+            guard !Task.isCancelled else { return }
+            let disposition = await coordinator.submitAcceptedCaption(metadata)
+            guard !Task.isCancelled else { return }
+            await MainActor.run {
+                guard let self,
+                      self.nativeAcceptedCaptionBindingsByID[id]?.metadata == binding.metadata,
+                      self.nativeAcceptedCaptionBindingsByID[id]?.context == binding.context,
+                      self.nativeContextIsCurrent(binding.context) else { return }
+                guard var updatedBinding = self.nativeAcceptedCaptionBindingsByID[id] else { return }
+                updatedBinding.transferDisposition = disposition
+                self.nativeAcceptedCaptionBindingsByID[id] = updatedBinding
+                self.nativeCaptionTransferTasksByID.removeValue(forKey: id)
+                self.nativePendingCaptionTransferIDsBySourceID[metadata.sourceID]?.removeAll { $0 == id }
+                // Disposition is advisory; local captions remain intact.
+                _ = disposition
+            }
+        }
+        nativeCaptionTransferTasksByID[id] = task
+    }
+
+    private func invalidateNativeAcceptedCaption(id: UUID) {
+        let sourceID = nativeAcceptedCaptionBindingsByID[id]?.metadata.sourceID
+        nativeCaptionTransferTasksByID.removeValue(forKey: id)?.cancel()
+        nativeAcceptedCaptionBindingsByID.removeValue(forKey: id)
+        if let sourceID {
+            nativeAcceptedCaptionIDsBySourceID[sourceID]?.removeAll { $0 == id }
+            nativePendingCaptionTransferIDsBySourceID[sourceID]?.removeAll { $0 == id }
+        }
+    }
+
+    private func invalidateNativeAcceptedCaptions(sourceID: String) {
+        let ids = nativeAcceptedCaptionIDsBySourceID.removeValue(forKey: sourceID) ?? []
+        for id in ids { nativeCaptionTransferTasksByID.removeValue(forKey: id)?.cancel() }
+        ids.forEach { nativeAcceptedCaptionBindingsByID.removeValue(forKey: $0) }
+        nativePendingCaptionTransferIDsBySourceID.removeValue(forKey: sourceID)
+        nativeRealtimeCaptureRegistrationsBySourceID.removeValue(forKey: sourceID)
+        nativeRealtimeReadyIdentitiesBySourceID.removeValue(forKey: sourceID)
+    }
+
+    private func invalidateAllNativeAcceptedCaptions() {
+        for task in nativeCaptionTransferTasksByID.values { task.cancel() }
+        nativeCaptionTransferTasksByID.removeAll()
+        nativeAcceptedCaptionBindingsByID.removeAll()
+        nativeAcceptedCaptionIDsBySourceID.removeAll()
+        nativePendingCaptionTransferIDsBySourceID.removeAll()
     }
 
     private func refreshCaptionTranslations() {
@@ -2875,6 +3164,7 @@ final class AppModel: ObservableObject {
     }
 
     func clearTranscript() {
+        invalidateAllNativeAcceptedCaptions()
         transcriptEntries.removeAll()
         transcriptGeneration &+= 1
         pruneCorrectionCaptionTracking()
@@ -2932,6 +3222,20 @@ final class AppModel: ObservableObject {
         liveTranscriptionSessionFactoryForTesting = factory
     }
 
+    func pauseNextNativeCoordinatorRegistrationForTesting() -> NativeRegistrationGateForTesting {
+        let gate = NativeRegistrationGateForTesting()
+        nativeRegistrationGateForTesting = gate
+        return gate
+    }
+
+    func pauseCaptionTranslationForTesting(_ operation: @escaping @MainActor () async -> Void) {
+        captionTranslationPauseForTesting = operation
+    }
+
+    func pauseNativeCaptionTransfersForTesting(_ operation: @escaping @MainActor () async -> Void) {
+        nativeCaptionTransferPauseForTesting = operation
+    }
+
     var correctionSessionIsActiveForTesting: Bool {
         correctionSessionIsActive
     }
@@ -2977,8 +3281,9 @@ final class AppModel: ObservableObject {
 
     func finalizePendingLocalCaptionForTesting(captionID: UUID, translation: String) {
         guard let index = pendingCaptions.firstIndex(where: { $0.id == captionID }) else { return }
-        let caption = pendingCaptions.remove(at: index)
+        let caption = pendingCaptions[index]
         commitLocalCaptionForTesting(caption, translation: translation)
+        pendingCaptions.removeAll { $0.id == captionID }
     }
 
     func applyLocalTranslationForTesting(_ translation: String, captionID: UUID) {
@@ -3043,6 +3348,70 @@ final class AppModel: ObservableObject {
 
     var correctionResultReceiptCountForTesting: Int {
         correctionResultReceiptCountForTestingStorage
+    }
+
+    var acceptedFinalDeliveryCountForTesting: Int {
+        acceptedFinalDeliveryCountForTestingStorage
+    }
+
+    var nativeAcceptedBindingStateForTesting: (Int, Int, Int) {
+        (nativeAcceptedCaptionBindingsByID.count,
+         nativePendingCaptionTransferIDsBySourceID.values.reduce(0) { $0 + $1.count },
+         nativeRealtimeCaptureRegistrationsBySourceID.count)
+    }
+
+    func nativeAcceptedMetadataForTesting(sourceID: String) async -> RealtimeAcceptedCaptionMetadata? {
+        await nativeRealtimeSessionCoordinator.acceptedCaptionMetadataForTesting(sourceID: sourceID)
+    }
+
+    func nativeAcceptedBindingsForTesting(sourceID: String) -> [RealtimeAcceptedCaptionMetadata] {
+        nativeAcceptedCaptionIDsBySourceID[sourceID, default: []].compactMap {
+            nativeAcceptedCaptionBindingsByID[$0]?.metadata
+        }
+    }
+
+    func localCaptionWasEnqueuedForTesting(_ sourceText: String) -> Bool {
+        pendingCaptions.contains(where: { $0.sourceText == sourceText })
+            || displayedCaption?.sourceText == sourceText
+            || transcriptEntries.contains(where: { $0.sourceText == sourceText })
+    }
+
+    func nativeReadyIdentityForTesting(sourceID: String) -> RealtimeSourceReadyIdentity? {
+        nativeRealtimeReadyIdentitiesBySourceID[sourceID]
+    }
+
+    func nativeAcceptedReadyIdentityForTesting(captionID: UUID) -> RealtimeSourceReadyIdentity? {
+        nativeAcceptedCaptionBindingsByID[captionID]?.readyIdentity
+    }
+
+    func nativeAcceptedTransferDispositionForTesting(
+        captionID: UUID
+    ) -> RealtimeCaptionSubmissionDisposition? {
+        nativeAcceptedCaptionBindingsByID[captionID]?.transferDisposition
+    }
+
+    func nativeCaptionTransferTasksSnapshotForTesting() -> [Task<Void, Never>] {
+        Array(nativeCaptionTransferTasksByID.values)
+    }
+
+    func captionTranslationTasksSnapshotForTesting() -> [Task<Void, Never>] {
+        Array(captionTranslationTasks.values)
+    }
+
+    func captionDisplayTaskSnapshotForTesting() -> Task<Void, Never>? {
+        captionDisplayTask
+    }
+
+    func captionTranslationTaskForTesting(captionID: UUID) -> Task<Void, Never>? {
+        captionTranslationTasks[captionID]
+    }
+
+    func nativeCaptionTransferTaskForTesting(captionID: UUID) -> Task<Void, Never>? {
+        nativeCaptionTransferTasksByID[captionID]
+    }
+
+    var nativeCaptureIdentitiesForTesting: [String: (UUID, UInt64)] {
+        nativeRealtimeInputsBySourceID.mapValues { ($0.sourceToken, $0.generation) }
     }
 
     func pauseNextProviderAudioTransitionResetForTesting() {
@@ -3178,7 +3547,7 @@ final class AppModel: ObservableObject {
         sourceCorrectionAudioPolicyEpochs.removeAll()
         invalidateProviderAudioTransitions()
         recentRecognizedCaptionTexts.removeAll()
-        recentArchivedCaption = nil
+        recentArchivedCaptionsBySourceID.removeAll()
         finalizedDraftPromotionIDs.removeAll()
         displayedCaption = nil
         overlayHistoryScrollOffset = 0
@@ -3520,7 +3889,11 @@ final class AppModel: ObservableObject {
         }
     }
 
-    private func shouldEnqueueRecognizedSentence(_ text: String, promotionID: UUID? = nil) -> Bool {
+    private func shouldEnqueueRecognizedSentence(
+        _ text: String,
+        sourceID: String,
+        promotionID: UUID? = nil
+    ) -> Bool {
         let now = Date()
         let comparable = comparableCaptionText(text)
         recentRecognizedCaptionTexts.removeAll { now.timeIntervalSince($0.time) > 6.0 }
@@ -3530,25 +3903,28 @@ final class AppModel: ObservableObject {
         }
 
         if let displayedCaption,
+           displayedCaption.sourceID == sourceID,
            comparableCaptionText(displayedCaption.sourceText) == comparable {
             return false
         }
 
         if let displayedCaption,
+           displayedCaption.sourceID == sourceID,
            isNearDuplicateCaptionText(displayedCaption.sourceText, text) {
             return false
         }
 
-        if pendingCaptions.contains(where: { comparableCaptionText($0.sourceText) == comparable }) {
+        if pendingCaptions.contains(where: { $0.sourceID == sourceID && comparableCaptionText($0.sourceText) == comparable }) {
             return false
         }
 
-        if pendingCaptions.contains(where: { isNearDuplicateCaptionText($0.sourceText, text) }) {
+        if pendingCaptions.contains(where: { $0.sourceID == sourceID && isNearDuplicateCaptionText($0.sourceText, text) }) {
             return false
         }
 
         if shouldSuppressArchivedCaptionReplay(
             comparableText: comparable,
+            sourceID: sourceID,
             promotionID: promotionID,
             now: now
         ) {
@@ -3556,15 +3932,16 @@ final class AppModel: ObservableObject {
         }
 
         return recentRecognizedCaptionTexts.contains(where: {
-            $0.comparableText == comparable || isNearDuplicateCaptionText($0.rawText, text)
+            $0.sourceID == sourceID && ($0.comparableText == comparable || isNearDuplicateCaptionText($0.rawText, text))
         }) == false
     }
 
-    private func rememberRecognizedSentence(_ text: String) {
+    private func rememberRecognizedSentence(_ text: String, sourceID: String) {
         let now = Date()
         recentRecognizedCaptionTexts.removeAll { now.timeIntervalSince($0.time) > 6.0 }
         recentRecognizedCaptionTexts.append(
             RecentRecognizedCaption(
+                sourceID: sourceID,
                 rawText: text,
                 comparableText: comparableCaptionText(text),
                 time: now
@@ -3572,14 +3949,15 @@ final class AppModel: ObservableObject {
         )
     }
 
-    private func rememberArchivedCaption(sourceText: String, promotionID: UUID?) {
+    private func rememberArchivedCaption(sourceID: String, sourceText: String, promotionID: UUID?) {
         let comparable = comparableCaptionText(sourceText)
         guard comparable.isEmpty == false else {
-            recentArchivedCaption = nil
+            recentArchivedCaptionsBySourceID.removeValue(forKey: sourceID)
             return
         }
 
-        recentArchivedCaption = RecentArchivedCaption(
+        recentArchivedCaptionsBySourceID[sourceID] = RecentArchivedCaption(
+            sourceID: sourceID,
             comparableText: comparable,
             time: Date(),
             promotionID: promotionID
@@ -3639,15 +4017,16 @@ final class AppModel: ObservableObject {
 
     private func shouldSuppressArchivedCaptionReplay(
         comparableText: String,
+        sourceID: String,
         promotionID: UUID?,
         now: Date
     ) -> Bool {
         guard comparableText.isEmpty == false,
-              displayedCaption == nil,
-              pendingCaptions.isEmpty,
-              hasActiveDraftOverlay == false,
-              overlayState?.draftPromotionID == nil,
-              let recentArchivedCaption,
+              displayedCaption?.sourceID != sourceID,
+              pendingCaptions.contains(where: { $0.sourceID == sourceID }) == false,
+              (hasActiveDraftOverlay && lastDraftSourceID == sourceID) == false,
+              (overlayState?.draftPromotionID != nil && lastDraftSourceID == sourceID) == false,
+              let recentArchivedCaption = recentArchivedCaptionsBySourceID[sourceID],
               now.timeIntervalSince(recentArchivedCaption.time) <= Self.archivedCaptionReplaySuppressionWindow else {
             return false
         }
@@ -3914,6 +4293,12 @@ final class AppModel: ObservableObject {
     }
 
     private func translatedText(for caption: QueuedCaption) async -> String? {
+        #if DEBUG
+        if let captionTranslationPauseForTesting {
+            await captionTranslationPauseForTesting()
+            return nil
+        }
+        #endif
         guard caption.sourceLanguageID != caption.targetLanguageID else {
             return caption.sourceText
         }
@@ -4236,6 +4621,9 @@ final class AppModel: ObservableObject {
             retainedCaptionIDs.contains($0.key)
         }
         correctedCaptionIDs.formIntersection(retainedCaptionIDs)
+        for id in Array(nativeAcceptedCaptionBindingsByID.keys) where !retainedCaptionIDs.contains(id) {
+            invalidateNativeAcceptedCaption(id: id)
+        }
     }
 
     private func shouldStoreOverlayHistory(translatedText: String, sourceText: String) -> Bool {
@@ -4377,12 +4765,113 @@ private extension AppModel {
 }
 
 private struct RecentRecognizedCaption {
+    let sourceID: String
     let rawText: String
     let comparableText: String
     let time: Date
 }
 
+private struct NativeSourceConfiguration: Equatable, Sendable {
+    let isEnabled: Bool
+    let profile: NativeRealtimeProfile
+    let region: NativeRealtimeRegion
+    let credentialReference: String?
+    let qwenWorkspaceID: String?
+    let sourceEnabled: Bool
+
+    init(_ settings: NativeRealtimeSettings, sourceID: String) {
+        isEnabled = settings.isEnabled
+        profile = settings.profile
+        region = settings.region
+        credentialReference = settings.credentialReference
+        qwenWorkspaceID = settings.qwenWorkspaceID
+        sourceEnabled = settings.isEnabled(for: sourceID)
+    }
+}
+
+private struct NativeRealtimeCaptureContext: Equatable, Sendable {
+    let sourceID: String
+    let sourceToken: UUID
+    let captureGeneration: UInt64
+    let lifecycleGeneration: Int
+    let startupGeneration: Int
+    let sourceStartupGeneration: Int
+    let nativeConfiguration: NativeSourceConfiguration
+}
+
+private struct NativeAcceptedCaptionBinding: Equatable, Sendable {
+    let metadata: RealtimeAcceptedCaptionMetadata
+    let context: NativeRealtimeCaptureContext
+    var transferDisposition: RealtimeCaptionSubmissionDisposition?
+    var terminalDisposition: RealtimeCaptionSubmissionDisposition?
+    var readyIdentity: RealtimeSourceReadyIdentity?
+
+    init(metadata: RealtimeAcceptedCaptionMetadata, context: NativeRealtimeCaptureContext) {
+        self.metadata = metadata
+        self.context = context
+        transferDisposition = nil
+        terminalDisposition = nil
+        readyIdentity = nil
+    }
+}
+
+#if DEBUG
+actor NativeRegistrationGateForTesting {
+    private var reached = false
+    private var released = false
+    private var reachedContinuation: CheckedContinuation<Void, Never>?
+    private var throwingReachedContinuation: CheckedContinuation<Void, any Error>?
+    private var releaseContinuation: CheckedContinuation<Void, Never>?
+    private var reachedTimeoutTask: Task<Void, Never>?
+
+    func suspendUntilReleased() async {
+        reached = true
+        reachedTimeoutTask?.cancel()
+        reachedTimeoutTask = nil
+        reachedContinuation?.resume()
+        reachedContinuation = nil
+        throwingReachedContinuation?.resume()
+        throwingReachedContinuation = nil
+        guard !released else { return }
+        await withCheckedContinuation { releaseContinuation = $0 }
+    }
+
+    func waitUntilReached() async {
+        guard !reached else { return }
+        await withCheckedContinuation { reachedContinuation = $0 }
+    }
+
+    func waitUntilReached(timeoutNanoseconds: UInt64 = 8_000_000_000) async throws {
+        guard !reached else { return }
+        try await withCheckedThrowingContinuation { continuation in
+            throwingReachedContinuation = continuation
+            reachedTimeoutTask = Task { [weak self] in
+                try? await Task.sleep(nanoseconds: timeoutNanoseconds)
+                guard !Task.isCancelled else { return }
+                await self?.timeoutReachedWait()
+            }
+        }
+    }
+
+    private func timeoutReachedWait() {
+        guard let continuation = throwingReachedContinuation else { return }
+        throwingReachedContinuation = nil
+        reachedTimeoutTask = nil
+        continuation.resume(throwing: NativeRegistrationGateTimeoutForTesting())
+    }
+
+    func release() {
+        released = true
+        releaseContinuation?.resume()
+        releaseContinuation = nil
+    }
+}
+
+private struct NativeRegistrationGateTimeoutForTesting: Error {}
+#endif
+
 private struct RecentArchivedCaption {
+    let sourceID: String
     let comparableText: String
     let time: Date
     let promotionID: UUID?

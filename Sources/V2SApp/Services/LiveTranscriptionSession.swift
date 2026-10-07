@@ -63,12 +63,19 @@ enum RealtimePCM16AudioOfferResult: Equatable {
 struct RealtimePCM16AudioInput: Sendable {
     let sourceToken: UUID
     let generation: UInt64
+    let firstAvailableSampleIndex: Int64
 
     private let fanout: RealtimePCM16AudioFanout
 
-    fileprivate init(sourceToken: UUID, generation: UInt64, fanout: RealtimePCM16AudioFanout) {
+    fileprivate init(
+        sourceToken: UUID,
+        generation: UInt64,
+        firstAvailableSampleIndex: Int64,
+        fanout: RealtimePCM16AudioFanout
+    ) {
         self.sourceToken = sourceToken
         self.generation = generation
+        self.firstAvailableSampleIndex = max(0, firstAvailableSampleIndex)
         self.fanout = fanout
     }
 
@@ -130,12 +137,17 @@ final class RealtimePCM16AudioFanout: @unchecked Sendable {
         self.maximumBufferedChunks = max(1, maximumBufferedChunks)
     }
 
-    func makeInput() -> RealtimePCM16AudioInput? {
+    func makeInput(firstAvailableSampleIndex: Int64 = 0) -> RealtimePCM16AudioInput? {
         lock.lock()
         defer { lock.unlock() }
         guard !didCreateInput, !isClosed else { return nil }
         didCreateInput = true
-        return RealtimePCM16AudioInput(sourceToken: sourceToken, generation: generation, fanout: self)
+        return RealtimePCM16AudioInput(
+            sourceToken: sourceToken,
+            generation: generation,
+            firstAvailableSampleIndex: firstAvailableSampleIndex,
+            fanout: self
+        )
     }
 
     var isActive: Bool {
@@ -664,6 +676,14 @@ final class LiveTranscriptionSession: NSObject, @unchecked Sendable {
     ) async throws {
         #if DEBUG
         if let startOperationForTesting {
+            self.transcriptHandler = transcriptHandler
+            self.partialHandler = partialHandler
+            self.modeConfig = modeConfig
+            self.recognitionContextualStrings = sanitizeContextualStrings(contextualStrings)
+            self.activeLocaleIdentifier = localeIdentifier
+            self.interfaceLanguageID = interfaceLanguageID
+            self.errorHandler = errorHandler
+            self.fatalErrorHandler = fatalErrorHandler
             try await startOperationForTesting()
             return
         }
@@ -861,6 +881,11 @@ final class LiveTranscriptionSession: NSObject, @unchecked Sendable {
     }
 
     @MainActor
+    func deliverRecognizedSentenceForTesting(_ sentence: RecognizedSentence) {
+        transcriptHandler?(sentence)
+    }
+
+    @MainActor
     func setPartialHandlerForTesting(
         _ handler: @escaping @MainActor (DraftSegment?) -> Void
     ) {
@@ -880,7 +905,13 @@ final class LiveTranscriptionSession: NSObject, @unchecked Sendable {
     func makeRealtimePCM16AudioInput() async -> RealtimePCM16AudioInput? {
         await withCheckedContinuation { continuation in
             captureQueue.async { [weak self] in
-                continuation.resume(returning: self?.realtimeAudioFanout?.makeInput())
+                guard let self else {
+                    continuation.resume(returning: nil)
+                    return
+                }
+                continuation.resume(returning: self.realtimeAudioFanout?.makeInput(
+                    firstAvailableSampleIndex: self.normalizedAudioSampleClock.nextSampleIndex
+                ))
             }
         }
     }
@@ -1089,7 +1120,8 @@ final class LiveTranscriptionSession: NSObject, @unchecked Sendable {
 
     func queueLegacyCommittedEmissionForTesting(
         text: String,
-        segments: [LegacySpeechSegmentTiming]
+        segments: [LegacySpeechSegmentTiming],
+        promotionSegmentID: UUID? = nil
     ) async -> Bool {
         await withCheckedContinuation { continuation in
             captureQueue.async { [weak self] in
@@ -1100,7 +1132,7 @@ final class LiveTranscriptionSession: NSObject, @unchecked Sendable {
                 let audioProvenance = legacyRecognitionSampleMapping?.provenance(for: segments)
                 queuedCommittedEmissionForTesting = makeCommittedEmission(
                     text: text,
-                    promotionSegmentID: nil,
+                    promotionSegmentID: promotionSegmentID,
                     audioWAVData: finishCorrectionAudio(),
                     audioProvenance: audioProvenance
                 )

@@ -114,6 +114,20 @@ struct RealtimeAcceptedCaptionMetadata: Equatable, Sendable {
     let sampleInterval: NormalizedAudioSampleInterval?
 }
 
+struct RealtimeCaptureRegistration: Equatable, Sendable {
+    let sourceID: String
+    let sourceToken: UUID
+    let captureGeneration: UInt64
+}
+
+struct RealtimeSourceReadyIdentity: Equatable, Sendable {
+    let sourceID: String
+    let sourceToken: UUID
+    let captureGeneration: UInt64
+    let alias: String
+    let driverGeneration: Int
+}
+
 enum RealtimeCaptionLocalOnlyReason: Equatable, Sendable {
     case unavailableSource
     case invalidMetadata

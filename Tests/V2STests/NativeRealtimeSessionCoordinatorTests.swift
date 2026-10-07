@@ -3,6 +3,67 @@ import Testing
 @testable import v2s
 
 @Suite struct NativeRealtimeSessionCoordinatorTests {
+    @Test func acceptedCaptionBeforeCaptureInputFloorIsRejectedAndLaterIntervalCommits() async throws {
+        let backend = SuspendingCoordinatorCredentialBackend()
+        let bag = CoordinatorDriverBag()
+        let coordinator = NativeRealtimeSessionCoordinator(
+            credentialStore: RealtimeCredentialStore(backend: backend),
+            driverFactory: { _, _, _ in
+                let driver = CoordinatorFakeDriver()
+                bag.append(driver)
+                return driver
+            }
+        )
+        let capture = makeCoordinatorCapture(sourceID: "capture-floor", firstAvailableSampleIndex: 2)
+        var settings = NativeRealtimeSettings.default
+        settings.isEnabled = true
+        settings.credentialReference = "fake-ref"
+        settings.enabledSourceIDs = [capture.source.sourceID]
+        let startTask = Task { await coordinator.start(captures: [capture.source], settings: settings) }
+        func cleanup() async {
+            await backend.releaseLookup(with: "fake-secret")
+            await coordinator.stop()
+            _ = await startTask.value
+        }
+
+        do {
+            try await requireCoordinatorCondition("held credential lookup") {
+                await backend.lookupCount() == 1
+            }
+            func metadata(interval: Range<Int64>, suffix: String) -> RealtimeAcceptedCaptionMetadata {
+                RealtimeAcceptedCaptionMetadata(
+                    sourceID: capture.source.sourceID,
+                    sourceToken: capture.source.input.sourceToken,
+                    captureGeneration: capture.source.input.generation,
+                    captionID: UUID(),
+                    utteranceID: suffix,
+                    sourceLanguageID: "en",
+                    targetLanguageID: "en",
+                    sampleInterval: interval
+                )
+            }
+            let old = metadata(interval: 0..<2, suffix: "before-input")
+            let current = metadata(interval: 2..<4, suffix: "after-input")
+            #expect(await coordinator.submitAcceptedCaption(old) == .localOnly(.missingAudioCoverage))
+            #expect(await coordinator.acceptedCaptionMetadataForTesting(sourceID: capture.source.sourceID) == nil)
+            #expect(await coordinator.submitAcceptedCaption(current) == .queued)
+            await backend.releaseLookup(with: "fake-secret")
+            let started = await startTask.value
+            #expect(started.count == 1)
+            try offer([1, 0, 2, 0], to: capture, sampleInterval: 2..<4, captureTimestampNanoseconds: 10)
+            try await requireCoordinatorCondition("post-floor caption commit") {
+                guard let driver = bag.all().first else { return false }
+                return await driver.committedUtterances().count == 1
+            }
+            let driver = try #require(bag.all().first)
+            #expect(await driver.committedUtterances().first?.utteranceID == current.utteranceID)
+        } catch {
+            await cleanup()
+            throw error
+        }
+        await cleanup()
+    }
+
     @Test func optedInCapturesGetIsolatedAliasesAndOnlyTheirOwnPCM() async throws {
         let backend = CoordinatorCredentialBackend(secret: "fake-secret")
         let bag = CoordinatorDriverBag()
@@ -135,6 +196,63 @@ import Testing
         _ = await startTask.value
         await coordinator.stop()
         if let deferredError { throw deferredError }
+    }
+
+    @Test func captureRegistrationIsPublishedBeforeCredentialAwaitAndReadyIdentityIsLocal() async throws {
+        let backend = SuspendingCoordinatorCredentialBackend()
+        let bag = CoordinatorDriverBag()
+        let identities = CoordinatorSourceIdentityBag()
+        let coordinator = NativeRealtimeSessionCoordinator(
+            credentialStore: RealtimeCredentialStore(backend: backend),
+            driverFactory: { _, _, _ in
+                let driver = CoordinatorFakeDriver()
+                bag.append(driver)
+                return driver
+            }
+        )
+        await coordinator.setCaptureRegistrationHandler { identities.append($0) }
+        await coordinator.setSourceReadyHandler { identities.append($0) }
+        let capture = makeCoordinatorCapture(sourceID: "source-a")
+        var settings = NativeRealtimeSettings.default
+        settings.isEnabled = true
+        settings.credentialReference = "fake-ref"
+        settings.enabledSourceIDs = ["source-a"]
+
+        let startTask = Task {
+            await coordinator.start(captures: [capture.source], settings: settings)
+        }
+        func cleanup() async {
+            startTask.cancel()
+            await backend.releaseLookup(with: "fake-secret")
+            _ = await startTask.value
+            await coordinator.stop()
+        }
+        do {
+            try await requireCoordinatorCondition("capture registration before credential await") {
+                let lookupStarted = await backend.lookupCount() == 1
+                return identities.registrations().count == 1 && lookupStarted
+            }
+            #expect(identities.registrations() == [RealtimeCaptureRegistration(
+                sourceID: "source-a",
+                sourceToken: capture.source.input.sourceToken,
+                captureGeneration: capture.source.input.generation
+            )])
+            #expect(identities.ready().isEmpty)
+
+            await backend.releaseLookup(with: "fake-secret")
+            let started = await startTask.value
+            #expect(started.count == 1)
+            let ready = try #require(identities.ready().first)
+            #expect(ready.sourceID == "source-a")
+            #expect(ready.sourceToken == capture.source.input.sourceToken)
+            #expect(ready.captureGeneration == capture.source.input.generation)
+            #expect(ready.alias == started[0].alias)
+            #expect(ready.driverGeneration == started[0].generation)
+        } catch {
+            await cleanup()
+            throw error
+        }
+        await cleanup()
     }
 
     @Test func committedCaptionIsNotReportedLocalOnlyWhenAudioReaderFailsBeforeTerminal() async throws {
@@ -3279,6 +3397,7 @@ import Testing
     @Test func interleavedSourcesKeepStartupQueueCorrectionsAndTerminalIdentityIsolated() async throws {
         let bag = CoordinatorDriverBag()
         let events = CoordinatorCaptionEventBag()
+        let identities = CoordinatorSourceIdentityBag()
         var settings = NativeRealtimeSettings.default
         settings.isEnabled = true
         settings.credentialReference = "fake-ref"
@@ -3296,6 +3415,7 @@ import Testing
             }
         )
         await coordinator.setCaptionEventHandler { events.append($0) }
+        await coordinator.setSourceReadyHandler { identities.append($0) }
         let firstCapture = makeCoordinatorCapture(sourceID: "source-a")
         let secondCapture = makeCoordinatorCapture(sourceID: "source-b")
         let startFinished = CoordinatorCompletionFlag()
@@ -3316,11 +3436,16 @@ import Testing
                 let firstHeld = await first.isStartSuspended()
                 let secondStarted = await second.successfulStartCount() == 1
                 let active = await coordinator.activeSourceIDs()
+                let readyB = identities.ready().first { $0.sourceID == "source-b" }
                 return firstHeld && secondStarted && active == ["source-b"]
+                    && readyB?.sourceToken == secondCapture.source.input.sourceToken
+                    && readyB?.captureGeneration == secondCapture.source.input.generation
+                    && readyB?.alias == "audio-2"
             }
             guard bag.all().count == 2 else { throw CoordinatorFixtureError.offerRejected }
             let firstDriver = bag.all()[0]
             let secondDriver = bag.all()[1]
+            #expect(identities.ready().map(\.sourceID) == ["source-b"])
 
             let firstCaptions = [
                 RealtimeAcceptedCaptionMetadata(
@@ -3743,7 +3868,8 @@ private final class CoordinatorSampleClock: @unchecked Sendable {
 
 private func makeCoordinatorCapture(
     sourceID: String,
-    maximumBufferedFrames: Int = 32_000
+    maximumBufferedFrames: Int = 32_000,
+    firstAvailableSampleIndex: Int64 = 0
 ) -> CoordinatorCaptureFixture {
     let token = UUID()
     let fanout = RealtimePCM16AudioFanout(
@@ -3751,7 +3877,7 @@ private func makeCoordinatorCapture(
         generation: 3,
         maximumBufferedFrames: maximumBufferedFrames
     )
-    let input = fanout.makeInput()!
+    let input = fanout.makeInput(firstAvailableSampleIndex: firstAvailableSampleIndex)!
     return CoordinatorCaptureFixture(
         source: NativeRealtimeCaptureSource(
             sourceID: sourceID,
@@ -3848,10 +3974,13 @@ private actor CoordinatorCredentialBackend: RealtimeCredentialBackend {
 private actor SuspendingCoordinatorCredentialBackend: RealtimeCredentialBackend {
     private var lookupCountStorage = 0
     private var lookupContinuation: CheckedContinuation<String?, any Error>?
+    private var lookupReleaseRequested = false
+    private var releasedSecret: String?
 
     func put(reference: String, secret: String) async throws {}
     func get(reference: String) async throws -> String? {
         lookupCountStorage += 1
+        if lookupReleaseRequested { return releasedSecret }
         return try await withCheckedThrowingContinuation { continuation in
             lookupContinuation = continuation
         }
@@ -3860,6 +3989,9 @@ private actor SuspendingCoordinatorCredentialBackend: RealtimeCredentialBackend 
     func lookupCount() -> Int { lookupCountStorage }
 
     func releaseLookup(with secret: String?) {
+        guard lookupReleaseRequested == false else { return }
+        lookupReleaseRequested = true
+        releasedSecret = secret
         guard let continuation = lookupContinuation else { return }
         lookupContinuation = nil
         continuation.resume(returning: secret)
@@ -3934,6 +4066,36 @@ private final class CoordinatorCaptionEventBag: @unchecked Sendable {
         lock.lock()
         defer { lock.unlock() }
         return events
+    }
+}
+
+private final class CoordinatorSourceIdentityBag: @unchecked Sendable {
+    private let lock = NSLock()
+    private var registrationStorage: [RealtimeCaptureRegistration] = []
+    private var readyStorage: [RealtimeSourceReadyIdentity] = []
+
+    func append(_ registration: RealtimeCaptureRegistration) {
+        lock.lock()
+        registrationStorage.append(registration)
+        lock.unlock()
+    }
+
+    func append(_ identity: RealtimeSourceReadyIdentity) {
+        lock.lock()
+        readyStorage.append(identity)
+        lock.unlock()
+    }
+
+    func registrations() -> [RealtimeCaptureRegistration] {
+        lock.lock()
+        defer { lock.unlock() }
+        return registrationStorage
+    }
+
+    func ready() -> [RealtimeSourceReadyIdentity] {
+        lock.lock()
+        defer { lock.unlock() }
+        return readyStorage
     }
 }
 

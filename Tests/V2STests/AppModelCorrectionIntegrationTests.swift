@@ -82,6 +82,896 @@ import Testing
         await coordinator.stop()
     }
 
+    @Test func acceptedLegacyFinalDuringInstalledInputRegistrationGapTransfersExactProvenance() async throws {
+        let credentials = IntegrationNativeCredentialBackend(secret: "fake-secret")
+        let drivers = IntegrationNativeDriverBag()
+        let coordinator = NativeRealtimeSessionCoordinator(
+            credentialStore: RealtimeCredentialStore(backend: credentials),
+            driverFactory: { _, _, _ in
+                let driver = IntegrationNativeRealtimeDriver()
+                drivers.append(driver)
+                return driver
+            }
+        )
+        let fixture = makeFixture(
+            correctionSettings: configuredCorrectionSettings(isEnabled: false),
+            nativeRealtimeSettings: configuredNativeRealtimeSettings(
+                enabledSourceIDs: [microphoneSource.id]
+            ),
+            nativeRealtimeSessionCoordinator: coordinator
+        )
+        defer { fixture.removeSettingsFile() }
+        let session = LiveTranscriptionSession()
+        session.setStartOperationForTesting {
+            await session.beginRecognitionSessionForTesting()
+        }
+        fixture.model.sourceLanguageOverrides[fixture.microphone.id] = "en"
+        fixture.model.sourceOutputLanguageOverrides[fixture.microphone.id] = "en"
+        fixture.model.selectedSourceIDs = [fixture.microphone.id]
+        fixture.model.setSessionResourcePreparationOperationForTesting {}
+        fixture.model.setLiveTranscriptionSessionFactoryForTesting { session }
+        fixture.model.acknowledgeNativeRealtimeDisclosureForNextSession()
+        let translationGate = AsyncTestGate()
+        fixture.model.pauseCaptionTranslationForTesting {
+            await translationGate.suspend()
+        }
+        let registrationGate = fixture.model.pauseNextNativeCoordinatorRegistrationForTesting()
+        let startTask = Task { await fixture.model.startSession() }
+        func cleanup() async {
+            await registrationGate.release()
+            await startTask.value
+            let translationTasks = fixture.model.captionTranslationTasksSnapshotForTesting()
+            let displayTask = fixture.model.captionDisplayTaskSnapshotForTesting()
+            let transferTasks = fixture.model.nativeCaptionTransferTasksSnapshotForTesting()
+            for task in translationTasks + transferTasks { task.cancel() }
+            displayTask?.cancel()
+            fixture.model.stopSession()
+            await translationGate.resume()
+            for task in translationTasks { await task.value }
+            for task in transferTasks { await task.value }
+            await displayTask?.value
+            await coordinator.stop()
+            await startTask.value
+        }
+
+        do {
+            try await registrationGate.waitUntilReached(timeoutNanoseconds: 8_000_000_000)
+            await session.resetCorrectionAudioCapture(enabled: false)
+            await session.beginLegacySampleMappingForTesting()
+            let inputPCM = try integrationRealtimeBuffer(samples: [0.25, -0.25])
+            #expect(await session.appendLegacyNormalizedBufferForTesting(inputPCM, preservesIdentity: true) == 0..<2)
+            #expect(await session.queueLegacyCommittedEmissionForTesting(
+                text: "registration gap final",
+                segments: [LegacySpeechSegmentTiming(timestamp: 0, duration: 2.0 / 16_000)],
+                promotionSegmentID: UUID()
+            ))
+            #expect(fixture.model.registeredLiveSessionForTesting(sourceID: fixture.microphone.id) === session)
+            await session.deliverQueuedCommittedEmissionForTesting()
+            #expect(fixture.model.acceptedFinalDeliveryCountForTesting == 1)
+            #expect(fixture.model.transcriptEntries.contains { $0.sourceText == "registration gap final" })
+            try await translationGate.waitUntilSuspended(timeoutNanoseconds: 8_000_000_000)
+
+            await registrationGate.release()
+            await startTask.value
+            #expect(fixture.model.nativeAcceptedBindingStateForTesting.0 == 1)
+            #expect(fixture.model.nativeAcceptedBindingStateForTesting.2 == 1)
+            try await waitUntil {
+                await fixture.model.nativeAcceptedMetadataForTesting(sourceID: fixture.microphone.id) != nil
+            }
+            try await waitUntil {
+                fixture.model.transcriptEntries.contains { $0.sourceText == "registration gap final" }
+            }
+            let accepted = try #require(await fixture.model.nativeAcceptedMetadataForTesting(sourceID: fixture.microphone.id))
+            #expect(accepted.sourceID == fixture.microphone.id)
+            #expect(accepted.captionID == fixture.model.transcriptEntries.first?.id)
+            #expect(accepted.sourceLanguageID == "en")
+            #expect(accepted.targetLanguageID == "en")
+            #expect(accepted.sampleInterval == 0..<2)
+            #expect(UUID(uuidString: accepted.utteranceID) != nil)
+            fixture.model.deliverNativeCaptureRegistrationForTesting(RealtimeCaptureRegistration(
+                sourceID: accepted.sourceID,
+                sourceToken: accepted.sourceToken,
+                captureGeneration: accepted.captureGeneration &- 1
+            ))
+            #expect(fixture.model.nativeAcceptedBindingStateForTesting.0 == 1)
+            #expect(await fixture.model.nativeAcceptedMetadataForTesting(sourceID: accepted.sourceID) == accepted)
+
+            var legacySettings = fixture.model.correction.settings
+            legacySettings.apiKey = "edited legacy key"
+            legacySettings.baseURL = "https://legacy.example/v1"
+            legacySettings.model = "legacy-model"
+            legacySettings.isEnabled = true
+            legacySettings.disabledSourceIDs = [fixture.microphone.id]
+            legacySettings.isolatedContextSourceIDs = [fixture.microphone.id]
+            fixture.model.correction.settings = legacySettings
+            #expect(await session.appendLegacyNormalizedBufferForTesting(inputPCM, preservesIdentity: true) == 2..<4)
+            #expect(await session.queueLegacyCommittedEmissionForTesting(
+                text: "after legacy configuration edit",
+                segments: [LegacySpeechSegmentTiming(timestamp: 2.0 / 16_000, duration: 2.0 / 16_000)]
+            ))
+            await session.deliverQueuedCommittedEmissionForTesting()
+            #expect(fixture.model.acceptedFinalDeliveryCountForTesting == 2)
+            #expect(fixture.model.pendingCaptionCountForTesting > 0)
+            let acceptedBindings = fixture.model.nativeAcceptedBindingsForTesting(sourceID: accepted.sourceID)
+            #expect(acceptedBindings.count == 2)
+            #expect(acceptedBindings.last?.sampleInterval == 2..<4)
+        } catch {
+            await cleanup()
+            throw error
+        }
+        await cleanup()
+    }
+
+    @Test func acceptedFinalBeforeNativeInputCreationStaysLocalAndIsNotReplayed() async throws {
+        let credentials = IntegrationNativeCredentialBackend(secret: "fake-secret")
+        let coordinator = NativeRealtimeSessionCoordinator(
+            credentialStore: RealtimeCredentialStore(backend: credentials),
+            driverFactory: { _, _, _ in IntegrationNativeRealtimeDriver() }
+        )
+        let fixture = makeFixture(
+            correctionSettings: configuredCorrectionSettings(isEnabled: false),
+            nativeRealtimeSettings: configuredNativeRealtimeSettings(
+                enabledSourceIDs: [microphoneSource.id]
+            ),
+            nativeRealtimeSessionCoordinator: coordinator
+        )
+        defer { fixture.removeSettingsFile() }
+        let session = LiveTranscriptionSession()
+        let localStartGate = AsyncTestGate()
+        session.setStartOperationForTesting {
+            await session.beginRecognitionSessionForTesting()
+            await localStartGate.suspend()
+        }
+        fixture.model.sourceLanguageOverrides[fixture.microphone.id] = "en"
+        fixture.model.sourceOutputLanguageOverrides[fixture.microphone.id] = "en"
+        fixture.model.selectedSourceIDs = [fixture.microphone.id]
+        fixture.model.setSessionResourcePreparationOperationForTesting {}
+        fixture.model.setLiveTranscriptionSessionFactoryForTesting { session }
+        fixture.model.acknowledgeNativeRealtimeDisclosureForNextSession()
+        let startTask = Task { await fixture.model.startSession() }
+        func cleanup() async {
+            await localStartGate.resume()
+            await startTask.value
+            let translations = fixture.model.captionTranslationTasksSnapshotForTesting()
+            let display = fixture.model.captionDisplayTaskSnapshotForTesting()
+            let transfers = fixture.model.nativeCaptionTransferTasksSnapshotForTesting()
+            (translations + transfers).forEach { $0.cancel() }
+            display?.cancel()
+            fixture.model.stopSession()
+            for task in translations { await task.value }
+            for task in transfers { await task.value }
+            await display?.value
+            await coordinator.stop()
+            await startTask.value
+        }
+
+        do {
+            try await localStartGate.waitUntilSuspended(timeoutNanoseconds: 8_000_000_000)
+            await session.resetCorrectionAudioCapture(enabled: false)
+            await session.beginLegacySampleMappingForTesting()
+            let inputPCM = try integrationRealtimeBuffer(samples: [0.25, -0.25])
+            #expect(await session.appendLegacyNormalizedBufferForTesting(inputPCM, preservesIdentity: true) == 0..<2)
+            #expect(await session.queueLegacyCommittedEmissionForTesting(
+                text: "pre-input final",
+                segments: [LegacySpeechSegmentTiming(timestamp: 0, duration: 2.0 / 16_000)]
+            ))
+            await session.deliverQueuedCommittedEmissionForTesting()
+            #expect(fixture.model.acceptedFinalDeliveryCountForTesting == 1)
+
+            await localStartGate.resume()
+            await startTask.value
+            try await waitUntil {
+                fixture.model.transcriptEntries.contains { $0.sourceText == "pre-input final" }
+            }
+            #expect(await fixture.model.nativeAcceptedMetadataForTesting(sourceID: fixture.microphone.id) == nil)
+            #expect(fixture.model.transcriptEntries.contains { $0.sourceText == "pre-input final" })
+        } catch {
+            await cleanup()
+            throw error
+        }
+        await cleanup()
+    }
+
+    @Test func delayedLegacyFinalBeforeConsumerFloorRemainsLocalAfterInputInstall() async throws {
+        let credentials = IntegrationNativeCredentialBackend(secret: "fake-secret")
+        let coordinator = NativeRealtimeSessionCoordinator(
+            credentialStore: RealtimeCredentialStore(backend: credentials),
+            driverFactory: { _, _, _ in IntegrationNativeRealtimeDriver() }
+        )
+        let fixture = makeFixture(
+            correctionSettings: configuredCorrectionSettings(isEnabled: false),
+            nativeRealtimeSettings: configuredNativeRealtimeSettings(
+                enabledSourceIDs: [microphoneSource.id]
+            ),
+            nativeRealtimeSessionCoordinator: coordinator
+        )
+        defer { fixture.removeSettingsFile() }
+        fixture.model.sourceLanguageOverrides[fixture.microphone.id] = "en"
+        fixture.model.sourceOutputLanguageOverrides[fixture.microphone.id] = "en"
+        fixture.model.selectedSourceIDs = [fixture.microphone.id]
+        fixture.model.setSessionResourcePreparationOperationForTesting {}
+        fixture.model.acknowledgeNativeRealtimeDisclosureForNextSession()
+        let session = LiveTranscriptionSession()
+        let localStartGate = AsyncTestGate()
+        session.setStartOperationForTesting {
+            await session.beginRecognitionSessionForTesting()
+            await localStartGate.suspend()
+        }
+        fixture.model.setLiveTranscriptionSessionFactoryForTesting { session }
+        let startTask = Task { await fixture.model.startSession() }
+        func cleanup() async {
+            await localStartGate.resume()
+            await startTask.value
+            let translations = fixture.model.captionTranslationTasksSnapshotForTesting()
+            let display = fixture.model.captionDisplayTaskSnapshotForTesting()
+            let transfers = fixture.model.nativeCaptionTransferTasksSnapshotForTesting()
+            (translations + transfers).forEach { $0.cancel() }
+            display?.cancel()
+            fixture.model.stopSession()
+            await display?.value
+            for task in translations + transfers { await task.value }
+            await coordinator.stop()
+            await startTask.value
+        }
+
+        do {
+            try await localStartGate.waitUntilSuspended(timeoutNanoseconds: 8_000_000_000)
+            await session.resetCorrectionAudioCapture(enabled: false)
+            await session.beginLegacySampleMappingForTesting()
+            let inputPCM = try integrationRealtimeBuffer(samples: [0.25, -0.25])
+            #expect(await session.appendLegacyNormalizedBufferForTesting(inputPCM, preservesIdentity: true) == 0..<2)
+            #expect(await session.queueLegacyCommittedEmissionForTesting(
+                text: "delayed no-consumer final",
+                segments: [LegacySpeechSegmentTiming(timestamp: 0, duration: 2.0 / 16_000)]
+            ))
+
+            await localStartGate.resume()
+            try await waitUntil { fixture.model.nativeAcceptedBindingStateForTesting.2 == 1 }
+            #expect(fixture.model.nativeCaptureIdentitiesForTesting[fixture.microphone.id] != nil)
+            await session.deliverQueuedCommittedEmissionForTesting()
+            try await waitUntil {
+                fixture.model.transcriptEntries.contains { $0.sourceText == "delayed no-consumer final" }
+            }
+            #expect(fixture.model.nativeAcceptedBindingsForTesting(sourceID: fixture.microphone.id).isEmpty)
+            #expect(await fixture.model.nativeAcceptedMetadataForTesting(sourceID: fixture.microphone.id) == nil)
+
+            #expect(await session.appendLegacyNormalizedBufferForTesting(inputPCM, preservesIdentity: true) == 2..<4)
+            #expect(await session.queueLegacyCommittedEmissionForTesting(
+                text: "post-install final",
+                segments: [LegacySpeechSegmentTiming(timestamp: 2.0 / 16_000, duration: 2.0 / 16_000)]
+            ))
+            await session.deliverQueuedCommittedEmissionForTesting()
+            try await waitUntil { fixture.model.nativeAcceptedBindingsForTesting(sourceID: fixture.microphone.id).count == 1 }
+            let accepted = try #require(await fixture.model.nativeAcceptedMetadataForTesting(sourceID: fixture.microphone.id))
+            #expect(accepted.sampleInterval == 2..<4)
+        } catch {
+            await cleanup()
+            throw error
+        }
+        await cleanup()
+    }
+
+    @Test @available(macOS 26.0, *) func registeredCaptionTransfersStayBelowPerSourcePendingLimitWhileLocalCaptionsContinue() async throws {
+        let credentials = IntegrationNativeCredentialBackend(secret: "fake-secret")
+        let coordinator = NativeRealtimeSessionCoordinator(
+            credentialStore: RealtimeCredentialStore(backend: credentials),
+            driverFactory: { _, _, _ in IntegrationNativeRealtimeDriver() }
+        )
+        let fixture = makeFixture(
+            correctionSettings: configuredCorrectionSettings(isEnabled: false),
+            nativeRealtimeSettings: configuredNativeRealtimeSettings(
+                enabledSourceIDs: [microphoneSource.id]
+            ),
+            nativeRealtimeSessionCoordinator: coordinator
+        )
+        defer { fixture.removeSettingsFile() }
+        fixture.model.sourceLanguageOverrides[fixture.microphone.id] = "en"
+        fixture.model.sourceOutputLanguageOverrides[fixture.microphone.id] = "en"
+        fixture.model.selectedSourceIDs = [fixture.microphone.id]
+        fixture.model.setSessionResourcePreparationOperationForTesting {}
+        fixture.model.acknowledgeNativeRealtimeDisclosureForNextSession()
+        let session = LiveTranscriptionSession()
+        session.setStartOperationForTesting { await session.beginRecognitionSessionForTesting() }
+        fixture.model.setLiveTranscriptionSessionFactoryForTesting { session }
+        let transferGate = AsyncTestGate()
+        fixture.model.pauseNativeCaptionTransfersForTesting { await transferGate.suspend() }
+        let startTask = Task { await fixture.model.startSession() }
+        func cleanup() async {
+            let transferTasks = fixture.model.nativeCaptionTransferTasksSnapshotForTesting()
+            let translationTasks = fixture.model.captionTranslationTasksSnapshotForTesting()
+            let displayTask = fixture.model.captionDisplayTaskSnapshotForTesting()
+            for task in transferTasks + translationTasks { task.cancel() }
+            displayTask?.cancel()
+            await transferGate.resume()
+            fixture.model.stopSession()
+            for task in transferTasks + translationTasks { await task.value }
+            await displayTask?.value
+            await coordinator.stop()
+            await startTask.value
+        }
+
+        do {
+            await startTask.value
+            let analyzerInputs = await session.installModernAnalyzerInputStreamForTesting()
+            var iterator = analyzerInputs.makeAsyncIterator()
+            let inputPCM = try integrationRealtimeBuffer(samples: [0.25, -0.25])
+            let sentences = [
+                "Apple trees bloom beside the quiet river.",
+                "Weather forecasts say rain arrives tomorrow.",
+                "Trains leave the station before sunrise each day.",
+                "Small birds gather along the garden fence.",
+                "Coffee cools slowly on the wooden table.",
+                "Cloud shadows cross the mountain in spring.",
+                "Children read stories beside the library window.",
+                "Blue bicycles lean against the brick wall.",
+                "Morning buses turn carefully around the market."
+            ]
+            for index in 0..<9 {
+                let lower = Int64(index * 2)
+                await session.appendCapturedAudioBufferForTesting(inputPCM)
+                let analyzerInput = try #require(await iterator.next())
+                let bufferStart = try #require(analyzerInput.bufferStartTime)
+                let duration = CMTime(value: 2, timescale: 16_000)
+                let provenance = try #require(await session.modernAudioProvenanceForTesting(
+                    CMTimeRange(start: bufferStart, duration: duration)
+                ))
+                #expect(provenance.sampleInterval == lower..<(lower + 2))
+                let text = sentences[index]
+                session.deliverRecognizedSentenceForTesting(RecognizedSentence(
+                    text: text,
+                    audioProvenance: provenance
+                ))
+                #expect(fixture.model.acceptedFinalDeliveryCountForTesting == index + 1)
+                try await waitUntil(timeout: .seconds(5)) {
+                    fixture.model.transcriptEntries.contains { $0.sourceText == text }
+                }
+                #expect(fixture.model.nativeAcceptedBindingsForTesting(sourceID: fixture.microphone.id).count == min(index + 1, 8))
+            }
+            try await transferGate.waitUntilSuspended(timeoutNanoseconds: 8_000_000_000)
+            #expect(fixture.model.acceptedFinalDeliveryCountForTesting == 9)
+            #expect(fixture.model.localCaptionWasEnqueuedForTesting(sentences[8]))
+            #expect(fixture.model.nativeAcceptedBindingStateForTesting.1 == 8)
+            #expect(fixture.model.nativeAcceptedBindingsForTesting(sourceID: fixture.microphone.id).count == 8)
+        } catch {
+            await cleanup()
+            throw error
+        }
+        await cleanup()
+    }
+
+    @Test func clearTranscriptRevokesAnUnadmittedAcceptedTransferWithoutStoppingCapture() async throws {
+        let credentials = IntegrationNativeCredentialBackend(secret: "fake-secret")
+        let coordinator = NativeRealtimeSessionCoordinator(
+            credentialStore: RealtimeCredentialStore(backend: credentials),
+            driverFactory: { _, _, _ in IntegrationNativeRealtimeDriver() }
+        )
+        let fixture = makeFixture(
+            correctionSettings: configuredCorrectionSettings(isEnabled: false),
+            nativeRealtimeSettings: configuredNativeRealtimeSettings(enabledSourceIDs: [microphoneSource.id]),
+            nativeRealtimeSessionCoordinator: coordinator
+        )
+        defer { fixture.removeSettingsFile() }
+        fixture.model.sourceLanguageOverrides[fixture.microphone.id] = "en"
+        fixture.model.sourceOutputLanguageOverrides[fixture.microphone.id] = "en"
+        fixture.model.selectedSourceIDs = [fixture.microphone.id]
+        fixture.model.setSessionResourcePreparationOperationForTesting {}
+        fixture.model.acknowledgeNativeRealtimeDisclosureForNextSession()
+        let session = LiveTranscriptionSession()
+        session.setStartOperationForTesting { await session.beginRecognitionSessionForTesting() }
+        fixture.model.setLiveTranscriptionSessionFactoryForTesting { session }
+        let transferGate = AsyncTestGate()
+        fixture.model.pauseNativeCaptionTransfersForTesting { await transferGate.suspend() }
+        let startTask = Task { await fixture.model.startSession() }
+        func cleanup(_ capturedTasks: [Task<Void, Never>] = []) async {
+            let transfers = fixture.model.nativeCaptionTransferTasksSnapshotForTesting() + capturedTasks
+            let translations = fixture.model.captionTranslationTasksSnapshotForTesting()
+            let display = fixture.model.captionDisplayTaskSnapshotForTesting()
+            (transfers + translations).forEach { $0.cancel() }
+            display?.cancel()
+            await transferGate.resume()
+            fixture.model.stopSession()
+            for task in transfers + translations { await task.value }
+            await display?.value
+            await coordinator.stop()
+            await startTask.value
+        }
+
+        var capturedTasks: [Task<Void, Never>] = []
+        do {
+            await startTask.value
+            await session.resetCorrectionAudioCapture(enabled: false)
+            await session.beginLegacySampleMappingForTesting()
+            let pcm = try integrationRealtimeBuffer(samples: [0.25, -0.25])
+            #expect(await session.appendLegacyNormalizedBufferForTesting(pcm, preservesIdentity: true) == 0..<2)
+            #expect(await session.queueLegacyCommittedEmissionForTesting(
+                text: "a caption cleared before transfer admission",
+                segments: [LegacySpeechSegmentTiming(timestamp: 0, duration: 2.0 / 16_000)]
+            ))
+            await session.deliverQueuedCommittedEmissionForTesting()
+            try await transferGate.waitUntilSuspended(timeoutNanoseconds: 8_000_000_000)
+            let firstBinding = try #require(fixture.model.nativeAcceptedBindingsForTesting(sourceID: fixture.microphone.id).last)
+            capturedTasks = fixture.model.nativeCaptionTransferTasksSnapshotForTesting()
+            #expect(capturedTasks.count == 1)
+
+            fixture.model.clearTranscript()
+            #expect(fixture.model.nativeAcceptedBindingsForTesting(sourceID: fixture.microphone.id).isEmpty)
+            let allTransfersCancelled = capturedTasks.allSatisfy { task in task.isCancelled }
+            #expect(allTransfersCancelled)
+            await transferGate.resume()
+            for task in capturedTasks { await task.value }
+            #expect(await coordinator.acceptedCaptionMetadataForTesting(sourceID: fixture.microphone.id) == nil)
+            #expect(fixture.model.sessionState == .running)
+
+            #expect(await session.appendLegacyNormalizedBufferForTesting(pcm, preservesIdentity: true) == 2..<4)
+            #expect(await session.queueLegacyCommittedEmissionForTesting(
+                text: "a later caption continues on the same capture",
+                segments: [LegacySpeechSegmentTiming(timestamp: 2.0 / 16_000, duration: 2.0 / 16_000)]
+            ))
+            await session.deliverQueuedCommittedEmissionForTesting()
+            try await waitUntil {
+                fixture.model.nativeAcceptedBindingsForTesting(sourceID: fixture.microphone.id).count == 1
+            }
+            let later = try #require(fixture.model.nativeAcceptedBindingsForTesting(sourceID: fixture.microphone.id).last)
+            #expect(later.captionID != firstBinding.captionID)
+            try await waitUntil {
+                fixture.model.nativeAcceptedTransferDispositionForTesting(captionID: later.captionID) == .queued
+            }
+            #expect(await coordinator.acceptedCaptionMetadataForTesting(sourceID: fixture.microphone.id) != nil)
+        } catch {
+            await cleanup(capturedTasks)
+            throw error
+        }
+        await cleanup(capturedTasks)
+    }
+
+    @Test @available(macOS 26.0, *) func acceptedNativeRecordLimitProtectsCoordinatorQueuedCaptionsAndDegradesLocally() async throws {
+        let credentials = IntegrationNativeCredentialBackend(secret: "fake-secret")
+        let driver = IntegrationNativeRealtimeDriver()
+        let coordinator = NativeRealtimeSessionCoordinator(
+            credentialStore: RealtimeCredentialStore(backend: credentials),
+            driverFactory: { _, _, _ in driver }
+        )
+        let fixture = makeFixture(
+            correctionSettings: configuredCorrectionSettings(isEnabled: false),
+            nativeRealtimeSettings: configuredNativeRealtimeSettings(enabledSourceIDs: [microphoneSource.id]),
+            nativeRealtimeSessionCoordinator: coordinator
+        )
+        defer { fixture.removeSettingsFile() }
+        fixture.model.sourceLanguageOverrides[fixture.microphone.id] = "en"
+        fixture.model.sourceOutputLanguageOverrides[fixture.microphone.id] = "en"
+        fixture.model.selectedSourceIDs = [fixture.microphone.id]
+        fixture.model.setSessionResourcePreparationOperationForTesting {}
+        fixture.model.acknowledgeNativeRealtimeDisclosureForNextSession()
+        let session = LiveTranscriptionSession()
+        session.setStartOperationForTesting { await session.beginRecognitionSessionForTesting() }
+        fixture.model.setLiveTranscriptionSessionFactoryForTesting { session }
+        let translationGate = AsyncTestGate()
+        fixture.model.pauseCaptionTranslationForTesting { await translationGate.suspend() }
+        let startTask = Task { await fixture.model.startSession() }
+        func cleanup() async {
+            let translationTasks = fixture.model.captionTranslationTasksSnapshotForTesting()
+            let display = fixture.model.captionDisplayTaskSnapshotForTesting()
+            let transferTasks = fixture.model.nativeCaptionTransferTasksSnapshotForTesting()
+            (translationTasks + transferTasks).forEach { $0.cancel() }
+            display?.cancel()
+            fixture.model.stopSession()
+            await translationGate.resume()
+            for task in translationTasks { await task.value }
+            for task in transferTasks { await task.value }
+            await display?.value
+            await coordinator.stop()
+            await startTask.value
+        }
+
+        func captionText(_ index: Int) -> String {
+            var state = UInt64(index) &+ 0x9E37_79B9_7F4A_7C15
+            var letters: [Character] = []
+            for _ in 0..<64 {
+                state &+= 0x9E37_79B9_7F4A_7C15
+                var mixed = state
+                mixed = (mixed ^ (mixed >> 30)) &* 0xBF58_476D_1CE4_E5B9
+                mixed = (mixed ^ (mixed >> 27)) &* 0x94D0_49BB_1331_11EB
+                mixed ^= mixed >> 31
+                letters.append(Character(UnicodeScalar(97 + Int(mixed % 26))!))
+            }
+            return stride(from: 0, to: letters.count, by: 8).map {
+                String(letters[$0..<($0 + 8)])
+            }.joined(separator: " ")
+        }
+
+        var activeCaptionIndex = -1
+        var activeCaptionID: UUID?
+        var activePhase = "starting"
+        do {
+            await startTask.value
+            let analyzerInputs = await session.installModernAnalyzerInputStreamForTesting()
+            var iterator = analyzerInputs.makeAsyncIterator()
+            let pcm = try integrationRealtimeBuffer(samples: [0.25, -0.25])
+            try await waitUntil(timeout: .seconds(5)) { await driver.isListeningForEvents() }
+            var firstBinding: RealtimeAcceptedCaptionMetadata?
+            var firstEightBindings: [RealtimeAcceptedCaptionMetadata] = []
+            var firstProvenance: RecognizedAudioProvenance?
+            var firstEvictableBinding: RealtimeAcceptedCaptionMetadata?
+            for index in 0...128 {
+                activeCaptionIndex = index
+                activePhase = "audio and final callback"
+                let text = captionText(index)
+                let lower = Int64(index * 2)
+                let provenance: RecognizedAudioProvenance
+                if index < 8 {
+                    await session.appendCapturedAudioBufferForTesting(pcm)
+                    let analyzerInput = try #require(await iterator.next())
+                    let bufferStart = try #require(analyzerInput.bufferStartTime)
+                    let duration = CMTime(value: 2, timescale: 16_000)
+                    provenance = try #require(await session.modernAudioProvenanceForTesting(
+                        CMTimeRange(start: bufferStart, duration: duration)
+                    ))
+                    #expect(provenance.sampleInterval == lower..<(lower + 2))
+                    if index == 0 { firstProvenance = provenance }
+                } else {
+                    provenance = try #require(firstProvenance)
+                }
+                session.deliverRecognizedSentenceForTesting(RecognizedSentence(text: text, audioProvenance: provenance))
+                #expect(fixture.model.acceptedFinalDeliveryCountForTesting == index + 1)
+                try await waitUntil(timeout: .seconds(5)) {
+                    fixture.model.localCaptionWasEnqueuedForTesting(text)
+                }
+                activePhase = "binding admission"
+                let bindings = fixture.model.nativeAcceptedBindingsForTesting(sourceID: fixture.microphone.id)
+                if index < 128 {
+                    try await waitUntil(timeout: .seconds(5)) {
+                        fixture.model.nativeAcceptedBindingsForTesting(sourceID: fixture.microphone.id).count == index + 1
+                    }
+                    let binding = try #require(fixture.model.nativeAcceptedBindingsForTesting(sourceID: fixture.microphone.id).last)
+                    activeCaptionID = binding.captionID
+                    if index < 8 {
+                        activePhase = "coordinator transfer disposition"
+                        try await waitUntil(timeout: .seconds(5)) {
+                            fixture.model.nativeAcceptedTransferDispositionForTesting(captionID: binding.captionID) == .queued
+                        }
+                        let ready = try #require(fixture.model.nativeAcceptedReadyIdentityForTesting(captionID: binding.captionID))
+                        activePhase = "driver commit"
+                        try await waitUntil(timeout: .seconds(5)) { await driver.committedUtteranceCount() == index + 1 }
+                        activePhase = "coordinator commit acceptance"
+                        try await waitUntil(timeout: .seconds(5)) {
+                            await coordinator.captionCommitSucceededForTesting(
+                                sourceID: fixture.microphone.id,
+                                captionID: binding.captionID
+                            )
+                        }
+                        await driver.emit(.utteranceCompleted(
+                            sourceAlias: ready.alias,
+                            generation: ready.driverGeneration,
+                            captionID: binding.captionID,
+                            utteranceID: binding.utteranceID
+                        ))
+                        activePhase = "provider completion delivery"
+                        try await waitUntil(timeout: .seconds(5)) {
+                            await coordinator.inFlightCaptionIDForTesting(sourceID: fixture.microphone.id) == nil
+                        }
+                        firstEightBindings.append(binding)
+                        if index == 0 { firstBinding = binding }
+                    } else {
+                        activePhase = "local-only coordinator disposition"
+                        try await waitUntil(timeout: .seconds(5)) {
+                            fixture.model.nativeAcceptedTransferDispositionForTesting(captionID: binding.captionID) != nil
+                        }
+                        let disposition = fixture.model.nativeAcceptedTransferDispositionForTesting(captionID: binding.captionID)
+                        guard case .localOnly? = disposition else {
+                            Issue.record("expected stale-interval caption to stay local, got \(String(describing: disposition))")
+                            break
+                        }
+                        if index == 8 { firstEvictableBinding = binding }
+                    }
+                    fixture.model.finalizePendingLocalCaptionForTesting(captionID: binding.captionID, translation: "")
+                } else {
+                    #expect(bindings.count == 128)
+                    #expect(firstBinding.map { bindings.contains($0) } == true)
+                    #expect(firstEightBindings.allSatisfy { bindings.contains($0) })
+                    #expect(firstEvictableBinding.map { !bindings.contains($0) } == true)
+                    #expect(fixture.model.localCaptionWasEnqueuedForTesting(text))
+                }
+            }
+            #expect(fixture.model.nativeAcceptedBindingsForTesting(sourceID: fixture.microphone.id).count == 128)
+        } catch {
+            let transferDisposition = activeCaptionID.flatMap {
+                fixture.model.nativeAcceptedTransferDispositionForTesting(captionID: $0)
+            }
+            let admittedRanges = await coordinator.admittedAudioRangeCountForTesting(sourceID: fixture.microphone.id)
+            let committedCount = await driver.committedUtteranceCount()
+            let inFlight = await coordinator.inFlightCaptionIDForTesting(sourceID: fixture.microphone.id)
+            let appBindingState = fixture.model.nativeAcceptedBindingStateForTesting
+            let sourceBindings = fixture.model.nativeAcceptedBindingsForTesting(sourceID: fixture.microphone.id).count
+            let captureIdentity = fixture.model.nativeCaptureIdentitiesForTesting[fixture.microphone.id]
+            Issue.record("accepted native record limit stopped at caption index \(activeCaptionIndex) during \(activePhase), disposition \(String(describing: transferDisposition)), admitted ranges \(admittedRanges), commits \(committedCount), in flight \(String(describing: inFlight)), app state \(appBindingState), source bindings \(sourceBindings), capture identity present \(captureIdentity != nil): \(error)")
+            await cleanup()
+            throw error
+        }
+        await cleanup()
+    }
+
+    @Test @available(macOS 26.0, *) func pendingCaptionDropAtIndexOneRevokesUnadmittedNativeAndTranslationTasks() async throws {
+        let credentials = IntegrationNativeCredentialBackend(secret: "fake-secret")
+        let coordinator = NativeRealtimeSessionCoordinator(
+            credentialStore: RealtimeCredentialStore(backend: credentials),
+            driverFactory: { _, _, _ in IntegrationNativeRealtimeDriver() }
+        )
+        let fixture = makeFixture(
+            correctionSettings: configuredCorrectionSettings(isEnabled: false),
+            nativeRealtimeSettings: configuredNativeRealtimeSettings(enabledSourceIDs: [microphoneSource.id]),
+            nativeRealtimeSessionCoordinator: coordinator
+        )
+        defer { fixture.removeSettingsFile() }
+        fixture.model.sourceLanguageOverrides[fixture.microphone.id] = "en"
+        fixture.model.sourceOutputLanguageOverrides[fixture.microphone.id] = "en"
+        fixture.model.selectedSourceIDs = [fixture.microphone.id]
+        fixture.model.setSessionResourcePreparationOperationForTesting {}
+        fixture.model.acknowledgeNativeRealtimeDisclosureForNextSession()
+        let session = LiveTranscriptionSession()
+        session.setStartOperationForTesting { await session.beginRecognitionSessionForTesting() }
+        fixture.model.setLiveTranscriptionSessionFactoryForTesting { session }
+        let translationGate = AsyncTestGate()
+        let transferGate = AsyncTestGate()
+        fixture.model.pauseCaptionTranslationForTesting { await translationGate.suspend() }
+        fixture.model.pauseNativeCaptionTransfersForTesting { await transferGate.suspend() }
+        let startTask = Task { await fixture.model.startSession() }
+        func cleanup(
+            translationTasks: [Task<Void, Never>] = [],
+            transferTasks: [Task<Void, Never>] = []
+        ) async {
+            let allTranslationTasks = fixture.model.captionTranslationTasksSnapshotForTesting() + translationTasks
+            let allTransferTasks = fixture.model.nativeCaptionTransferTasksSnapshotForTesting() + transferTasks
+            let displayTask = fixture.model.captionDisplayTaskSnapshotForTesting()
+            for task in allTranslationTasks + allTransferTasks { task.cancel() }
+            displayTask?.cancel()
+            fixture.model.stopSession()
+            await translationGate.resume()
+            await transferGate.resume()
+            for task in allTranslationTasks + allTransferTasks { await task.value }
+            await displayTask?.value
+            await coordinator.stop()
+            await startTask.value
+        }
+
+        var translationTasks: [Task<Void, Never>] = []
+        var transferTasks: [Task<Void, Never>] = []
+        do {
+            await startTask.value
+            let stream = await session.installModernAnalyzerInputStreamForTesting()
+            var iterator = stream.makeAsyncIterator()
+            let pcm = try integrationRealtimeBuffer(samples: [0.25, -0.25])
+            let texts = [
+                "The orchard rests beside the river at sunrise.",
+                "A bright lantern guides travelers through the valley.",
+                "Fresh bread cools beside the open kitchen window.",
+                "Blue boats return quietly to the harbor at dusk."
+            ]
+            var droppedCaptionID: UUID?
+            var droppedTranslationTask: Task<Void, Never>?
+            var droppedTransferTask: Task<Void, Never>?
+            for index in texts.indices {
+                await session.appendCapturedAudioBufferForTesting(pcm)
+                let input = try #require(await iterator.next())
+                let start = try #require(input.bufferStartTime)
+                let provenance = try #require(await session.modernAudioProvenanceForTesting(
+                    CMTimeRange(start: start, duration: CMTime(value: 2, timescale: 16_000))
+                ))
+                session.deliverRecognizedSentenceForTesting(RecognizedSentence(
+                    text: texts[index],
+                    audioProvenance: provenance
+                ))
+                #expect(fixture.model.acceptedFinalDeliveryCountForTesting == index + 1)
+                try await waitUntil(timeout: .seconds(5)) {
+                    fixture.model.localCaptionWasEnqueuedForTesting(texts[index])
+                }
+                let bindings = fixture.model.nativeAcceptedBindingsForTesting(sourceID: fixture.microphone.id)
+                if index < 3 {
+                    try await waitUntil(timeout: .seconds(5)) { bindings.count == index + 1 }
+                    if index == 0 {
+                        try await translationGate.waitUntilSuspended(timeoutNanoseconds: 8_000_000_000)
+                        try await transferGate.waitUntilSuspended(timeoutNanoseconds: 8_000_000_000)
+                    }
+                    if index == 1 {
+                        let dropped = try #require(fixture.model.nativeAcceptedBindingsForTesting(sourceID: fixture.microphone.id).last)
+                        droppedCaptionID = dropped.captionID
+                        droppedTranslationTask = fixture.model.captionTranslationTaskForTesting(captionID: dropped.captionID)
+                        droppedTransferTask = fixture.model.nativeCaptionTransferTaskForTesting(captionID: dropped.captionID)
+                        #expect(droppedTranslationTask != nil)
+                        #expect(droppedTransferTask != nil)
+                    }
+                }
+            }
+            let droppedID = try #require(droppedCaptionID)
+            translationTasks = fixture.model.captionTranslationTasksSnapshotForTesting()
+            transferTasks = fixture.model.nativeCaptionTransferTasksSnapshotForTesting()
+            let bindings = fixture.model.nativeAcceptedBindingsForTesting(sourceID: fixture.microphone.id)
+            #expect(bindings.count == 3)
+            #expect(bindings.contains(where: { $0.captionID == droppedID }) == false)
+            #expect(droppedTranslationTask?.isCancelled == true)
+            #expect(droppedTransferTask?.isCancelled == true)
+            #expect(fixture.model.nativeAcceptedBindingStateForTesting.1 == 3)
+            #expect(fixture.model.pendingCaptionCountForTesting == 3)
+            #expect(fixture.model.localCaptionWasEnqueuedForTesting(texts[3]))
+        } catch {
+            await cleanup(translationTasks: translationTasks, transferTasks: transferTasks)
+            throw error
+        }
+        await cleanup(translationTasks: translationTasks, transferTasks: transferTasks)
+    }
+
+    @Test @available(macOS 26.0, *) func unregisteredNativeCaptionStagingIsCappedPerSourceAndKeepsLocalCaptions() async throws {
+        let coordinator = NativeRealtimeSessionCoordinator(
+            credentialStore: RealtimeCredentialStore(backend: IntegrationNativeCredentialBackend(secret: "fake-secret")),
+            driverFactory: { _, _, _ in IntegrationNativeRealtimeDriver() }
+        )
+        let fixture = makeFixture(
+            correctionSettings: configuredCorrectionSettings(isEnabled: false),
+            nativeRealtimeSettings: configuredNativeRealtimeSettings(enabledSourceIDs: [microphoneSource.id]),
+            nativeRealtimeSessionCoordinator: coordinator
+        )
+        defer { fixture.removeSettingsFile() }
+        let session = LiveTranscriptionSession()
+        session.setStartOperationForTesting { await session.beginRecognitionSessionForTesting() }
+        fixture.model.sourceLanguageOverrides[fixture.microphone.id] = "en"
+        fixture.model.sourceOutputLanguageOverrides[fixture.microphone.id] = "en"
+        fixture.model.selectedSourceIDs = [fixture.microphone.id]
+        fixture.model.setSessionResourcePreparationOperationForTesting {}
+        fixture.model.setLiveTranscriptionSessionFactoryForTesting { session }
+        fixture.model.acknowledgeNativeRealtimeDisclosureForNextSession()
+        let registrationGate = fixture.model.pauseNextNativeCoordinatorRegistrationForTesting()
+        let translationGate = AsyncTestGate()
+        fixture.model.pauseCaptionTranslationForTesting { await translationGate.suspend() }
+        let startTask = Task { await fixture.model.startSession() }
+        func cleanup() async {
+            await registrationGate.release()
+            await startTask.value
+            let translations = fixture.model.captionTranslationTasksSnapshotForTesting()
+            let display = fixture.model.captionDisplayTaskSnapshotForTesting()
+            let transfers = fixture.model.nativeCaptionTransferTasksSnapshotForTesting()
+            (translations + transfers).forEach { $0.cancel() }
+            display?.cancel()
+            fixture.model.stopSession()
+            await translationGate.resume()
+            translations.forEach { $0.cancel() }
+            for task in translations + transfers { await task.value }
+            await display?.value
+            await coordinator.stop()
+        }
+        var activeCaptionIndex = -1
+        do {
+            try await registrationGate.waitUntilReached(timeoutNanoseconds: 8_000_000_000)
+            let stream = await session.installModernAnalyzerInputStreamForTesting()
+            var iterator = stream.makeAsyncIterator()
+            let pcm = try integrationRealtimeBuffer(samples: [0.25, -0.25])
+            let texts = [
+                "A red kite circles above the quiet meadow.",
+                "Fresh oranges fill a basket beside the doorway.",
+                "The silver train crosses the bridge before dawn.",
+                "Warm rain taps softly against the garden roof.",
+                "A small candle glows inside the stone cottage.",
+                "Green turtles rest along the sandy shoreline.",
+                "The baker stacks warm rolls beside the window.",
+                "Two bright planets appear above the mountain.",
+                "A wooden sailboat drifts beyond the harbor wall."
+            ]
+            for index in texts.indices {
+                activeCaptionIndex = index
+                await session.appendCapturedAudioBufferForTesting(pcm)
+                let input = try #require(await iterator.next())
+                let start = try #require(input.bufferStartTime)
+                let provenance = try #require(await session.modernAudioProvenanceForTesting(
+                    CMTimeRange(start: start, duration: CMTime(value: 2, timescale: 16_000))
+                ))
+                session.deliverRecognizedSentenceForTesting(RecognizedSentence(text: texts[index], audioProvenance: provenance))
+                #expect(fixture.model.acceptedFinalDeliveryCountForTesting == index + 1)
+                let expectedStagedCount = min(index + 1, 8)
+                try await waitUntil(timeout: .seconds(5)) {
+                    fixture.model.nativeAcceptedBindingStateForTesting.0 >= expectedStagedCount
+                }
+                #expect(fixture.model.nativeAcceptedBindingStateForTesting.0 == expectedStagedCount)
+                #expect(fixture.model.nativeAcceptedBindingStateForTesting.1 == expectedStagedCount)
+                try await waitUntil(timeout: .seconds(5)) { fixture.model.localCaptionWasEnqueuedForTesting(texts[index]) }
+                if index == 0 {
+                    try await translationGate.waitUntilSuspended(timeoutNanoseconds: 8_000_000_000)
+                }
+                if let metadata = fixture.model.nativeAcceptedBindingsForTesting(sourceID: fixture.microphone.id).last {
+                    fixture.model.finalizePendingLocalCaptionForTesting(captionID: metadata.captionID, translation: "")
+                }
+            }
+            #expect(fixture.model.nativeAcceptedBindingsForTesting(sourceID: fixture.microphone.id).count == 8)
+            #expect(fixture.model.nativeAcceptedBindingStateForTesting.0 == 8)
+            #expect(fixture.model.nativeAcceptedBindingStateForTesting.1 == 8)
+            #expect(fixture.model.nativeAcceptedBindingStateForTesting.2 == 0)
+            #expect(fixture.model.localCaptionWasEnqueuedForTesting(texts[8]))
+        } catch {
+            Issue.record("unregistered staging stopped at index \(activeCaptionIndex), bindings/staged/registered \(fixture.model.nativeAcceptedBindingStateForTesting), pending captions \(fixture.model.pendingCaptionCountForTesting)")
+            await cleanup()
+            throw error
+        }
+        await cleanup()
+    }
+
+    @Test @available(macOS 26.0, *) func acceptedModernTimedFinalTransfersMappedCaptureIdentity() async throws {
+        let credentials = IntegrationNativeCredentialBackend(secret: "fake-secret")
+        let coordinator = NativeRealtimeSessionCoordinator(
+            credentialStore: RealtimeCredentialStore(backend: credentials),
+            driverFactory: { _, _, _ in IntegrationNativeRealtimeDriver() }
+        )
+        let fixture = makeFixture(
+            correctionSettings: configuredCorrectionSettings(isEnabled: false),
+            nativeRealtimeSettings: configuredNativeRealtimeSettings(
+                enabledSourceIDs: [microphoneSource.id]
+            ),
+            nativeRealtimeSessionCoordinator: coordinator
+        )
+        defer { fixture.removeSettingsFile() }
+        let session = LiveTranscriptionSession()
+        session.setStartOperationForTesting {
+            await session.beginRecognitionSessionForTesting()
+        }
+        fixture.model.sourceLanguageOverrides[fixture.microphone.id] = "en"
+        fixture.model.sourceOutputLanguageOverrides[fixture.microphone.id] = "en"
+        fixture.model.selectedSourceIDs = [fixture.microphone.id]
+        fixture.model.setSessionResourcePreparationOperationForTesting {}
+        fixture.model.setLiveTranscriptionSessionFactoryForTesting { session }
+        fixture.model.acknowledgeNativeRealtimeDisclosureForNextSession()
+        let registrationGate = fixture.model.pauseNextNativeCoordinatorRegistrationForTesting()
+        let startTask = Task { await fixture.model.startSession() }
+        func cleanup() async {
+            await registrationGate.release()
+            await startTask.value
+            let translations = fixture.model.captionTranslationTasksSnapshotForTesting()
+            let transfers = fixture.model.nativeCaptionTransferTasksSnapshotForTesting()
+            let display = fixture.model.captionDisplayTaskSnapshotForTesting()
+            (translations + transfers).forEach { $0.cancel() }
+            display?.cancel()
+            fixture.model.stopSession()
+            for task in translations + transfers { await task.value }
+            await display?.value
+            await coordinator.stop()
+        }
+
+        do {
+            try await registrationGate.waitUntilReached(timeoutNanoseconds: 8_000_000_000)
+            let analyzerInputs = await session.installModernAnalyzerInputStreamForTesting()
+            await session.appendCapturedAudioBufferForTesting(
+                try integrationRealtimeBuffer(samples: [0.25, -0.25])
+            )
+            var iterator = analyzerInputs.makeAsyncIterator()
+            let analyzerInput = try #require(await iterator.next())
+            let bufferStartTime = try #require(analyzerInput.bufferStartTime)
+            let duration = CMTime(value: 2, timescale: 16_000)
+            let provenance = try #require(await session.modernAudioProvenanceForTesting(
+                CMTimeRange(start: bufferStartTime, duration: duration)
+            ))
+            let installedIdentity = try #require(fixture.model.nativeCaptureIdentitiesForTesting[fixture.microphone.id])
+            #expect(provenance.sourceToken == installedIdentity.0)
+            #expect(provenance.captureGeneration == installedIdentity.1)
+            #expect(provenance.sampleInterval == 0..<2)
+
+            session.deliverRecognizedSentenceForTesting(RecognizedSentence(
+                text: "modern timed final",
+                audioProvenance: provenance
+            ))
+            #expect(fixture.model.acceptedFinalDeliveryCountForTesting == 1)
+            await registrationGate.release()
+            await startTask.value
+            try await waitUntil {
+                await fixture.model.nativeAcceptedMetadataForTesting(sourceID: fixture.microphone.id) != nil
+            }
+            let metadata = try #require(await fixture.model.nativeAcceptedMetadataForTesting(sourceID: fixture.microphone.id))
+            #expect(metadata.sourceID == fixture.microphone.id)
+            #expect(metadata.captionID == fixture.model.transcriptEntries.first?.id)
+            #expect(metadata.sampleInterval == provenance.sampleInterval)
+            #expect(metadata.sourceToken == provenance.sourceToken)
+            #expect(metadata.captureGeneration == provenance.captureGeneration)
+        } catch {
+            await cleanup()
+            throw error
+        }
+        await cleanup()
+    }
+
     @Test func nativeConfigurationChangeDuringStartupInvalidatesThePendingDisclosureAuthorization() async throws {
         let settingsURL = makeSettingsURL()
         defer { try? FileManager.default.removeItem(at: settingsURL) }
@@ -220,6 +1110,192 @@ import Testing
         )])
         fixture.model.stopSession()
         await coordinator.stop()
+    }
+
+    @Test func readySiblingCaptionTransfersWhileFirstNativeDriverStartIsHeld() async throws {
+        let credentials = IntegrationNativeCredentialBackend(secret: "fake-secret")
+        let drivers = IntegrationNativeDriverBag()
+        let coordinator = NativeRealtimeSessionCoordinator(
+            credentialStore: RealtimeCredentialStore(backend: credentials),
+            driverFactory: { _, _, role in drivers.makeDriver(holdingRole: .applicationAudio, role: role) }
+        )
+        let fixture = makeFixture(
+            correctionSettings: configuredCorrectionSettings(isEnabled: false),
+            nativeRealtimeSettings: configuredNativeRealtimeSettings(
+                enabledSourceIDs: [applicationSource.id, microphoneSource.id]
+            ),
+            nativeRealtimeSessionCoordinator: coordinator
+        )
+        defer { fixture.removeSettingsFile() }
+        fixture.model.selectedSourceIDs = [fixture.application.id, fixture.microphone.id]
+        fixture.model.sourceLanguageOverrides[fixture.application.id] = "en"
+        fixture.model.sourceOutputLanguageOverrides[fixture.application.id] = "en"
+        fixture.model.sourceLanguageOverrides[fixture.microphone.id] = "en"
+        fixture.model.sourceOutputLanguageOverrides[fixture.microphone.id] = "en"
+        fixture.model.setSessionResourcePreparationOperationForTesting {}
+        fixture.model.acknowledgeNativeRealtimeDisclosureForNextSession()
+        let applicationSession = LiveTranscriptionSession()
+        let microphoneSession = LiveTranscriptionSession()
+        applicationSession.setStartOperationForTesting {
+            await applicationSession.beginRecognitionSessionForTesting()
+        }
+        microphoneSession.setStartOperationForTesting {
+            await microphoneSession.beginRecognitionSessionForTesting()
+        }
+        var nextSessionIndex = 0
+        let sessions = [applicationSession, microphoneSession]
+        fixture.model.setLiveTranscriptionSessionFactoryForTesting {
+            defer { nextSessionIndex += 1 }
+            return sessions[nextSessionIndex]
+        }
+
+        let completion = IntegrationAsyncSignal()
+        let startTask = Task {
+            await fixture.model.startSession()
+            await completion.resolve()
+        }
+        func cleanup() async {
+            let allDrivers = drivers.all()
+            for driver in allDrivers { await driver.resumeStart() }
+            await startTask.value
+            let translations = fixture.model.captionTranslationTasksSnapshotForTesting()
+            let transfers = fixture.model.nativeCaptionTransferTasksSnapshotForTesting()
+            let display = fixture.model.captionDisplayTaskSnapshotForTesting()
+            (translations + transfers).forEach { $0.cancel() }
+            display?.cancel()
+            fixture.model.stopSession()
+            await coordinator.stop()
+            for task in translations + transfers { await task.value }
+            await display?.value
+        }
+
+        do {
+            try await waitUntil { await drivers.driver(for: .applicationAudio)?.isStartSuspended() == true }
+            try await waitUntil {
+                fixture.model.nativeReadyIdentityForTesting(sourceID: fixture.microphone.id) != nil
+            }
+            let ready = try #require(fixture.model.nativeReadyIdentityForTesting(sourceID: fixture.microphone.id))
+            #expect(ready.sourceID == fixture.microphone.id)
+            #expect(await completion.isResolved() == false)
+            #expect(fixture.model.registeredLiveSessionForTesting(sourceID: fixture.microphone.id) === microphoneSession)
+
+            await microphoneSession.beginLegacySampleMappingForTesting()
+            let inputPCM = try integrationRealtimeBuffer(samples: [0.25, -0.25])
+            #expect(await microphoneSession.appendLegacyNormalizedBufferForTesting(inputPCM, preservesIdentity: true) == 0..<2)
+            #expect(await microphoneSession.queueLegacyCommittedEmissionForTesting(
+                text: "ready sibling final",
+                segments: [LegacySpeechSegmentTiming(timestamp: 0, duration: 2.0 / 16_000)]
+            ))
+            await microphoneSession.deliverQueuedCommittedEmissionForTesting()
+            try await waitUntil {
+                await fixture.model.nativeAcceptedMetadataForTesting(sourceID: fixture.microphone.id) != nil
+            }
+            let accepted = try #require(await fixture.model.nativeAcceptedMetadataForTesting(sourceID: fixture.microphone.id))
+            #expect(accepted.sourceToken == ready.sourceToken)
+            #expect(accepted.captureGeneration == ready.captureGeneration)
+            #expect(fixture.model.nativeAcceptedReadyIdentityForTesting(captionID: accepted.captionID) == ready)
+            #expect(await completion.isResolved() == false)
+        } catch {
+            await cleanup()
+            throw error
+        }
+        await cleanup()
+    }
+
+    @Test func optingOutNativeSourceAWhileSourceBRemainsRunningPreservesBMetadata() async throws {
+        let credentials = IntegrationNativeCredentialBackend(secret: "fake-secret")
+        let drivers = IntegrationNativeDriverBag()
+        let coordinator = NativeRealtimeSessionCoordinator(
+            credentialStore: RealtimeCredentialStore(backend: credentials),
+            driverFactory: { _, _, role in
+                let driver = IntegrationNativeRealtimeDriver()
+                drivers.append(driver, for: role)
+                return driver
+            }
+        )
+        let fixture = makeFixture(
+            correctionSettings: configuredCorrectionSettings(isEnabled: false),
+            nativeRealtimeSettings: configuredNativeRealtimeSettings(
+                enabledSourceIDs: [applicationSource.id, microphoneSource.id]
+            ),
+            nativeRealtimeSessionCoordinator: coordinator
+        )
+        defer { fixture.removeSettingsFile() }
+        fixture.model.selectedSourceIDs = [fixture.application.id, fixture.microphone.id]
+        for sourceID in [fixture.application.id, fixture.microphone.id] {
+            fixture.model.sourceLanguageOverrides[sourceID] = "en"
+            fixture.model.sourceOutputLanguageOverrides[sourceID] = "en"
+        }
+        fixture.model.setSessionResourcePreparationOperationForTesting {}
+        fixture.model.acknowledgeNativeRealtimeDisclosureForNextSession()
+        let applicationSession = LiveTranscriptionSession()
+        let microphoneSession = LiveTranscriptionSession()
+        applicationSession.setStartOperationForTesting { await applicationSession.beginRecognitionSessionForTesting() }
+        microphoneSession.setStartOperationForTesting { await microphoneSession.beginRecognitionSessionForTesting() }
+        var nextSessionIndex = 0
+        let sessions = [applicationSession, microphoneSession]
+        fixture.model.setLiveTranscriptionSessionFactoryForTesting {
+            defer { nextSessionIndex += 1 }
+            return sessions[nextSessionIndex]
+        }
+        var heldApplicationDriver: IntegrationNativeRealtimeDriver?
+        func cleanup() async {
+            let translationTasks = fixture.model.captionTranslationTasksSnapshotForTesting()
+            let displayTask = fixture.model.captionDisplayTaskSnapshotForTesting()
+            translationTasks.forEach { $0.cancel() }
+            displayTask?.cancel()
+            await heldApplicationDriver?.resumeStop()
+            fixture.model.stopSession()
+            await coordinator.stop()
+            for task in translationTasks { await task.value }
+            await displayTask?.value
+        }
+        do {
+            await fixture.model.startSession()
+            let applicationDriver = try #require(drivers.driver(for: .applicationAudio))
+            await microphoneSession.beginLegacySampleMappingForTesting()
+            let inputPCM = try integrationRealtimeBuffer(samples: [0.25, -0.25])
+            #expect(await microphoneSession.appendLegacyNormalizedBufferForTesting(inputPCM, preservesIdentity: true) == 0..<2)
+            #expect(await microphoneSession.queueLegacyCommittedEmissionForTesting(
+                text: "microphone caption before application opt-out",
+                segments: [LegacySpeechSegmentTiming(timestamp: 0, duration: 2.0 / 16_000)]
+            ))
+            await microphoneSession.deliverQueuedCommittedEmissionForTesting()
+            try await waitUntil {
+                await fixture.model.nativeAcceptedMetadataForTesting(sourceID: fixture.microphone.id) != nil
+            }
+            let beforeOptOut = try #require(fixture.model.nativeAcceptedBindingsForTesting(sourceID: fixture.microphone.id).last)
+            await applicationDriver.suspendNextStop()
+            heldApplicationDriver = applicationDriver
+            var settings = fixture.model.nativeRealtimeSettings
+            settings.enabledSourceIDs = [fixture.microphone.id]
+            fixture.model.nativeRealtimeSettings = settings
+
+            try await waitUntil { await applicationDriver.isStopSuspended() }
+            #expect(fixture.model.nativeReadyIdentityForTesting(sourceID: fixture.microphone.id) != nil)
+            #expect(fixture.model.nativeAcceptedBindingsForTesting(sourceID: fixture.microphone.id).contains(beforeOptOut))
+            #expect(fixture.model.nativeAcceptedReadyIdentityForTesting(captionID: beforeOptOut.captionID)?.sourceID == fixture.microphone.id)
+            #expect(await microphoneSession.appendLegacyNormalizedBufferForTesting(inputPCM, preservesIdentity: true) == 2..<4)
+            #expect(await microphoneSession.queueLegacyCommittedEmissionForTesting(
+                text: "healthy microphone after application opt-out",
+                segments: [LegacySpeechSegmentTiming(timestamp: 2.0 / 16_000, duration: 2.0 / 16_000)]
+            ))
+            await microphoneSession.deliverQueuedCommittedEmissionForTesting()
+            try await waitUntil {
+                fixture.model.nativeAcceptedBindingsForTesting(sourceID: fixture.microphone.id).count == 2
+            }
+            let accepted = try #require(fixture.model.nativeAcceptedBindingsForTesting(sourceID: fixture.microphone.id).last)
+            try await waitUntil {
+                fixture.model.nativeAcceptedTransferDispositionForTesting(captionID: accepted.captionID) == .queued
+            }
+            #expect(accepted.sampleInterval == 2..<4)
+            #expect(fixture.model.nativeAcceptedReadyIdentityForTesting(captionID: accepted.captionID)?.sourceID == fixture.microphone.id)
+            #expect(fixture.model.registeredLiveSessionForTesting(sourceID: fixture.microphone.id) === microphoneSession)
+        } catch {
+            await cleanup()
+            throw error
+        }
+        await cleanup()
     }
 
     @Test func missingNativeCredentialReportsSourceStatusAndKeepsLocalSessionRunning() async throws {
@@ -662,6 +1738,35 @@ import Testing
         #expect(fixture.model.overlayState?.captionEpoch == epoch)
         #expect(fixture.model.transcriptEntries.first?.localSourceText == "helo world")
         #expect(fixture.model.transcriptEntries.first?.localTranslatedText == "你好 世界")
+    }
+
+    @Test func identicalAcceptedFinalsFromDifferentSourcesAreNotDeduplicated() async throws {
+        let fixture = makeFixture()
+        defer { fixture.removeSettingsFile() }
+        let microphoneSession = LiveTranscriptionSession()
+        let applicationSession = LiveTranscriptionSession()
+        fixture.model.sourceLanguageOverrides[fixture.microphone.id] = "en"
+        fixture.model.sourceLanguageOverrides[fixture.application.id] = "en"
+        fixture.model.sourceOutputLanguageOverrides[fixture.microphone.id] = "en"
+        fixture.model.sourceOutputLanguageOverrides[fixture.application.id] = "en"
+        fixture.model.registerSuccessfulLiveSessionForTesting(
+            microphoneSession,
+            source: fixture.microphone,
+            deliverRecognizedSentences: true
+        )
+        fixture.model.registerSuccessfulLiveSessionForTesting(
+            applicationSession,
+            source: fixture.application,
+            deliverRecognizedSentences: true
+        )
+        microphoneSession.deliverRecognizedSentenceForTesting(
+            RecognizedSentence(text: "same final", promotionSegmentID: nil, audioWAVData: nil)
+        )
+        applicationSession.deliverRecognizedSentenceForTesting(
+            RecognizedSentence(text: "same final", promotionSegmentID: nil, audioWAVData: nil)
+        )
+
+        #expect(fixture.model.pendingCaptionCountForTesting == 2)
     }
 
     @Test func textOnlyResultChangesOnlyTranslationAndPreservesLocalOriginal() async throws {
@@ -1796,11 +2901,46 @@ private actor IntegrationNativeCredentialBackend: RealtimeCredentialBackend {
 private final class IntegrationNativeDriverBag: @unchecked Sendable {
     private let lock = NSLock()
     private var drivers: [IntegrationNativeRealtimeDriver] = []
+    private var microphoneDriver: IntegrationNativeRealtimeDriver?
+    private var applicationAudioDriver: IntegrationNativeRealtimeDriver?
 
     func append(_ driver: IntegrationNativeRealtimeDriver) {
         lock.lock()
         drivers.append(driver)
         lock.unlock()
+    }
+
+    func makeDriver(holdingFirstStart: Bool) -> IntegrationNativeRealtimeDriver {
+        lock.lock()
+        let driver = IntegrationNativeRealtimeDriver(holdStart: holdingFirstStart && drivers.isEmpty)
+        drivers.append(driver)
+        lock.unlock()
+        return driver
+    }
+
+    func makeDriver(
+        holdingRole: RealtimeAudioSourceRole,
+        role: RealtimeAudioSourceRole
+    ) -> IntegrationNativeRealtimeDriver {
+        lock.lock()
+        let driver = IntegrationNativeRealtimeDriver(holdStart: role == holdingRole)
+        drivers.append(driver)
+        if role == .applicationAudio { applicationAudioDriver = driver } else { microphoneDriver = driver }
+        lock.unlock()
+        return driver
+    }
+
+    func append(_ driver: IntegrationNativeRealtimeDriver, for role: RealtimeAudioSourceRole) {
+        lock.lock()
+        drivers.append(driver)
+        if role == .applicationAudio { applicationAudioDriver = driver } else { microphoneDriver = driver }
+        lock.unlock()
+    }
+
+    func driver(for role: RealtimeAudioSourceRole) -> IntegrationNativeRealtimeDriver? {
+        lock.lock()
+        defer { lock.unlock() }
+        return role == .applicationAudio ? applicationAudioDriver : microphoneDriver
     }
 
     func all() -> [IntegrationNativeRealtimeDriver] {
@@ -1810,22 +2950,66 @@ private final class IntegrationNativeDriverBag: @unchecked Sendable {
     }
 }
 
+private actor IntegrationAsyncSignal {
+    private var resolved = false
+    func resolve() { resolved = true }
+    func isResolved() -> Bool { resolved }
+}
+
+private final class IntegrationNativeCaptionDispositionBag: @unchecked Sendable {
+    private let lock = NSLock()
+    private var values: [(RealtimeAcceptedCaptionMetadata, RealtimeCaptionSubmissionDisposition)] = []
+
+    func append(_ metadata: RealtimeAcceptedCaptionMetadata, _ disposition: RealtimeCaptionSubmissionDisposition) {
+        lock.lock()
+        values.append((metadata, disposition))
+        lock.unlock()
+    }
+
+    func all() -> [(metadata: RealtimeAcceptedCaptionMetadata, disposition: RealtimeCaptionSubmissionDisposition)] {
+        lock.lock()
+        defer { lock.unlock() }
+        return values.map { (metadata: $0.0, disposition: $0.1) }
+    }
+}
+
 private actor IntegrationNativeRealtimeDriver: RealtimeSessionDriving {
+    private let holdStart: Bool
     private var audioChunksStorage: [RealtimeAudioChunk] = []
+    private var committedUtterancesStorage: [RealtimeUtterance] = []
     private var startRecordsStorage: [(String, Int)] = []
     private var stopInvocationCountStorage = 0
     private var shouldSuspendNextStop = false
     private var stopContinuation: CheckedContinuation<Void, Never>?
+    private var startContinuation: CheckedContinuation<Void, Never>?
+    private var startSuspended = false
+    private var startReleased = false
     private var eventContinuation: AsyncStream<RealtimeProviderEvent>.Continuation?
     private var didStop = false
 
+    init(holdStart: Bool = false) { self.holdStart = holdStart }
+
     func start(sourceAlias: String, generation: Int) async throws {
         startRecordsStorage.append((sourceAlias, generation))
+        guard holdStart, startReleased == false else { return }
+        startSuspended = true
+        await withCheckedContinuation { startContinuation = $0 }
+    }
+    func isStartSuspended() -> Bool { startSuspended }
+    func resumeStart() {
+        startReleased = true
+        startSuspended = false
+        let continuation = startContinuation
+        startContinuation = nil
+        continuation?.resume()
     }
     func sendAudioChunk(_ chunk: RealtimeAudioChunk) async throws {
         audioChunksStorage.append(chunk)
     }
-    func commit(_ utterance: RealtimeUtterance) async throws {}
+    func commit(_ utterance: RealtimeUtterance) async throws {
+        committedUtterancesStorage.append(utterance)
+    }
+    func committedUtteranceCount() -> Int { committedUtterancesStorage.count }
     func sendVideoFrame(_ frame: RealtimeVideoFrame) async throws {}
     func revokeVideoPermission() async {}
     func events() async -> AsyncStream<RealtimeProviderEvent> {
@@ -1837,6 +3021,8 @@ private actor IntegrationNativeRealtimeDriver: RealtimeSessionDriving {
             }
         }
     }
+    func isListeningForEvents() -> Bool { eventContinuation != nil }
+    func emit(_ event: RealtimeProviderEvent) { eventContinuation?.yield(event) }
     func stop() async {
         stopInvocationCountStorage += 1
         didStop = true
@@ -1852,6 +3038,7 @@ private actor IntegrationNativeRealtimeDriver: RealtimeSessionDriving {
     func suspendNextStop() { shouldSuspendNextStop = true }
     func isStopSuspended() -> Bool { stopContinuation != nil }
     func resumeStop() {
+        shouldSuspendNextStop = false
         let continuation = stopContinuation
         stopContinuation = nil
         continuation?.resume()
@@ -2171,31 +3358,62 @@ private struct IntegrationNoHeldCorrectionCall: Error {}
 
 private actor AsyncTestGate {
     private var isSuspended = false
-    private var suspensionContinuation: CheckedContinuation<Void, Never>?
+    private var released = false
+    private var suspensionContinuations: [CheckedContinuation<Void, Never>] = []
     private var observers: [CheckedContinuation<Void, Never>] = []
+    private var throwingObserver: CheckedContinuation<Void, any Error>?
+    private var observerTimeoutTask: Task<Void, Never>?
 
     func suspend() async {
+        guard !released else { return }
         isSuspended = true
         let observers = observers
         self.observers.removeAll()
         for observer in observers {
             observer.resume()
         }
+        observerTimeoutTask?.cancel()
+        observerTimeoutTask = nil
+        throwingObserver?.resume()
+        throwingObserver = nil
         await withCheckedContinuation { continuation in
-            suspensionContinuation = continuation
+            suspensionContinuations.append(continuation)
         }
     }
 
     func waitUntilSuspended() async {
+        guard !released else { return }
         guard isSuspended == false else { return }
         await withCheckedContinuation { continuation in
             observers.append(continuation)
         }
     }
 
+    func waitUntilSuspended(timeoutNanoseconds: UInt64) async throws {
+        guard !released else { return }
+        guard isSuspended == false else { return }
+        try await withCheckedThrowingContinuation { continuation in
+            throwingObserver = continuation
+            observerTimeoutTask = Task { [weak self] in
+                try? await Task.sleep(nanoseconds: timeoutNanoseconds)
+                guard !Task.isCancelled else { return }
+                await self?.timeoutObserver()
+            }
+        }
+    }
+
+    private func timeoutObserver() {
+        guard let continuation = throwingObserver else { return }
+        throwingObserver = nil
+        observerTimeoutTask = nil
+        continuation.resume(throwing: CorrectionIntegrationWaitTimeout())
+    }
+
     func resume() {
+        released = true
         isSuspended = false
-        suspensionContinuation?.resume()
-        suspensionContinuation = nil
+        let continuations = suspensionContinuations
+        suspensionContinuations.removeAll()
+        for continuation in continuations { continuation.resume() }
     }
 }
