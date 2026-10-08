@@ -797,42 +797,160 @@ struct NativeRealtimeSessionDriverTests {
         try await driver.sendAudioChunk(makeChunk(generation: 7, timestamp: 900))
 
         try await driver.commit(makeUtterance(generation: 7, start: 0, end: 500))
-        #expect(await connection.waitUntilSentMessageCount(4))
+        #expect(await connection.waitUntilSentMessageCount(3))
         #expect(await connection.sentMessageTypes() == [
-            "session.update",
-            "input_audio_buffer.append",
-            "input_audio_buffer.append",
-            "input_audio_buffer.commit",
+            "session.update", "input_audio_buffer.append", "input_audio_buffer.commit",
         ])
 
         // A second commit before the acknowledgement must fail without another boundary.
         await expectFailure(.capabilityRejected) {
             try await driver.commit(makeUtterance(generation: 7, start: 501, end: 1_000))
         }
-        #expect(await connection.sentMessageTypes().count == 4)
+        #expect(await connection.sentMessageTypes().count == 3)
 
         await connection.enqueue(.text(#"{"type":"input_audio_buffer.committed"}"#))
-        #expect(await connection.waitUntilSentMessageCount(5))
+        #expect(await connection.waitUntilSentMessageCount(4))
         await connection.enqueue(.text(#"{"type":"response.created","response":{"id":"resp_empty"}}"#))
         await connection.enqueue(.text(#"{"type":"response.done","response":{"id":"resp_empty","status":"completed"}}"#))
         try await Task.sleep(for: .milliseconds(10))
 
         // The later chunk stayed queued for the next utterance.
         try await driver.commit(makeUtterance(generation: 7, start: 501, end: 1_000))
-        #expect(await connection.waitUntilSentMessageCount(7))
+        #expect(await connection.waitUntilSentMessageCount(6))
         #expect(await connection.sentMessageTypes() == [
-            "session.update",
-            "input_audio_buffer.append",
-            "input_audio_buffer.append",
-            "input_audio_buffer.commit",
-            "response.create",
-            "input_audio_buffer.append",
-            "input_audio_buffer.commit",
+            "session.update", "input_audio_buffer.append", "input_audio_buffer.commit",
+            "response.create", "input_audio_buffer.append", "input_audio_buffer.commit",
         ])
 
         await driver.stop()
         #expect(await recorder.outcome() == .succeeded)
         await task.value
+    }
+
+    @Test func openAIExactCommitResamplesOnlyTheSelectedCaptionBeforeWireAppend() async throws {
+        let (driver, connection, recorder, task) = await makeReadyDriver(profile: .openAIMini)
+        var operationSucceeded = false
+        do {
+            let source = Data([10, 0, 20, 0])
+            try await driver.sendAudioChunk(makeExactChunk(generation: 7, start: 0, pcm16LEData: source))
+            try await driver.commit(makeUtterance(generation: 7, start: 0, end: 125_000))
+            operationSucceeded = true
+        } catch {
+            operationSucceeded = false
+        }
+        let didSend = await connection.waitUntilSentMessageCount(3)
+        let messages = await connection.sentTextMessages()
+        let sentTypes = await connection.sentMessageTypes()
+        let savedTasks = await driver.backgroundTasksForTesting()
+        await driver.stop()
+        await task.value
+        for savedTask in savedTasks { await savedTask.value }
+        #expect(operationSucceeded)
+        #expect(didSend)
+        #expect(appendedPCM(in: messages) == [Data([10, 0, 17, 0, 20, 0])])
+        #expect(sentTypes == [
+            "session.update", "input_audio_buffer.append", "input_audio_buffer.commit",
+        ])
+        #expect(await recorder.outcome() == .succeeded)
+    }
+
+    @Test func openAIWirePreservesSignedConstantRampAndExtremaVectors() async throws {
+        func pcm16LE(_ samples: [Int16]) -> Data {
+            Data(samples.flatMap { sample in
+                let bits = UInt16(bitPattern: sample)
+                return [UInt8(bits & 0xff), UInt8(bits >> 8)]
+            })
+        }
+        let vectors: [([Int16], [Int16])] = [
+            ([-1234], [-1234]),
+            ([1234, 1234, 1234, 1234], [1234, 1234, 1234, 1234, 1234, 1234]),
+            ([0, 300, 600, 900], [0, 200, 400, 600, 800, 900]),
+            ([-32_768, 32_767], [-32_768, 10_922, 32_767]),
+            ([32_767, -32_768], [32_767, -10_923, -32_768]),
+        ]
+        for (sourceSamples, expectedSamples) in vectors {
+            let (driver, connection, recorder, task) = await makeReadyDriver(profile: .openAIMini)
+            var operationSucceeded = false
+            do {
+                let source = pcm16LE(sourceSamples)
+                let duration = UInt64(sourceSamples.count) * 62_500
+                try await driver.sendAudioChunk(makeExactChunk(
+                    generation: 7, start: 0, pcm16LEData: source
+                ))
+                try await driver.commit(makeUtterance(generation: 7, start: 0, end: duration))
+                operationSucceeded = true
+            } catch {
+                operationSucceeded = false
+            }
+            let didSend = await connection.waitUntilSentMessageCount(3)
+            let appends = appendedPCM(in: await connection.sentTextMessages())
+            let savedTasks = await driver.backgroundTasksForTesting()
+            await driver.stop()
+            await task.value
+            for savedTask in savedTasks { await savedTask.value }
+            #expect(operationSucceeded)
+            #expect(didSend)
+            #expect(appends == [pcm16LE(expectedSamples)])
+            #expect(await recorder.outcome() == .succeeded)
+        }
+    }
+
+    @Test func oneSecondOpenAIUtteranceSplitsAtWireByteCap() async throws {
+        let (driver, connection, recorder, task) = await makeReadyDriver(profile: .openAIMini)
+        var operationSucceeded = false
+        do {
+            let source = Data(repeating: 0, count: 32_000)
+            try await driver.sendAudioChunk(makeExactChunk(generation: 7, start: 0, pcm16LEData: source))
+            try await driver.commit(makeUtterance(generation: 7, start: 0, end: 1_000_000_000))
+            operationSucceeded = true
+        } catch {
+            operationSucceeded = false
+        }
+        let didSend = await connection.waitUntilSentMessageCount(4)
+        let appends = appendedPCM(in: await connection.sentTextMessages())
+        let savedTasks = await driver.backgroundTasksForTesting()
+        await driver.stop()
+        await task.value
+        for savedTask in savedTasks { await savedTask.value }
+        #expect(operationSucceeded)
+        #expect(didSend)
+        #expect(appends.count == 2)
+        #expect(appends.map(\.count) == [32_000, 16_000])
+        #expect(appends.allSatisfy { !$0.isEmpty && $0.count.isMultiple(of: 2) && $0.count <= 32_000 })
+        #expect(appends.reduce(0) { $0 + $1.count } == 48_000)
+        #expect(await recorder.outcome() == .succeeded)
+    }
+
+    @Test func maximumCanonicalOpenAIUtteranceProducesAtMostTwentyFourWireAppends() async throws {
+        let (driver, connection, recorder, task) = await makeReadyDriver(profile: .openAIMini)
+        var operationSucceeded = false
+        do {
+            let source = Data(repeating: 0, count: 32_000)
+            for index in 0..<16 {
+                try await driver.sendAudioChunk(makeExactChunk(
+                    generation: 7, start: UInt64(index) * 1_000_000_000, pcm16LEData: source
+                ))
+            }
+            try await driver.commit(makeUtterance(generation: 7, start: 0, end: 16_000_000_000))
+            operationSucceeded = true
+        } catch {
+            operationSucceeded = false
+        }
+        let didSend = await connection.waitUntilSentMessageCount(26)
+        let messages = await connection.sentTextMessages()
+        let sentTypes = await connection.sentMessageTypes()
+        let appends = appendedPCM(in: messages)
+        let savedTasks = await driver.backgroundTasksForTesting()
+        await driver.stop()
+        await task.value
+        for savedTask in savedTasks { await savedTask.value }
+        #expect(operationSucceeded)
+        #expect(didSend)
+        #expect(appends.count == 24)
+        #expect(appends.allSatisfy { $0.count == 32_000 && $0.count.isMultiple(of: 2) })
+        #expect(appends.reduce(0) { $0 + $1.count } == 768_000)
+        #expect(sentTypes.suffix(25).filter { $0 == "input_audio_buffer.commit" }.count == 1)
+        #expect(await recorder.outcome() == .succeeded)
     }
 
     @Test func exactCommitRejectsGapsAndPreservesBothUsableRanges() async throws {
@@ -865,7 +983,7 @@ struct NativeRealtimeSessionDriverTests {
         // own caption intervals, with no partial audio sent for the rejected one.
         try await driver.commit(makeUtterance(generation: 7, start: 0, end: 125_000))
         #expect(await connection.waitUntilSentMessageCount(3))
-        #expect(appendedPCM(in: await connection.sentTextMessages()) == [firstPCM])
+        #expect(appendedPCM(in: await connection.sentTextMessages()) == [Data([10, 0, 17, 0, 20, 0])])
         await connection.enqueue(.text(#"{"type":"input_audio_buffer.committed"}"#))
         #expect(await connection.waitUntilSentMessageCount(4))
         await connection.enqueue(.text(#"{"type":"response.created","response":{"id":"resp_gap_first"}}"#))
@@ -875,7 +993,7 @@ struct NativeRealtimeSessionDriverTests {
 
         try await driver.commit(makeUtterance(generation: 7, start: 187_500, end: 312_500))
         #expect(await connection.waitUntilSentMessageCount(6))
-        #expect(appendedPCM(in: await connection.sentTextMessages()) == [firstPCM, laterPCM])
+        #expect(appendedPCM(in: await connection.sentTextMessages()) == [Data([10, 0, 17, 0, 20, 0]), Data([40, 0, 47, 0, 50, 0])])
 
         await driver.stop()
         eventTask.cancel()
@@ -955,7 +1073,7 @@ struct NativeRealtimeSessionDriverTests {
         // The compatibility caller can still consume the original point-only PCM.
         try await driver.commit(makeUtterance(generation: 7, start: 0, end: 500))
         #expect(await connection.waitUntilSentMessageCount(3))
-        #expect(appendedPCM(in: await connection.sentTextMessages()) == [Data([0, 0, 0, 0])])
+        #expect(appendedPCM(in: await connection.sentTextMessages()) == [Data([0, 0, 0, 0, 0, 0])])
         await driver.stop()
         #expect(await recorder.outcome() == .succeeded)
         await task.value
@@ -1084,7 +1202,7 @@ struct NativeRealtimeSessionDriverTests {
 
         try await driver.commit(makeUtterance(generation: 7, start: 0, end: 250_000))
         #expect(await connection.waitUntilSentMessageCount(3))
-        #expect(appendedPCM(in: await connection.sentTextMessages()) == [pcm])
+        #expect(appendedPCM(in: await connection.sentTextMessages()) == [Data([10, 0, 17, 0, 23, 0, 30, 0, 37, 0, 40, 0])])
         await driver.stop()
         #expect(await recorder.outcome() == .succeeded)
         await task.value
@@ -1115,27 +1233,25 @@ struct NativeRealtimeSessionDriverTests {
         ))
 
         try await driver.commit(makeUtterance(generation: 7, start: 62_500, end: 312_500))
-        #expect(await connection.waitUntilSentMessageCount(4))
+        #expect(await connection.waitUntilSentMessageCount(3))
         let firstTurnMessages = await connection.sentTextMessages()
         #expect(appendedPCM(in: firstTurnMessages) == [
-            Data([20, 0, 30, 0, 40, 0]),
-            Data([50, 0]),
+            Data([20, 0, 27, 0, 33, 0, 40, 0, 47, 0, 50, 0]),
         ])
 
         await connection.enqueue(.text(#"{"type":"input_audio_buffer.committed"}"#))
-        #expect(await connection.waitUntilSentMessageCount(5))
+        #expect(await connection.waitUntilSentMessageCount(4))
         await connection.enqueue(.text(#"{"type":"response.created","response":{"id":"resp_sliced"}}"#))
         await connection.enqueue(.text(#"{"type":"response.output_text.delta","response_id":"resp_sliced","delta":"ready"}"#))
         await connection.enqueue(.text(#"{"type":"response.done","response":{"id":"resp_sliced","status":"completed"}}"#))
         #expect(await events.waitForCount(2))
 
         try await driver.commit(makeUtterance(generation: 7, start: 312_500, end: 500_000))
-        #expect(await connection.waitUntilSentMessageCount(7))
+        #expect(await connection.waitUntilSentMessageCount(6))
         let secondTurnMessages = await connection.sentTextMessages()
         #expect(appendedPCM(in: secondTurnMessages) == [
-            Data([20, 0, 30, 0, 40, 0]),
-            Data([50, 0]),
-            Data([60, 0, 70, 0, 80, 0]),
+            Data([20, 0, 27, 0, 33, 0, 40, 0, 47, 0, 50, 0]),
+            Data([60, 0, 67, 0, 73, 0, 80, 0]),
         ])
 
         await driver.stop()
@@ -1469,6 +1585,18 @@ struct NativeRealtimeSessionDriverTests {
                 #expect(await connection.sentMessageTypes() == [
                     "session.update", "input_audio_buffer.append", "input_audio_buffer.commit",
                 ])
+                if profile.provider == .xAI {
+                    let wireMessages = await connection.sentTextMessages()
+                    let setup = try #require(JSONSerialization.jsonObject(
+                        with: Data(wireMessages[0].utf8)
+                    ) as? [String: Any])
+                    let session = try #require(setup["session"] as? [String: Any])
+                    let audio = try #require(session["audio"] as? [String: Any])
+                    let input = try #require(audio["input"] as? [String: Any])
+                    let format = try #require(input["format"] as? [String: Any])
+                    #expect(format["rate"] as? Int == 16_000)
+                    #expect(appendedPCM(in: wireMessages) == [Data(repeating: 0, count: 320)])
+                }
                 await connection.enqueue(.text(#"{"type":"input_audio_buffer.committed"}"#))
                 #expect(await connection.waitUntilSentMessageCount(4))
                 let responseRequest = try #require(await connection.sentTextMessages().last)
@@ -1609,6 +1737,154 @@ struct NativeRealtimeSessionDriverTests {
         eventTask.cancel()
         #expect(await recorder.outcome() == .succeeded)
         await task.value
+    }
+
+    @Test func stoppingDuringOpenAIAppendPreventsLaterMessagesAfterRevocation() async throws {
+        let connection = FakeRealtimeWebSocketConnection(
+            suspendSendType: "input_audio_buffer.append", holdClose: true
+        )
+        let connector = FakeRealtimeWebSocketConnector(profile: .openAIMini, connections: [connection])
+        let driver = NativeRealtimeSessionDriver(
+            settings: settings(profile: .openAIMini),
+            credential: "synthetic-key",
+            sourceRole: .microphone,
+            connector: connector,
+            setupTimeout: .seconds(1)
+        )
+        let (recorder, startTask) = launchStart(driver, alias: "audio-1", generation: 7)
+        #expect(await connection.waitUntilSentMessageCount(1))
+        await connection.enqueue(acknowledgement(for: .openAIMini))
+        let startOutcome = await recorder.waitForOutcome()
+        if startOutcome != .succeeded {
+            let startupTasks = await driver.backgroundTasksForTesting()
+            await connection.releaseHeldClose()
+            await driver.stop()
+            for startupTask in startupTasks { await startupTask.value }
+            await startTask.value
+            #expect(startOutcome == .succeeded)
+            return
+        }
+        await startTask.value
+
+        var admitted = false
+        do {
+            try await driver.sendAudioChunk(makeExactChunk(
+                generation: 7, start: 0, pcm16LEData: Data(repeating: 0, count: 32_000)
+            ))
+            admitted = true
+        } catch {
+            admitted = false
+        }
+        var commitTask: Task<Void, Error>?
+        if admitted {
+            commitTask = Task {
+                try await driver.commit(makeUtterance(generation: 7, start: 0, end: 1_000_000_000))
+            }
+        }
+        let heldAppend = await connection.waitUntilSuspendedMessageTypeStarted("input_audio_buffer.append")
+        let savedTasks = await driver.backgroundTasksForTesting()
+        let savedDrain = await driver.drainTaskForTesting()
+        let stopTask = Task { await driver.stop() }
+        let closeHeld = await connection.waitUntilCloseStarted()
+
+        // Revoke the generation while the first append is held, then let that
+        // already-recorded send succeed while the socket remains open. The drain
+        // must hit its operation/state fence before attempting append two.
+        await connection.releaseSuspendedSend()
+        if heldAppend {
+            await savedDrain?.value
+        } else {
+            await connection.releaseHeldClose()
+            await driver.stop()
+            await savedDrain?.value
+        }
+        let typesBeforeClose = await connection.sentMessageTypes()
+        await connection.releaseHeldClose()
+        await stopTask.value
+        for savedTask in savedTasks { await savedTask.value }
+        if let commitTask {
+            do { try await commitTask.value } catch { }
+        }
+        let finalTypes = await connection.sentMessageTypes()
+        #expect(admitted)
+        #expect(heldAppend)
+        #expect(closeHeld)
+        #expect(typesBeforeClose == ["session.update", "input_audio_buffer.append"])
+        #expect(finalTypes == ["session.update", "input_audio_buffer.append"])
+        #expect(await recorder.outcome() == .succeeded)
+    }
+
+    @Test func openAIAppendFailureClearsStateWithoutLaterMessages() async throws {
+        let connection = FakeRealtimeWebSocketConnection(
+            suspendSendType: "input_audio_buffer.append", holdClose: true
+        )
+        let connector = FakeRealtimeWebSocketConnector(profile: .openAIMini, connections: [connection])
+        let driver = NativeRealtimeSessionDriver(
+            settings: settings(profile: .openAIMini),
+            credential: "synthetic-key",
+            sourceRole: .microphone,
+            connector: connector,
+            setupTimeout: .seconds(1)
+        )
+        let (recorder, startTask) = launchStart(driver, alias: "audio-1", generation: 7)
+        #expect(await connection.waitUntilSentMessageCount(1))
+        await connection.enqueue(acknowledgement(for: .openAIMini))
+        let startOutcome = await recorder.waitForOutcome()
+        if startOutcome != .succeeded {
+            let startupTasks = await driver.backgroundTasksForTesting()
+            await connection.releaseHeldClose()
+            await driver.stop()
+            for startupTask in startupTasks { await startupTask.value }
+            await startTask.value
+            #expect(startOutcome == .succeeded)
+            return
+        }
+        await startTask.value
+
+        var admitted = false
+        do {
+            try await driver.sendAudioChunk(makeExactChunk(
+                generation: 7, start: 0, pcm16LEData: Data(repeating: 0, count: 32_000)
+            ))
+            admitted = true
+        } catch {
+            admitted = false
+        }
+        var commitTask: Task<Void, Error>?
+        if admitted {
+            commitTask = Task {
+                try await driver.commit(makeUtterance(generation: 7, start: 0, end: 1_000_000_000))
+            }
+        }
+        let heldAppend = await connection.waitUntilSuspendedMessageTypeStarted("input_audio_buffer.append")
+        let savedTasks = await driver.backgroundTasksForTesting()
+        let savedDrain = await driver.drainTaskForTesting()
+        await connection.failSuspendedSend()
+        let closeHeld = await connection.waitUntilCloseStarted()
+        let failed = await driver.isFailedForTesting()
+        let mailboxCleared = !(await driver.hasPendingMediaForTesting())
+        if !heldAppend {
+            await connection.releaseSuspendedSend()
+            await connection.releaseHeldClose()
+            await driver.stop()
+        } else {
+            await connection.releaseHeldClose()
+        }
+        await savedDrain?.value
+        for savedTask in savedTasks { await savedTask.value }
+        if let commitTask {
+            do { try await commitTask.value } catch { }
+        }
+        let stopTask = Task { await driver.stop() }
+        await stopTask.value
+        let sentTypes = await connection.sentMessageTypes()
+        #expect(admitted)
+        #expect(heldAppend)
+        #expect(closeHeld)
+        #expect(failed)
+        #expect(mailboxCleared)
+        #expect(sentTypes == ["session.update", "input_audio_buffer.append"])
+        #expect(await recorder.outcome() == .succeeded)
     }
 
     @Test func commitAcknowledgementBeforeBoundaryFlushCannotRequestResponse() async throws {
@@ -2582,6 +2858,10 @@ private struct FakeConnectorError: Error, CustomStringConvertible {
 private actor FakeRealtimeWebSocketConnection: RealtimeWebSocketConnection {
     private let suspendSend: Bool
     private let suspendSendTypes: Set<String>
+    private let holdCloseInitially: Bool
+    private var heldCloseReleased = false
+    private var heldCloseWaiter: CheckedContinuation<Void, Never>?
+    private var closeHasStarted = false
     private var messages: [RealtimeSocketMessage] = []
     private var sentMessages: [RealtimeSocketMessage] = []
     private var sentTypes: [String] = []
@@ -2597,9 +2877,11 @@ private actor FakeRealtimeWebSocketConnection: RealtimeWebSocketConnection {
     init(
         suspendSend: Bool = false,
         suspendSendType: String? = nil,
-        suspendSendTypes: Set<String> = []
+        suspendSendTypes: Set<String> = [],
+        holdClose: Bool = false
     ) {
         self.suspendSend = suspendSend
+        self.holdCloseInitially = holdClose
         var configuredTypes = suspendSendTypes
         if let suspendSendType { configuredTypes.insert(suspendSendType) }
         self.suspendSendTypes = configuredTypes
@@ -2646,6 +2928,11 @@ private actor FakeRealtimeWebSocketConnection: RealtimeWebSocketConnection {
     }
 
     func close() async {
+        guard !closed else { return }
+        closeHasStarted = true
+        if holdCloseInitially && !heldCloseReleased {
+            await withCheckedContinuation { heldCloseWaiter = $0 }
+        }
         guard !closed else { return }
         closed = true
         closes += 1
@@ -2704,6 +2991,21 @@ private actor FakeRealtimeWebSocketConnection: RealtimeWebSocketConnection {
         guard let sendWaiter else { return }
         self.sendWaiter = nil
         sendWaiter.resume()
+    }
+
+    func releaseHeldClose() {
+        heldCloseReleased = true
+        guard let waiter = heldCloseWaiter else { return }
+        heldCloseWaiter = nil
+        waiter.resume()
+    }
+
+    func waitUntilCloseStarted() async -> Bool {
+        for _ in 0..<200 {
+            if closeHasStarted { return true }
+            try? await Task.sleep(for: .milliseconds(10))
+        }
+        return closeHasStarted
     }
 
     func failSuspendedSend() {

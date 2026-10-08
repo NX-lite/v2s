@@ -326,8 +326,40 @@ actor NativeRealtimeSessionDriver: RealtimeSessionDriving {
             if settings.profile.provider == .gemini {
                 audioMessages.append(try GeminiRealtimeCodec.activityStart())
             }
-            for chunk in committed {
-                audioMessages.append(try audioMessage(for: chunk, alias: alias, generation: generation))
+            if settings.profile.provider == .openAI {
+                var canonicalUtterance = Data()
+                let sourceByteCount = committed.reduce(into: 0) { $0 += $1.pcm16LEData.count }
+                guard sourceByteCount > 0,
+                      sourceByteCount <= OpenAIXAIRealtimeCodec.maximumOpenAISourceBytes else {
+                    throw RealtimeCodecError.invalidAudio
+                }
+                canonicalUtterance.reserveCapacity(sourceByteCount)
+                for chunk in committed { canonicalUtterance.append(chunk.pcm16LEData) }
+                let wire = try OpenAIXAIRealtimeCodec.openAIWirePCM16(
+                    fromCanonicalPCM16LE: canonicalUtterance,
+                    sourceAlias: alias,
+                    generation: generation
+                )
+                var offset = 0
+                while offset < wire.pcm16LEData.count {
+                    let count = min(OpenAIXAIRealtimeCodec.maximumAudioChunkBytes,
+                                    wire.pcm16LEData.count - offset)
+                    guard count > 0, count.isMultiple(of: 2), audioMessages.count < 24 else {
+                        throw RealtimeCodecError.invalidAudio
+                    }
+                    let payload = wire.pcm16LEData.subdata(in: offset..<(offset + count))
+                    let wireChunk = OpenAIWirePCM16(
+                        sourceAlias: alias, generation: generation, pcm16LEData: payload
+                    )
+                    audioMessages.append(try OpenAIXAIRealtimeCodec.openAIAppend(
+                        wireChunk, sourceAlias: alias, generation: generation
+                    ))
+                    offset += count
+                }
+            } else {
+                for chunk in committed {
+                    audioMessages.append(try audioMessage(for: chunk, alias: alias, generation: generation))
+                }
             }
             boundary = try commitMessage(for: utterance)
         } catch let error as RealtimeCodecError {
@@ -498,6 +530,12 @@ actor NativeRealtimeSessionDriver: RealtimeSessionDriving {
         if case .failed = state { return true }
         return false
     }
+
+    func backgroundTasksForTesting() -> [Task<Void, Never>] {
+        [connectionTask, receiveTask, drainTask].compactMap { $0 }
+    }
+
+    func drainTaskForTesting() -> Task<Void, Never>? { drainTask }
 
     func hasPendingMediaForTesting() -> Bool {
         !audioMailbox.isEmpty || videoMailbox != nil
@@ -1407,8 +1445,10 @@ actor NativeRealtimeSessionDriver: RealtimeSessionDriving {
         generation: Int
     ) throws -> RealtimeSocketMessage {
         switch settings.profile.provider {
-        case .openAI, .xAI:
-            try OpenAIXAIRealtimeCodec.audioAppend(chunk, sourceAlias: alias, generation: generation)
+        case .openAI:
+            throw RealtimeCodecError.invalidAudio
+        case .xAI:
+            try OpenAIXAIRealtimeCodec.xAIAppend(chunk, sourceAlias: alias, generation: generation)
         case .qwen:
             try QwenRealtimeCodec.audio(chunk, sourceAlias: alias, generation: generation)
         case .gemini:

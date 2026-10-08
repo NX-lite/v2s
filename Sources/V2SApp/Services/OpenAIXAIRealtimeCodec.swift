@@ -23,9 +23,23 @@ enum OpenAIXAIRealtimeEvent: Equatable, Sendable {
 }
 
 /// Pure JSON wire codec. No socket, credentials, diagnostics, or media retention.
+struct OpenAIWirePCM16: Equatable, Sendable {
+    let sourceAlias: String
+    let generation: Int
+    let pcm16LEData: Data
+    let sampleRate = 24_000
+
+    init(sourceAlias: String, generation: Int, pcm16LEData: Data) {
+        self.sourceAlias = sourceAlias
+        self.generation = generation
+        self.pcm16LEData = pcm16LEData
+    }
+}
+
 enum OpenAIXAIRealtimeCodec {
     static let maximumAudioChunkBytes = 32_000
     static let maximumIncomingBytes = 1_048_576
+    static let maximumOpenAISourceBytes = 512_000
     private static let maximumTextCharacters = 8_192
 
     static func sessionUpdate(
@@ -54,7 +68,7 @@ enum OpenAIXAIRealtimeCodec {
                     "output_modalities": ["text"],
                     "audio": [
                         "input": [
-                            "format": ["type": "audio/pcm", "rate": 16_000],
+                            "format": ["type": "audio/pcm", "rate": 24_000],
                             "turn_detection": NSNull(),
                         ] as [String: Any],
                     ],
@@ -74,11 +88,71 @@ enum OpenAIXAIRealtimeCodec {
         ])
     }
 
-    static func audioAppend(
-        _ chunk: RealtimeAudioChunk,
+    /// Converts one exact, bounded canonical utterance. Output has floor(3N/2)
+    /// samples at rational source positions 2j/3; the last source sample is
+    /// repeated at the endpoint. Signed nearest-integer rounding uses denominator
+    /// three, which has no half ties, and serialization is explicitly little-endian.
+    static func openAIWirePCM16(
+        fromCanonicalPCM16LE source: Data,
         sourceAlias: String,
         generation: Int
-    ) throws -> RealtimeSocketMessage {
+    ) throws -> OpenAIWirePCM16 {
+        guard validAlias(sourceAlias), !source.isEmpty,
+              source.count.isMultiple(of: 2),
+              source.count <= maximumOpenAISourceBytes else {
+            throw RealtimeCodecError.invalidAudio
+        }
+        let frameCount = source.count / 2
+        let (tripledCount, overflow) = frameCount.multipliedReportingOverflow(by: 3)
+        guard !overflow else { throw RealtimeCodecError.invalidAudio }
+        let outputFrames = tripledCount / 2
+        let (outputBytes, byteOverflow) = outputFrames.multipliedReportingOverflow(by: 2)
+        guard !byteOverflow, outputBytes > 0 else { throw RealtimeCodecError.invalidAudio }
+
+        let sourceBytes = Array(source)
+        var samples = [Int16]()
+        samples.reserveCapacity(frameCount)
+        for offset in stride(from: 0, to: sourceBytes.count, by: 2) {
+            let bits = UInt16(sourceBytes[offset]) | (UInt16(sourceBytes[offset + 1]) << 8)
+            samples.append(Int16(bitPattern: bits))
+        }
+        var output = Data()
+        output.reserveCapacity(outputBytes)
+        for index in 0..<outputFrames {
+            let numerator = index * 2
+            let leftIndex = numerator / 3
+            let remainder = numerator % 3
+            let value: Int64
+            if leftIndex + 1 >= samples.count {
+                value = Int64(samples[samples.count - 1])
+            } else {
+                let weighted = Int64(samples[leftIndex]) * Int64(3 - remainder) +
+                    Int64(samples[leftIndex + 1]) * Int64(remainder)
+                value = weighted >= 0 ? (weighted + 1) / 3 : -((-weighted + 1) / 3)
+            }
+            let sample = Int16(clamping: value)
+            let bits = UInt16(bitPattern: sample)
+            output.append(UInt8(bits & 0xff))
+            output.append(UInt8(bits >> 8))
+        }
+        return OpenAIWirePCM16(sourceAlias: sourceAlias, generation: generation, pcm16LEData: output)
+    }
+
+    static func openAIAppend(_ wire: OpenAIWirePCM16, sourceAlias: String, generation: Int) throws -> RealtimeSocketMessage {
+        guard validAlias(sourceAlias), wire.sourceAlias == sourceAlias,
+              wire.generation == generation, wire.sampleRate == 24_000,
+              !wire.pcm16LEData.isEmpty,
+              wire.pcm16LEData.count.isMultiple(of: 2),
+              wire.pcm16LEData.count <= maximumAudioChunkBytes else {
+            throw RealtimeCodecError.invalidAudio
+        }
+        return try encode([
+            "type": "input_audio_buffer.append",
+            "audio": wire.pcm16LEData.base64EncodedString(),
+        ])
+    }
+
+    static func xAIAppend(_ chunk: RealtimeAudioChunk, sourceAlias: String, generation: Int) throws -> RealtimeSocketMessage {
         guard validAlias(sourceAlias), chunk.sourceAlias == sourceAlias,
               chunk.generation == generation, chunk.sampleRate == 16_000,
               !chunk.pcm16LEData.isEmpty,

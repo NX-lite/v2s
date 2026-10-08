@@ -12,7 +12,11 @@ import Foundation
             capturedAtMonotonicNanoseconds: 1,
             pcm16LEData: Data([1, 2]), sampleRate: 16_000
         )
-        _ = try OpenAIXAIRealtimeCodec.audioAppend(chunk, sourceAlias: "audio-1", generation: 1)
+        _ = try OpenAIXAIRealtimeCodec.xAIAppend(chunk, sourceAlias: "audio-1", generation: 1)
+        let openAIWire = try OpenAIXAIRealtimeCodec.openAIWirePCM16(
+            fromCanonicalPCM16LE: chunk.pcm16LEData, sourceAlias: "audio-1", generation: 1
+        )
+        _ = try OpenAIXAIRealtimeCodec.openAIAppend(openAIWire, sourceAlias: "audio-1", generation: 1)
         let event = try OpenAIXAIRealtimeCodec.parse(
             .text(#"{"type":"response.text.delta","delta":"ok"}"#)
         )

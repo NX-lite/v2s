@@ -17,7 +17,7 @@ import Testing
         #expect(input["turn_detection"] is NSNull)
         let format = try #require(input["format"] as? [String: Any])
         #expect(format["type"] as? String == "audio/pcm")
-        #expect(format["rate"] as? Int == 16_000)
+        #expect(format["rate"] as? Int == 24_000)
         #expect((session["instructions"] as? String)?.contains("audio-1") == true)
         #expect((session["instructions"] as? String)?.contains("application audio") == true)
         #expect(!(session["instructions"] as? String ?? "").contains("bundle.example"))
@@ -51,16 +51,16 @@ import Testing
             capturedAtMonotonicNanoseconds: 10,
             pcm16LEData: Data([1, 2, 3, 4]), sampleRate: 16_000
         )
-        let event = try json(OpenAIXAIRealtimeCodec.audioAppend(
+        let event = try json(OpenAIXAIRealtimeCodec.xAIAppend(
             valid, sourceAlias: "audio-1", generation: 7
         ))
         #expect(event["type"] as? String == "input_audio_buffer.append")
         #expect(event["audio"] as? String == "AQIDBA==")
         #expect(throws: RealtimeCodecError.invalidAudio) {
-            try OpenAIXAIRealtimeCodec.audioAppend(valid, sourceAlias: "audio-2", generation: 7)
+            try OpenAIXAIRealtimeCodec.xAIAppend(valid, sourceAlias: "audio-2", generation: 7)
         }
         #expect(throws: RealtimeCodecError.invalidAudio) {
-            try OpenAIXAIRealtimeCodec.audioAppend(valid, sourceAlias: "audio-1", generation: 8)
+            try OpenAIXAIRealtimeCodec.xAIAppend(valid, sourceAlias: "audio-1", generation: 8)
         }
         let odd = RealtimeAudioChunk(
             sourceAlias: "audio-1", generation: 7,
@@ -68,7 +68,7 @@ import Testing
             pcm16LEData: Data([1, 2, 3]), sampleRate: 16_000
         )
         #expect(throws: RealtimeCodecError.invalidAudio) {
-            try OpenAIXAIRealtimeCodec.audioAppend(odd, sourceAlias: "audio-1", generation: 7)
+            try OpenAIXAIRealtimeCodec.xAIAppend(odd, sourceAlias: "audio-1", generation: 7)
         }
         let wrongRate = RealtimeAudioChunk(
             sourceAlias: "audio-1", generation: 7,
@@ -76,7 +76,7 @@ import Testing
             pcm16LEData: Data([1, 2]), sampleRate: 24_000
         )
         #expect(throws: RealtimeCodecError.invalidAudio) {
-            try OpenAIXAIRealtimeCodec.audioAppend(wrongRate, sourceAlias: "audio-1", generation: 7)
+            try OpenAIXAIRealtimeCodec.xAIAppend(wrongRate, sourceAlias: "audio-1", generation: 7)
         }
         let oversized = RealtimeAudioChunk(
             sourceAlias: "audio-1", generation: 7,
@@ -85,7 +85,70 @@ import Testing
             sampleRate: 16_000
         )
         #expect(throws: RealtimeCodecError.invalidAudio) {
-            try OpenAIXAIRealtimeCodec.audioAppend(oversized, sourceAlias: "audio-1", generation: 7)
+            try OpenAIXAIRealtimeCodec.xAIAppend(oversized, sourceAlias: "audio-1", generation: 7)
+        }
+    }
+
+    @Test func openAIWireResamplerUsesLockedSignedLittleEndianVectors() throws {
+        func pcm(_ samples: [Int16]) -> Data {
+            Data(samples.flatMap { value in
+                let bits = UInt16(bitPattern: value)
+                return [UInt8(bits & 0xff), UInt8(bits >> 8)]
+            })
+        }
+        let positive = try OpenAIXAIRealtimeCodec.openAIWirePCM16(
+            fromCanonicalPCM16LE: pcm([10, 20]), sourceAlias: "audio-1", generation: 7
+        )
+        #expect(positive.pcm16LEData == pcm([10, 17, 20]))
+        let negative = try OpenAIXAIRealtimeCodec.openAIWirePCM16(
+            fromCanonicalPCM16LE: pcm([-3, 0]), sourceAlias: "audio-1", generation: 7
+        )
+        #expect(negative.pcm16LEData == pcm([-3, -1, 0]))
+        let ramp = try OpenAIXAIRealtimeCodec.openAIWirePCM16(
+            fromCanonicalPCM16LE: pcm([0, 300, 600, 900]), sourceAlias: "audio-1", generation: 7
+        )
+        #expect(ramp.pcm16LEData == pcm([0, 200, 400, 600, 800, 900]))
+        let backing = Data([99, 99, 10, 0, 20, 0, 88])
+        let slicedSource = backing[2..<6]
+        let sliced = try OpenAIXAIRealtimeCodec.openAIWirePCM16(
+            fromCanonicalPCM16LE: slicedSource, sourceAlias: "audio-1", generation: 7
+        )
+        #expect(sliced.pcm16LEData == pcm([10, 17, 20]))
+        #expect(throws: RealtimeCodecError.invalidAudio) {
+            try OpenAIXAIRealtimeCodec.openAIWirePCM16(
+                fromCanonicalPCM16LE: Data(), sourceAlias: "audio-1", generation: 7
+            )
+        }
+        #expect(throws: RealtimeCodecError.invalidAudio) {
+            try OpenAIXAIRealtimeCodec.openAIWirePCM16(
+                fromCanonicalPCM16LE: Data([0, 0, 1]), sourceAlias: "audio-1", generation: 7
+            )
+        }
+        #expect(throws: RealtimeCodecError.invalidAudio) {
+            try OpenAIXAIRealtimeCodec.openAIWirePCM16(
+                fromCanonicalPCM16LE: Data(count: 512_002), sourceAlias: "audio-1", generation: 7
+            )
+        }
+        let oddFrames = try OpenAIXAIRealtimeCodec.openAIWirePCM16(
+            fromCanonicalPCM16LE: pcm([0, 300, 600]), sourceAlias: "audio-1", generation: 7
+        )
+        #expect(oddFrames.pcm16LEData == pcm([0, 200, 400, 600]))
+        #expect(try json(OpenAIXAIRealtimeCodec.openAIAppend(
+            positive, sourceAlias: "audio-1", generation: 7
+        ))["audio"] as? String == pcm([10, 17, 20]).base64EncodedString())
+        for invalidWire in [
+            OpenAIWirePCM16(sourceAlias: "audio-2", generation: 7, pcm16LEData: Data([1, 2])),
+            OpenAIWirePCM16(sourceAlias: "audio-1", generation: 8, pcm16LEData: Data([1, 2])),
+            OpenAIWirePCM16(sourceAlias: "audio-1", generation: 7, pcm16LEData: Data()),
+            OpenAIWirePCM16(sourceAlias: "audio-1", generation: 7, pcm16LEData: Data([1, 2, 3])),
+            OpenAIWirePCM16(sourceAlias: "audio-1", generation: 7,
+                            pcm16LEData: Data(count: OpenAIXAIRealtimeCodec.maximumAudioChunkBytes + 2)),
+        ] {
+            #expect(throws: RealtimeCodecError.invalidAudio) {
+                try OpenAIXAIRealtimeCodec.openAIAppend(
+                    invalidWire, sourceAlias: "audio-1", generation: 7
+                )
+            }
         }
     }
 
