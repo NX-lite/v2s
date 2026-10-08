@@ -154,6 +154,51 @@ import Testing
         #expect(entry.translatedText == "本地翻译")
     }
 
+    @Test func transcriptEntryNativeTranslationStatesDoNotExposeStaleLocalTarget() {
+        let pending = TranscriptEntry(
+            id: UUID(),
+            sourceID: "mic-1",
+            sourceName: "Desk Mic",
+            sourceLanguageID: "en",
+            targetLanguageID: "zh-Hans",
+            localSourceText: "local source",
+            localTranslatedText: "stale local target",
+            correctedSourceText: "corrected source",
+            nativeCorrectedTranslationState: .pending
+        )
+        let failed = TranscriptEntry(
+            id: UUID(),
+            sourceID: "mic-1",
+            sourceName: "Desk Mic",
+            sourceLanguageID: "en",
+            targetLanguageID: "zh-Hans",
+            localSourceText: "local source",
+            localTranslatedText: "stale local target",
+            correctedSourceText: "corrected source",
+            nativeCorrectedTranslationState: .failed
+        )
+        let readyEmpty = TranscriptEntry(
+            id: UUID(),
+            sourceID: "mic-1",
+            sourceName: "Desk Mic",
+            sourceLanguageID: "en",
+            targetLanguageID: "zh-Hans",
+            localSourceText: "local source",
+            localTranslatedText: "stale local target",
+            correctedSourceText: "corrected source",
+            correctedTranslatedText: "",
+            nativeCorrectedTranslationState: .ready
+        )
+
+        #expect(pending.sourceText == "corrected source")
+        #expect(pending.translatedText.isEmpty)
+        #expect(failed.translatedText.isEmpty)
+        #expect(readyEmpty.translatedText.isEmpty)
+        #expect(pending.localTranslatedText == "stale local target")
+        #expect(failed.localTranslatedText == "stale local target")
+        #expect(readyEmpty.localTranslatedText == "stale local target")
+    }
+
     @Test func snapshotCopiesTranscriptEntriesInTheirStoredOrder() {
         let settingsURL = makeSettingsURL()
         defer { try? FileManager.default.removeItem(at: settingsURL) }

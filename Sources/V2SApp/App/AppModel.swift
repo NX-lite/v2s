@@ -69,6 +69,7 @@ final class AppModel: ObservableObject {
     private var activeSources: [InputSource] = []
     private var captionDisplayTask: Task<Void, Never>?
     private var captionTranslationTasks: [UUID: Task<Void, Never>] = [:]
+    private var captionRefreshTask: Task<Void, Never>?
     private var pendingCaptions: [QueuedCaption] = []
     private var readyCaptionTranslations: [UUID: String] = [:]
     private var captionTranslationWaiters: [UUID: [UUID: CheckedContinuation<String?, Never>]] = [:]
@@ -107,6 +108,10 @@ final class AppModel: ObservableObject {
     private var correctionResultReceiptCountForTestingStorage = 0
     private var acceptedFinalDeliveryCountForTestingStorage = 0
     private var captionTranslationPauseForTesting: (@MainActor () async -> Void)?
+    private var captionQueueInitialWritePauseForTesting: (@MainActor () async -> Void)?
+    private var translationOperationForTesting: (@MainActor (String, String, String) async throws -> String?)?
+    private var nativeSourceReadyPauseForTesting: (@MainActor () async -> Void)?
+    private var nativeSourceReadyTasksForTesting: [String: Task<Void, Never>] = [:]
     private var nativeCaptionTransferPauseForTesting: (@MainActor () async -> Void)?
     #endif
     private var recentRecognizedCaptionTexts: [RecentRecognizedCaption] = []
@@ -334,6 +339,8 @@ final class AppModel: ObservableObject {
         nativeRealtimeStartupTask?.cancel()
         for task in nativeCaptionTransferTasksByID.values { task.cancel() }
         nativeCaptionTransferTasksByID.removeAll()
+        for binding in nativeAcceptedCaptionBindingsByID.values { binding.nativeCorrectionTask?.cancel() }
+        captionRefreshTask?.cancel()
         for input in nativeRealtimeInputsBySourceID.values {
             input.finish(error: .sourceSuperseded)
         }
@@ -1443,7 +1450,13 @@ final class AppModel: ObservableObject {
             }
         }
         await nativeRealtimeSessionCoordinator.setSourceReadyHandler { [weak self] identity in
-            Task { @MainActor [weak self] in
+            let task = Task { @MainActor [weak self] in
+                #if DEBUG
+                let pauseForTesting = self?.nativeSourceReadyPauseForTesting
+                self?.nativeSourceReadyPauseForTesting = nil
+                if let pauseForTesting { await pauseForTesting() }
+                guard Task.isCancelled == false else { return }
+                #endif
                 self?.nativeSourceDidBecomeReady(
                     identity,
                     lifecycleGeneration: lifecycleGeneration,
@@ -1451,10 +1464,20 @@ final class AppModel: ObservableObject {
                     sourceStartupGenerations: sourceStartupGenerations
                 )
             }
+            #if DEBUG
+            Task { @MainActor [weak self] in
+                self?.nativeSourceReadyTasksForTesting[identity.sourceID] = task
+            }
+            #endif
         }
         await nativeRealtimeSessionCoordinator.setCaptionDispositionHandler { [weak self] metadata, disposition in
             Task { @MainActor [weak self] in
                 self?.nativeCaptionDispositionDidArrive(metadata, disposition: disposition)
+            }
+        }
+        await nativeRealtimeSessionCoordinator.setCaptionEventHandler { [weak self] event in
+            Task { @MainActor [weak self] in
+                self?.nativeCaptionEventDidArrive(event)
             }
         }
         let eligibleCaptures = captures.filter { capture in
@@ -2761,7 +2784,12 @@ final class AppModel: ObservableObject {
                 promotedDraftTranslation: promotedDraftTranslation,
                 capturedAt: capturedAt,
                 audioWAVData: correctionAudioWAVData,
-                correctionAudioPolicyEpoch: correctionAudioPolicyEpoch
+                correctionAudioPolicyEpoch: correctionAudioPolicyEpoch,
+                wasAcceptedInNativeRealtime: CaptionEnhancementPolicy.mode(
+                    for: source.id,
+                    correction: correction.settings,
+                    nativeRealtime: nativeRealtimeSettings
+                ) == .nativeRealtime
             )
 
             rememberRecognizedSentence(sourceText, sourceID: source.id)
@@ -2786,7 +2814,12 @@ final class AppModel: ObservableObject {
                 promotedDraftTranslation: nil,
                 capturedAt: capturedAt,
                 audioWAVData: correctionAudioWAVData,
-                correctionAudioPolicyEpoch: correctionAudioPolicyEpoch
+                correctionAudioPolicyEpoch: correctionAudioPolicyEpoch,
+                wasAcceptedInNativeRealtime: CaptionEnhancementPolicy.mode(
+                    for: source.id,
+                    correction: correction.settings,
+                    nativeRealtime: nativeRealtimeSettings
+                ) == .nativeRealtime
             )
 
             rememberRecognizedSentence(sourceText, sourceID: source.id)
@@ -2855,8 +2888,11 @@ final class AppModel: ObservableObject {
             guard let evictIndex = sourceIDs.firstIndex(where: {
                 guard let existing = nativeAcceptedCaptionBindingsByID[$0] else { return true }
                 let pendingTransfer = nativePendingCaptionTransferIDsBySourceID[caption.sourceID, default: []].contains($0)
-                let awaitingTerminal = existing.transferDisposition == .queued && existing.terminalDisposition == nil
-                return !pendingTransfer && !awaitingTerminal
+                let awaitingTerminal = existing.transferDisposition == .queued
+                    && existing.terminalDisposition == nil
+                    && !existing.terminalEventReceived
+                let translatingCorrection = existing.nativeCorrectionTask != nil
+                return !pendingTransfer && !awaitingTerminal && !translatingCorrection
             }) else { return }
             let evicted = sourceIDs.remove(at: evictIndex)
             invalidateNativeAcceptedCaption(id: evicted)
@@ -2932,7 +2968,269 @@ final class AppModel: ObservableObject {
                   binding.context.sourceToken == identity.sourceToken,
                   binding.context.captureGeneration == identity.captureGeneration else { continue }
             binding.readyIdentity = identity
+            let earlyEvents = binding.earlyEvents
+            binding.earlyEvents.removeAll(keepingCapacity: true)
             nativeAcceptedCaptionBindingsByID[id] = binding
+            for event in earlyEvents {
+                nativeCaptionEventDidArrive(event)
+            }
+        }
+    }
+
+    private func nativeCaptionEventDidArrive(_ event: RealtimeCaptionEventEnvelope) {
+        guard var binding = nativeAcceptedCaptionBindingsByID[event.captionID],
+              binding.metadata.sourceID == event.sourceID,
+              binding.metadata.sourceToken == event.sourceToken,
+              binding.metadata.captureGeneration == event.captureGeneration,
+              binding.metadata.captionID == event.captionID,
+              binding.metadata.utteranceID == event.utteranceID,
+              binding.metadata.sourceLanguageID == event.sourceLanguageID,
+              binding.metadata.targetLanguageID == event.targetLanguageID,
+              nativeBindingIsCurrent(binding, requireTrustedReady: false) else { return }
+
+        if let readyIdentity = binding.readyIdentity {
+            guard readyIdentity.sourceID == event.sourceID,
+                  readyIdentity.sourceToken == event.sourceToken,
+                  readyIdentity.captureGeneration == event.captureGeneration,
+                  readyIdentity.alias == event.sourceAlias,
+                  readyIdentity.driverGeneration == event.driverGeneration else { return }
+        } else {
+            let sourceEarlyEventCount = nativeAcceptedCaptionIDsBySourceID[event.sourceID, default: []]
+                .compactMap { nativeAcceptedCaptionBindingsByID[$0]?.earlyEvents.count }
+                .reduce(0, +)
+            guard binding.earlyEvents.count < 8, sourceEarlyEventCount < 8 else { return }
+            binding.earlyEvents.append(event)
+            nativeAcceptedCaptionBindingsByID[event.captionID] = binding
+            return
+        }
+
+        switch event.kind {
+        case .correctedText(let text):
+            applyNativeCorrectedSource(text, to: event.captionID)
+        case .utteranceCompleted:
+            binding.terminalEventReceived = true
+            nativeAcceptedCaptionBindingsByID[event.captionID] = binding
+        case .suggestion:
+            break
+        }
+    }
+
+    private func nativeBindingIsCurrent(
+        _ binding: NativeAcceptedCaptionBinding,
+        requireTrustedReady: Bool
+    ) -> Bool {
+        let metadata = binding.metadata
+        guard nativeAcceptedCaptionBindingsByID[metadata.captionID]?.metadata == metadata,
+              nativeAcceptedCaptionBindingsByID[metadata.captionID]?.context == binding.context,
+              nativeContextIsCurrent(binding.context),
+              CaptionEnhancementPolicy.mode(
+                for: metadata.sourceID,
+                correction: correction.settings,
+                nativeRealtime: nativeRealtimeSettings
+              ) == .nativeRealtime,
+              let input = nativeRealtimeInputsBySourceID[metadata.sourceID],
+              input.sourceToken == metadata.sourceToken,
+              input.generation == metadata.captureGeneration,
+              !input.isConsumed,
+              input.terminationError == nil else { return false }
+        if requireTrustedReady {
+            guard let readyIdentity = binding.readyIdentity,
+                  nativeRealtimeReadyIdentitiesBySourceID[metadata.sourceID] == readyIdentity else { return false }
+        }
+        return true
+    }
+
+    private func applyNativeCorrectedSource(_ text: String, to captionID: UUID) {
+        guard let binding = nativeAcceptedCaptionBindingsByID[captionID],
+              nativeBindingIsCurrent(binding, requireTrustedReady: true) else { return }
+        let correctedSource = sanitizedDisplayText(text)
+        guard correctedSource.isEmpty == false else { return }
+
+        correctedCaptionIDs.insert(captionID)
+        let revision = UUID()
+        binding.nativeCorrectionTask?.cancel()
+        var updatedBinding = binding
+        updatedBinding.nativeCorrectionRevision = revision
+        updatedBinding.nativeCorrectedSourceText = correctedSource
+        updatedBinding.nativeCorrectedTranslatedText = nil
+        updatedBinding.nativeCorrectionTranslationState = .pending
+        updatedBinding.nativeCorrectionTask = nil
+        nativeAcceptedCaptionBindingsByID[captionID] = updatedBinding
+        writeNativeEffectiveCaption(updatedBinding)
+
+        if binding.metadata.sourceLanguageID == binding.metadata.targetLanguageID {
+            updatedBinding.nativeCorrectedTranslatedText = correctedSource
+            updatedBinding.nativeCorrectionTranslationState = .ready
+            nativeAcceptedCaptionBindingsByID[captionID] = updatedBinding
+            writeNativeEffectiveCaption(updatedBinding)
+            return
+        }
+
+        let metadata = binding.metadata
+        let context = binding.context
+        let readyIdentity = binding.readyIdentity
+        let translationCoordinator = self.translationCoordinator
+        let glossaryService = self.glossaryService
+        let glossary = self.glossary
+        #if DEBUG
+        let testTranslationOperation = translationOperationForTesting
+        #endif
+        let translationTask = Task { @MainActor [weak self, translationCoordinator, glossaryService] in
+            let raw: String?
+            do {
+                #if DEBUG
+                if let testTranslationOperation {
+                    raw = try await testTranslationOperation(
+                        correctedSource,
+                        metadata.sourceLanguageID,
+                        metadata.targetLanguageID
+                    )
+                } else {
+                    raw = try await translationCoordinator.translate(
+                        correctedSource,
+                        from: metadata.sourceLanguageID,
+                        to: metadata.targetLanguageID
+                    )
+                }
+                #else
+                raw = try await translationCoordinator.translate(
+                    correctedSource,
+                    from: metadata.sourceLanguageID,
+                    to: metadata.targetLanguageID
+                )
+                #endif
+            } catch {
+                raw = nil
+            }
+            guard !Task.isCancelled, let self,
+                  let current = self.nativeAcceptedCaptionBindingsByID[captionID],
+                  current.metadata == metadata,
+                  current.context == context,
+                  current.readyIdentity == readyIdentity,
+                  current.nativeCorrectionRevision == revision,
+                  self.nativeBindingIsCurrent(current, requireTrustedReady: true) else { return }
+
+            var result = current
+            if let raw {
+                let translated = self.sanitizedDisplayText(glossaryService.apply(to: raw, glossary: glossary))
+                if !translated.isEmpty,
+                   !self.shouldTreatAsMissingTranslation(
+                    translated,
+                    sourceText: correctedSource,
+                    sourceLanguageID: metadata.sourceLanguageID,
+                    targetLanguageID: metadata.targetLanguageID
+                   ) {
+                    result.nativeCorrectedTranslatedText = translated
+                    result.nativeCorrectionTranslationState = .ready
+                } else {
+                    result.nativeCorrectedTranslatedText = nil
+                    result.nativeCorrectionTranslationState = .failed
+                }
+            } else {
+                result.nativeCorrectedTranslatedText = nil
+                result.nativeCorrectionTranslationState = .failed
+            }
+            result.nativeCorrectionTask = nil
+            self.nativeAcceptedCaptionBindingsByID[captionID] = result
+            self.writeNativeEffectiveCaption(result)
+        }
+        updatedBinding.nativeCorrectionTask = translationTask
+        nativeAcceptedCaptionBindingsByID[captionID] = updatedBinding
+    }
+
+    private func writeNativeEffectiveCaption(_ binding: NativeAcceptedCaptionBinding) {
+        guard let sourceText = binding.nativeCorrectedSourceText else { return }
+        let translatedText: String
+        switch binding.nativeCorrectionTranslationState {
+        case .none, .pending, .failed:
+            translatedText = ""
+        case .ready:
+            translatedText = binding.nativeCorrectedTranslatedText ?? ""
+        }
+        if let index = transcriptEntries.firstIndex(where: { $0.id == binding.metadata.captionID }) {
+            transcriptEntries[index].correctedSourceText = sourceText
+            transcriptEntries[index].correctedTranslatedText = binding.nativeCorrectedTranslatedText
+            transcriptEntries[index].nativeCorrectedTranslationState = binding.nativeCorrectionTranslationState
+        }
+        guard var state = overlayState else { return }
+        if state.committedCaptionID == binding.metadata.captionID {
+            state.sourceText = sourceText
+            state.translatedText = translatedText
+            overlayState = state
+        }
+        if let index = state.history.firstIndex(where: { $0.id == binding.metadata.captionID }) {
+            state.history[index].sourceText = sourceText
+            state.history[index].translatedText = translatedText
+            overlayState = state
+        }
+    }
+
+    private func nativeCorrectionBindingForCurrentCaption(_ captionID: UUID) -> NativeAcceptedCaptionBinding? {
+        guard let binding = nativeAcceptedCaptionBindingsByID[captionID],
+              binding.nativeCorrectionTranslationState != .none,
+              nativeAcceptedCaptionBindingsByID[captionID]?.metadata == binding.metadata else { return nil }
+        return binding
+    }
+
+    private func effectiveCaptionValues(
+        captionID: UUID,
+        fallbackSource: String,
+        fallbackTranslation: String,
+        preserveAcceptedNativeFact: Bool = false
+    ) -> (source: String, translation: String) {
+        if let binding = nativeCorrectionBindingForCurrentCaption(captionID) {
+            return (
+                binding.nativeCorrectedSourceText ?? fallbackSource,
+                nativeEffectiveTranslation(for: binding, localTranslation: fallbackTranslation)
+            )
+        }
+        if let entry = transcriptEntries.first(where: { $0.id == captionID }),
+           entry.nativeCorrectedTranslationState != .none {
+            return (entry.sourceText, entry.translatedText)
+        }
+        if preserveAcceptedNativeFact,
+           let retained = retainedAcceptedNativeCaptionValues(for: captionID) {
+            return retained
+        }
+        return (fallbackSource, fallbackTranslation)
+    }
+
+    /// Keeps an already accepted native correction effective while its local queue
+    /// write completes after transcript clearing removed the binding and entry marker.
+    private func retainedAcceptedNativeCaptionValues(for captionID: UUID) -> (source: String, translation: String)? {
+        guard correctedCaptionIDs.contains(captionID) else { return nil }
+        if overlayState?.committedCaptionID == captionID,
+           let state = overlayState {
+            return (state.sourceText, state.translatedText)
+        }
+        if let history = overlayState?.history.last(where: { $0.id == captionID }) {
+            return (history.sourceText, history.translatedText)
+        }
+        return nil
+    }
+
+    private func restoreRetainedNativeCorrectionMarker(for captionID: UUID, wasAcceptedInNativeRealtime: Bool) {
+        guard wasAcceptedInNativeRealtime,
+              let retained = retainedAcceptedNativeCaptionValues(for: captionID),
+              let index = transcriptEntries.firstIndex(where: { $0.id == captionID }) else { return }
+        guard transcriptEntries[index].nativeCorrectedTranslationState == .none else { return }
+        transcriptEntries[index].correctedSourceText = retained.source
+        transcriptEntries[index].correctedTranslatedText = retained.translation
+        transcriptEntries[index].nativeCorrectedTranslationState = retained.translation.isEmpty ? .failed : .ready
+    }
+
+    private func nativeEffectiveTranslation(
+        for binding: NativeAcceptedCaptionBinding?,
+        localTranslation: String
+    ) -> String {
+        guard let binding else { return localTranslation }
+        switch binding.nativeCorrectionTranslationState {
+        case .none:
+            return localTranslation
+        case .pending, .failed:
+            return ""
+        case .ready:
+            return binding.nativeCorrectedTranslatedText ?? ""
         }
     }
 
@@ -3009,6 +3307,7 @@ final class AppModel: ObservableObject {
     private func invalidateNativeAcceptedCaption(id: UUID) {
         let sourceID = nativeAcceptedCaptionBindingsByID[id]?.metadata.sourceID
         nativeCaptionTransferTasksByID.removeValue(forKey: id)?.cancel()
+        nativeAcceptedCaptionBindingsByID[id]?.nativeCorrectionTask?.cancel()
         nativeAcceptedCaptionBindingsByID.removeValue(forKey: id)
         if let sourceID {
             nativeAcceptedCaptionIDsBySourceID[sourceID]?.removeAll { $0 == id }
@@ -3018,7 +3317,10 @@ final class AppModel: ObservableObject {
 
     private func invalidateNativeAcceptedCaptions(sourceID: String) {
         let ids = nativeAcceptedCaptionIDsBySourceID.removeValue(forKey: sourceID) ?? []
-        for id in ids { nativeCaptionTransferTasksByID.removeValue(forKey: id)?.cancel() }
+        for id in ids {
+            nativeCaptionTransferTasksByID.removeValue(forKey: id)?.cancel()
+            nativeAcceptedCaptionBindingsByID[id]?.nativeCorrectionTask?.cancel()
+        }
         ids.forEach { nativeAcceptedCaptionBindingsByID.removeValue(forKey: $0) }
         nativePendingCaptionTransferIDsBySourceID.removeValue(forKey: sourceID)
         nativeRealtimeCaptureRegistrationsBySourceID.removeValue(forKey: sourceID)
@@ -3027,6 +3329,7 @@ final class AppModel: ObservableObject {
 
     private func invalidateAllNativeAcceptedCaptions() {
         for task in nativeCaptionTransferTasksByID.values { task.cancel() }
+        for binding in nativeAcceptedCaptionBindingsByID.values { binding.nativeCorrectionTask?.cancel() }
         nativeCaptionTransferTasksByID.removeAll()
         nativeAcceptedCaptionBindingsByID.removeAll()
         nativeAcceptedCaptionIDsBySourceID.removeAll()
@@ -3046,13 +3349,15 @@ final class AppModel: ObservableObject {
         }
 
         if let displayedCaption {
-            Task { @MainActor [weak self] in
+            captionRefreshTask?.cancel()
+            captionRefreshTask = Task { @MainActor [weak self] in
                 guard let self else {
                     return
                 }
 
                 let translatedText = await translatedText(for: displayedCaption)
-                guard liveTranscriptionSession != nil,
+                guard Task.isCancelled == false,
+                      liveTranscriptionSession != nil,
                       self.displayedCaption?.id == displayedCaption.id else {
                     return
                 }
@@ -3071,13 +3376,28 @@ final class AppModel: ObservableObject {
                     sourceText: displayedCaption.sourceText,
                     translatedText: resolvedTranslation
                 )
+                if let nativeCorrection = nativeCorrectionBindingForCurrentCaption(displayedCaption.id) {
+                    writeNativeEffectiveCaption(nativeCorrection)
+                } else {
+                    restoreRetainedNativeCorrectionMarker(
+                        for: displayedCaption.id,
+                        wasAcceptedInNativeRealtime: displayedCaption.wasAcceptedInNativeRealtime
+                    )
+                }
                 guard correctedCaptionIDs.contains(displayedCaption.id) == false else {
                     return
                 }
+                let effectiveValues = effectiveCaptionValues(
+                    captionID: displayedCaption.id,
+                    fallbackSource: displayedCaption.sourceText,
+                    fallbackTranslation: resolvedTranslation,
+                    preserveAcceptedNativeFact: displayedCaption.wasAcceptedInNativeRealtime
+                )
                 updateCommittedOverlay(
-                    translatedText: resolvedTranslation,
-                    sourceText: displayedCaption.sourceText,
-                    lateTranslation: translationExpected && resolvedTranslation.isEmpty == false
+                    translatedText: effectiveValues.translation,
+                    sourceText: effectiveValues.source,
+                    captionID: displayedCaption.id,
+                    lateTranslation: translationExpected && effectiveValues.translation.isEmpty == false
                 )
             }
         }
@@ -3232,6 +3552,39 @@ final class AppModel: ObservableObject {
         captionTranslationPauseForTesting = operation
     }
 
+    func pauseBeforeNextCaptionQueueInitialWriteForTesting(
+        _ operation: @escaping @MainActor () async -> Void
+    ) {
+        captionQueueInitialWritePauseForTesting = operation
+    }
+
+    func nativeCorrectionSnapshotForTesting(
+        captionID: UUID
+    ) -> (sourceText: String?, translatedText: String?, state: NativeCorrectedTranslationState)? {
+        guard let binding = nativeAcceptedCaptionBindingsByID[captionID] else { return nil }
+        return (
+            binding.nativeCorrectedSourceText,
+            binding.nativeCorrectedTranslatedText,
+            binding.nativeCorrectionTranslationState
+        )
+    }
+
+    func setTranslationOperationForTesting(
+        _ operation: @escaping @MainActor (String, String, String) async throws -> String?
+    ) {
+        translationOperationForTesting = operation
+    }
+
+    func pauseNextNativeSourceReadyHandlingForTesting(
+        _ operation: @escaping @MainActor () async -> Void
+    ) {
+        nativeSourceReadyPauseForTesting = operation
+    }
+
+    func nativeSourceReadyTaskSnapshotForTesting(sourceID: String) -> Task<Void, Never>? {
+        nativeSourceReadyTasksForTesting[sourceID]
+    }
+
     func pauseNativeCaptionTransfersForTesting(_ operation: @escaping @MainActor () async -> Void) {
         nativeCaptionTransferPauseForTesting = operation
     }
@@ -3342,6 +3695,10 @@ final class AppModel: ObservableObject {
         pendingCaptions.count
     }
 
+    var pendingCaptionIDsForTesting: Set<UUID> {
+        Set(pendingCaptions.map(\.id))
+    }
+
     var submittedCorrectionCaptionIDsForTesting: Set<UUID> {
         Set(submittedCorrectionSourceIDsByCaptionID.keys)
     }
@@ -3376,6 +3733,12 @@ final class AppModel: ObservableObject {
             || transcriptEntries.contains(where: { $0.sourceText == sourceText })
     }
 
+    func localCaptionIDForTesting(sourceText: String) -> UUID? {
+        pendingCaptions.first(where: { $0.sourceText == sourceText })?.id
+            ?? displayedCaption.flatMap { $0.sourceText == sourceText ? $0.id : nil }
+            ?? transcriptEntries.first(where: { $0.localSourceText == sourceText })?.id
+    }
+
     func nativeReadyIdentityForTesting(sourceID: String) -> RealtimeSourceReadyIdentity? {
         nativeRealtimeReadyIdentitiesBySourceID[sourceID]
     }
@@ -3402,6 +3765,40 @@ final class AppModel: ObservableObject {
         captionDisplayTask
     }
 
+    func refreshCaptionTranslationsForTesting() {
+        refreshCaptionTranslations()
+    }
+
+    func captionRefreshTaskSnapshotForTesting() -> Task<Void, Never>? {
+        captionRefreshTask
+    }
+
+    func committedCaptionArchiveTaskSnapshotForTesting() -> Task<Void, Never>? {
+        committedCaptionArchiveTask
+    }
+
+    func cancelCommittedCaptionArchiveForTesting() {
+        cancelCommittedCaptionArchive()
+    }
+
+    func nativeCorrectionTasksSnapshotForTesting() -> [Task<Void, Never>] {
+        nativeAcceptedCaptionBindingsByID.values.compactMap(\.nativeCorrectionTask)
+    }
+
+    func nativeEarlyEventCountForTesting(sourceID: String) -> Int {
+        nativeAcceptedCaptionIDsBySourceID[sourceID, default: []]
+            .compactMap { nativeAcceptedCaptionBindingsByID[$0]?.earlyEvents.count }
+            .reduce(0, +)
+    }
+
+    func nativeTerminalEventReceivedForTesting(captionID: UUID) -> Bool {
+        nativeAcceptedCaptionBindingsByID[captionID]?.terminalEventReceived ?? false
+    }
+
+    func deliverNativeCaptionEventForTesting(_ event: RealtimeCaptionEventEnvelope) {
+        nativeCaptionEventDidArrive(event)
+    }
+
     func captionTranslationTaskForTesting(captionID: UUID) -> Task<Void, Never>? {
         captionTranslationTasks[captionID]
     }
@@ -3412,6 +3809,20 @@ final class AppModel: ObservableObject {
 
     var nativeCaptureIdentitiesForTesting: [String: (UUID, UInt64)] {
         nativeRealtimeInputsBySourceID.mapValues { ($0.sourceToken, $0.generation) }
+    }
+
+    func finishNativeCaptureInputForTesting(
+        sourceID: String,
+        error: RealtimePCM16AudioStreamError
+    ) {
+        nativeRealtimeInputsBySourceID[sourceID]?.finish(error: error)
+    }
+
+    func nativeCaptureInputStateForTesting(
+        sourceID: String
+    ) -> (isConsumed: Bool, terminationError: RealtimePCM16AudioStreamError?)? {
+        guard let input = nativeRealtimeInputsBySourceID[sourceID] else { return nil }
+        return (input.isConsumed, input.terminationError)
     }
 
     func pauseNextProviderAudioTransitionResetForTesting() {
@@ -3459,7 +3870,12 @@ final class AppModel: ObservableObject {
             promotedDraftTranslation: nil,
             capturedAt: capturedAt,
             audioWAVData: audioWAVData,
-            correctionAudioPolicyEpoch: sourceCorrectionAudioPolicyEpochs[source.id, default: 0]
+            correctionAudioPolicyEpoch: sourceCorrectionAudioPolicyEpochs[source.id, default: 0],
+            wasAcceptedInNativeRealtime: CaptionEnhancementPolicy.mode(
+                for: source.id,
+                correction: correction.settings,
+                nativeRealtime: nativeRealtimeSettings
+            ) == .nativeRealtime
         )
     }
 
@@ -3614,10 +4030,31 @@ final class AppModel: ObservableObject {
             // text replaces the draft seamlessly instead of flashing.
             let hadDraftTranslation = initialTranslation?.isEmpty == false
 
+            #if DEBUG
+            if let pauseForTesting = captionQueueInitialWritePauseForTesting {
+                captionQueueInitialWritePauseForTesting = nil
+                let pausedLifecycleGeneration = sessionLifecycleGeneration
+                let pausedLiveSession = liveTranscriptionSession
+                await pauseForTesting()
+                guard !Task.isCancelled,
+                      sessionLifecycleGeneration == pausedLifecycleGeneration,
+                      liveTranscriptionSession === pausedLiveSession,
+                      displayedCaption?.id == caption.id,
+                      pendingCaptions.first?.id == caption.id else { break }
+            }
+            #endif
+
+            let nativeCorrection = nativeCorrectionBindingForCurrentCaption(caption.id)
+            let initialEffective = effectiveCaptionValues(
+                captionID: caption.id,
+                fallbackSource: caption.sourceText,
+                fallbackTranslation: initialTranslation ?? (translationExpected ? "" : caption.sourceText),
+                preserveAcceptedNativeFact: caption.wasAcceptedInNativeRealtime
+            )
             overlayState?.skipCommittedFadeIn = hadDraftTranslation
             updateCommittedOverlay(
-                translatedText: initialTranslation ?? (translationExpected ? "" : caption.sourceText),
-                sourceText: caption.sourceText,
+                translatedText: initialEffective.translation,
+                sourceText: initialEffective.source,
                 captionID: caption.id,
                 promotionID: caption.promotionID,
                 bumpEpoch: true
@@ -3631,6 +4068,14 @@ final class AppModel: ObservableObject {
                 sourceText: caption.sourceText,
                 translatedText: initialTranslation ?? (translationExpected ? "" : caption.sourceText)
             )
+            if let nativeCorrection {
+                writeNativeEffectiveCaption(nativeCorrection)
+            } else {
+                restoreRetainedNativeCorrectionMarker(
+                    for: caption.id,
+                    wasAcceptedInNativeRealtime: caption.wasAcceptedInNativeRealtime
+                )
+            }
             overlayState?.sourceName = caption.sourceName
             clearDraftOverlay()
 
@@ -3682,10 +4127,18 @@ final class AppModel: ObservableObject {
                 }
             }
 
+            let currentNativeCorrection = nativeCorrectionBindingForCurrentCaption(caption.id)
+            let effective = effectiveCaptionValues(
+                captionID: caption.id,
+                fallbackSource: caption.sourceText,
+                fallbackTranslation: resolvedTranslation,
+                preserveAcceptedNativeFact: caption.wasAcceptedInNativeRealtime
+            )
+
             updateCommittedOverlay(
-                translatedText: resolvedTranslation,
-                sourceText: caption.sourceText,
-                lateTranslation: translationExpected && resolvedTranslation.isEmpty == false
+                translatedText: effective.translation,
+                sourceText: effective.source,
+                lateTranslation: translationExpected && effective.translation.isEmpty == false
             )
             upsertTranscriptEntry(
                 id: caption.id,
@@ -3696,6 +4149,14 @@ final class AppModel: ObservableObject {
                 sourceText: caption.sourceText,
                 translatedText: resolvedTranslation
             )
+            if let currentNativeCorrection {
+                writeNativeEffectiveCaption(currentNativeCorrection)
+            } else {
+                restoreRetainedNativeCorrectionMarker(
+                    for: caption.id,
+                    wasAcceptedInNativeRealtime: caption.wasAcceptedInNativeRealtime
+                )
+            }
             if resolvedTranslation.isEmpty == false {
                 translationRevisions[caption.id] = resolvedTranslation
             } else {
@@ -3728,12 +4189,13 @@ final class AppModel: ObservableObject {
         for caption: QueuedCaption,
         localTranslation: String
     ) {
-        guard CaptionEnhancementPolicy.mode(
-            for: caption.sourceID,
-            correction: correction.settings,
-            nativeRealtime: nativeRealtimeSettings
-        ) == .sentenceCorrection,
-        !nativeRealtimeRevokingSourceIDs.contains(caption.sourceID) else { return }
+        guard !caption.wasAcceptedInNativeRealtime,
+              CaptionEnhancementPolicy.mode(
+                  for: caption.sourceID,
+                  correction: correction.settings,
+                  nativeRealtime: nativeRealtimeSettings
+              ) == .sentenceCorrection,
+              !nativeRealtimeRevokingSourceIDs.contains(caption.sourceID) else { return }
         guard submittedCorrectionSourceIDsByCaptionID[caption.id] == nil else { return }
         submittedCorrectionSourceIDsByCaptionID[caption.id] = caption.sourceID
 
@@ -4167,6 +4629,29 @@ final class AppModel: ObservableObject {
             didApplyTranslation = true
         }
 
+        if let nativeCorrection = nativeCorrectionBindingForCurrentCaption(captionID) {
+            translationRevisions[captionID] = translatedText
+            writeNativeEffectiveCaption(nativeCorrection)
+            return
+        }
+
+        if let entry = transcriptEntries.first(where: { $0.id == captionID }),
+           entry.nativeCorrectedTranslationState != .none {
+            translationRevisions[captionID] = translatedText
+            if displayedCaption?.id == captionID,
+               var state = overlayState,
+               state.committedCaptionID == captionID {
+                state.sourceText = entry.sourceText
+                state.translatedText = entry.translatedText
+                overlayState = state
+            }
+            if let index = overlayState?.history.lastIndex(where: { $0.id == captionID }) {
+                overlayState?.history[index].sourceText = entry.sourceText
+                overlayState?.history[index].translatedText = entry.translatedText
+            }
+            return
+        }
+
         guard correctedCaptionIDs.contains(captionID) == false else {
             return
         }
@@ -4308,11 +4793,27 @@ final class AppModel: ObservableObject {
         // and transcript entries instead of being dropped permanently.
         let raw: String?
         do {
+            #if DEBUG
+            if let translationOperationForTesting {
+                raw = try await translationOperationForTesting(
+                    caption.sourceText,
+                    caption.sourceLanguageID,
+                    caption.targetLanguageID
+                )
+            } else {
+                raw = try await translationCoordinator.translate(
+                    caption.sourceText,
+                    from: caption.sourceLanguageID,
+                    to: caption.targetLanguageID
+                )
+            }
+            #else
             raw = try await translationCoordinator.translate(
                 caption.sourceText,
                 from: caption.sourceLanguageID,
                 to: caption.targetLanguageID
             )
+            #endif
         } catch {
             raw = nil
         }
@@ -4440,6 +4941,7 @@ final class AppModel: ObservableObject {
                 localTranslatedText: translatedText,
                 correctedSourceText: existingEntry.correctedSourceText,
                 correctedTranslatedText: existingEntry.correctedTranslatedText,
+                nativeCorrectedTranslationState: existingEntry.nativeCorrectedTranslationState,
                 timestamp: existingEntry.timestamp
             )
         } else {
@@ -4484,6 +4986,8 @@ final class AppModel: ObservableObject {
     }
 
     private func cancelCaptionTranslations() {
+        captionRefreshTask?.cancel()
+        captionRefreshTask = nil
         for task in captionTranslationTasks.values {
             task.cancel()
         }
@@ -4799,12 +5303,19 @@ private struct NativeRealtimeCaptureContext: Equatable, Sendable {
     let nativeConfiguration: NativeSourceConfiguration
 }
 
-private struct NativeAcceptedCaptionBinding: Equatable, Sendable {
+private struct NativeAcceptedCaptionBinding: Sendable {
     let metadata: RealtimeAcceptedCaptionMetadata
     let context: NativeRealtimeCaptureContext
     var transferDisposition: RealtimeCaptionSubmissionDisposition?
     var terminalDisposition: RealtimeCaptionSubmissionDisposition?
     var readyIdentity: RealtimeSourceReadyIdentity?
+    var terminalEventReceived = false
+    var earlyEvents: [RealtimeCaptionEventEnvelope] = []
+    var nativeCorrectionRevision: UUID?
+    var nativeCorrectedSourceText: String?
+    var nativeCorrectedTranslatedText: String?
+    var nativeCorrectionTranslationState: NativeCorrectedTranslationState = .none
+    var nativeCorrectionTask: Task<Void, Never>?
 
     init(metadata: RealtimeAcceptedCaptionMetadata, context: NativeRealtimeCaptureContext) {
         self.metadata = metadata
@@ -4894,6 +5405,7 @@ private struct QueuedCaption: Identifiable, Equatable {
     let capturedAt: Date
     var audioWAVData: Data?
     let correctionAudioPolicyEpoch: Int
+    let wasAcceptedInNativeRealtime: Bool
 }
 
 private struct SpeechLanguageCatalog {

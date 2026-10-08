@@ -202,6 +202,1654 @@ import Testing
         await cleanup()
     }
 
+    @Test func nativeCorrectionAppliedWhileOriginalTranslationIsHeldSurvivesQueueWrite() async throws {
+        let credentials = IntegrationNativeCredentialBackend(secret: "fake-secret")
+        let drivers = IntegrationNativeDriverBag()
+        let coordinator = NativeRealtimeSessionCoordinator(
+            credentialStore: RealtimeCredentialStore(backend: credentials),
+            driverFactory: { _, _, _ in
+                let driver = IntegrationNativeRealtimeDriver()
+                drivers.append(driver)
+                return driver
+            }
+        )
+        let fixture = makeFixture(
+            correctionSettings: configuredCorrectionSettings(isEnabled: false),
+            nativeRealtimeSettings: configuredNativeRealtimeSettings(enabledSourceIDs: [microphoneSource.id]),
+            nativeRealtimeSessionCoordinator: coordinator
+        )
+        defer { fixture.removeSettingsFile() }
+        let session = LiveTranscriptionSession()
+        session.setStartOperationForTesting { await session.beginRecognitionSessionForTesting() }
+        fixture.model.selectedSourceIDs = [fixture.microphone.id]
+        fixture.model.sourceLanguageOverrides[fixture.microphone.id] = "en"
+        fixture.model.sourceOutputLanguageOverrides[fixture.microphone.id] = "zh-Hans"
+        fixture.model.setSessionResourcePreparationOperationForTesting {}
+        fixture.model.setLiveTranscriptionSessionFactoryForTesting { session }
+        fixture.model.acknowledgeNativeRealtimeDisclosureForNextSession()
+        let translations = IntegrationNativeTranslationHarness()
+        fixture.model.setTranslationOperationForTesting { text, source, target in
+            try await translations.translate(text, source: source, target: target)
+        }
+        let startTask = Task { await fixture.model.startSession() }
+        func cleanup() async {
+            let translationTasks = fixture.model.captionTranslationTasksSnapshotForTesting()
+            let correctionTasks = fixture.model.nativeCorrectionTasksSnapshotForTesting()
+            let displayTask = fixture.model.captionDisplayTaskSnapshotForTesting()
+            let transferTasks = fixture.model.nativeCaptionTransferTasksSnapshotForTesting()
+            (translationTasks + correctionTasks + transferTasks).forEach { $0.cancel() }
+            displayTask?.cancel()
+            await translations.releaseAll()
+            fixture.model.stopSession()
+            await coordinator.stop()
+            await startTask.value
+            for task in translationTasks + correctionTasks + transferTasks { await task.value }
+            await displayTask?.value
+        }
+
+        var stage = "trusted-ready callback"
+        do {
+            try await waitUntil {
+                fixture.model.nativeReadyIdentityForTesting(sourceID: fixture.microphone.id) != nil
+            }
+            stage = "actual accepted final"
+            await session.beginLegacySampleMappingForTesting()
+            let inputPCM = try integrationRealtimeBuffer(samples: [0.25, -0.25])
+            #expect(await session.appendLegacyNormalizedBufferForTesting(inputPCM, preservesIdentity: true) == 0..<2)
+            #expect(await session.queueLegacyCommittedEmissionForTesting(
+                text: "original-A",
+                segments: [LegacySpeechSegmentTiming(timestamp: 0, duration: 2.0 / 16_000)]
+            ))
+            await session.deliverQueuedCommittedEmissionForTesting()
+            try await waitUntil {
+                await fixture.model.nativeAcceptedMetadataForTesting(sourceID: fixture.microphone.id) != nil
+            }
+            let accepted = try #require(await fixture.model.nativeAcceptedMetadataForTesting(sourceID: fixture.microphone.id))
+            let ready = try #require(fixture.model.nativeReadyIdentityForTesting(sourceID: fixture.microphone.id))
+            #expect(accepted.sourceToken == ready.sourceToken)
+            #expect(accepted.captureGeneration == ready.captureGeneration)
+            stage = "original translation held"
+            try await waitUntil { await translations.hasRequest(text: "original-A") }
+            try await waitUntil {
+                fixture.model.transcriptEntries.first(where: { $0.id == accepted.captionID })?.localSourceText
+                    == "original-A"
+            }
+            let originalEntryBeforeCorrection = try #require(
+                fixture.model.transcriptEntries.first(where: { $0.id == accepted.captionID })
+            )
+            #expect(originalEntryBeforeCorrection.id == accepted.captionID)
+            #expect(originalEntryBeforeCorrection.sourceText == "original-A")
+            #expect(originalEntryBeforeCorrection.localSourceText == "original-A")
+            stage = "driver subscribed and commit succeeded"
+            try await waitUntil {
+                guard let driver = drivers.all().first else { return false }
+                let committedCount = await driver.committedUtteranceCount()
+                let listening = await driver.isListeningForEvents()
+                return committedCount == 1 && listening
+            }
+            let driver = try #require(drivers.all().first)
+            await driver.emit(.correctedText(
+                sourceAlias: ready.alias,
+                generation: ready.driverGeneration,
+                captionID: accepted.captionID,
+                utteranceID: accepted.utteranceID,
+                text: "corrected-A"
+            ))
+            stage = "corrected translation requested by AppModel"
+            try await waitUntil { await translations.hasRequest(text: "corrected-A") }
+            await translations.release(text: "corrected-A", result: "translated-corrected-A")
+            try await waitUntil {
+                fixture.model.transcriptEntries.first(where: { $0.id == accepted.captionID })?.sourceText == "corrected-A"
+            }
+            await translations.release(text: "original-A", result: "translated-original-A")
+            try await waitUntil {
+                fixture.model.transcriptEntries.first(where: { $0.id == accepted.captionID })?.localTranslatedText == "translated-original-A"
+            }
+            let entry = try #require(fixture.model.transcriptEntries.first(where: { $0.id == accepted.captionID }))
+            #expect(entry.sourceText == "corrected-A")
+            #expect(entry.translatedText == "translated-corrected-A")
+            #expect(entry.localSourceText == "original-A")
+            #expect(entry.localTranslatedText == "translated-original-A")
+            #expect(fixture.model.overlayState?.sourceText == "corrected-A")
+            #expect(fixture.model.overlayState?.translatedText == "translated-corrected-A")
+
+            stage = "native pending suppresses the existing local target fallback"
+            await driver.emit(.correctedText(
+                sourceAlias: ready.alias,
+                generation: ready.driverGeneration,
+                captionID: accepted.captionID,
+                utteranceID: accepted.utteranceID,
+                text: "corrected-A-pending"
+            ))
+            try await waitUntil { await translations.hasRequest(text: "corrected-A-pending") }
+            let pendingEntry = try #require(fixture.model.transcriptEntries.first(where: { $0.id == accepted.captionID }))
+            #expect(pendingEntry.localTranslatedText == "translated-original-A")
+            #expect(pendingEntry.translatedText.isEmpty)
+            #expect(fixture.model.overlayState?.translatedText.isEmpty == true)
+            await translations.release(text: "corrected-A-pending", result: nil)
+            try await waitUntil {
+                fixture.model.nativeCorrectionSnapshotForTesting(captionID: accepted.captionID)?.state == .failed
+            }
+            let failedEntry = try #require(fixture.model.transcriptEntries.first(where: { $0.id == accepted.captionID }))
+            #expect(failedEntry.localTranslatedText == "translated-original-A")
+            #expect(failedEntry.translatedText.isEmpty)
+            #expect(fixture.model.overlayState?.translatedText.isEmpty == true)
+
+            stage = "clear transcript revokes a held native correction"
+            await driver.emit(.correctedText(
+                sourceAlias: ready.alias,
+                generation: ready.driverGeneration,
+                captionID: accepted.captionID,
+                utteranceID: accepted.utteranceID,
+                text: "corrected-A-cleared"
+            ))
+            try await waitUntil { await translations.hasRequest(text: "corrected-A-cleared") }
+            let heldCorrectionTask = try #require(
+                fixture.model.nativeCorrectionTasksSnapshotForTesting().first
+            )
+            fixture.model.clearTranscript()
+            #expect(fixture.model.transcriptEntries.isEmpty)
+            #expect(fixture.model.nativeCorrectionSnapshotForTesting(captionID: accepted.captionID) == nil)
+            await translations.release(text: "corrected-A-cleared", result: "must-not-resurrect")
+            await heldCorrectionTask.value
+            #expect(fixture.model.transcriptEntries.isEmpty)
+            #expect(fixture.model.overlayState?.translatedText.isEmpty == true)
+        } catch {
+            print("nativeCorrection RED stage: \(stage); error: \(error)")
+            await cleanup()
+            throw error
+        }
+        await cleanup()
+    }
+
+    @Test func finishedInputFencesHeldNativeCorrectionAndStaleEventBeforeFailureCallback() async throws {
+        let credentials = IntegrationNativeCredentialBackend(secret: "fake-secret")
+        let drivers = IntegrationNativeDriverBag()
+        let coordinator = NativeRealtimeSessionCoordinator(
+            credentialStore: RealtimeCredentialStore(backend: credentials),
+            driverFactory: { _, _, _ in
+                let driver = IntegrationNativeRealtimeDriver()
+                drivers.append(driver)
+                return driver
+            }
+        )
+        let fixture = makeFixture(
+            correctionSettings: configuredCorrectionSettings(isEnabled: false),
+            nativeRealtimeSettings: configuredNativeRealtimeSettings(enabledSourceIDs: [microphoneSource.id]),
+            nativeRealtimeSessionCoordinator: coordinator
+        )
+        defer { fixture.removeSettingsFile() }
+        let session = LiveTranscriptionSession()
+        session.setStartOperationForTesting { await session.beginRecognitionSessionForTesting() }
+        fixture.model.selectedSourceIDs = [fixture.microphone.id]
+        fixture.model.sourceLanguageOverrides[fixture.microphone.id] = "en"
+        fixture.model.sourceOutputLanguageOverrides[fixture.microphone.id] = "zh-Hans"
+        fixture.model.setSessionResourcePreparationOperationForTesting {}
+        fixture.model.setLiveTranscriptionSessionFactoryForTesting { session }
+        fixture.model.acknowledgeNativeRealtimeDisclosureForNextSession()
+        let translations = IntegrationNativeTranslationHarness()
+        fixture.model.setTranslationOperationForTesting { text, source, target in
+            if text == "input dead accepted correction" || text == "stale event after input death" {
+                return try await translations.translate(text, source: source, target: target)
+            }
+            return "local translation for \(text)"
+        }
+        let startTask = Task { await fixture.model.startSession() }
+        var heldCorrectionTask: Task<Void, Never>?
+        func cleanup() async {
+            let correctionTasks = fixture.model.nativeCorrectionTasksSnapshotForTesting()
+            let translationTasks = fixture.model.captionTranslationTasksSnapshotForTesting()
+            let transferTasks = fixture.model.nativeCaptionTransferTasksSnapshotForTesting()
+            let displayTask = fixture.model.captionDisplayTaskSnapshotForTesting()
+            heldCorrectionTask?.cancel()
+            (correctionTasks + translationTasks + transferTasks).forEach { $0.cancel() }
+            displayTask?.cancel()
+            await translations.releaseAll()
+            if let driver = drivers.all().first { await driver.resumeStop() }
+            fixture.model.finishNativeCaptureInputForTesting(
+                sourceID: fixture.microphone.id,
+                error: .sourceSuperseded
+            )
+            fixture.model.stopSession()
+            await coordinator.stop()
+            await startTask.value
+            for task in correctionTasks + translationTasks + transferTasks { await task.value }
+            await heldCorrectionTask?.value
+            await displayTask?.value
+        }
+
+        do {
+            try await waitUntil { fixture.model.nativeReadyIdentityForTesting(sourceID: fixture.microphone.id) != nil }
+            let ready = try #require(fixture.model.nativeReadyIdentityForTesting(sourceID: fixture.microphone.id))
+            await startTask.value
+            await session.beginLegacySampleMappingForTesting()
+            let pcm = try integrationRealtimeBuffer(samples: [0.25, -0.25])
+            #expect(await session.appendLegacyNormalizedBufferForTesting(pcm, preservesIdentity: true) == 0..<2)
+            #expect(await session.queueLegacyCommittedEmissionForTesting(
+                text: "input dead original accepted caption",
+                segments: [LegacySpeechSegmentTiming(timestamp: 0, duration: 2.0 / 16_000)]
+            ))
+            await session.deliverQueuedCommittedEmissionForTesting()
+            try await waitUntil { await fixture.model.nativeAcceptedMetadataForTesting(sourceID: fixture.microphone.id) != nil }
+            let accepted = try #require(await fixture.model.nativeAcceptedMetadataForTesting(sourceID: fixture.microphone.id))
+            let driver = try #require(drivers.all().first)
+            try await waitUntil { await coordinator.captionCommitSucceededForTesting(sourceID: accepted.sourceID, captionID: accepted.captionID) }
+            await driver.emit(.correctedText(
+                sourceAlias: ready.alias,
+                generation: ready.driverGeneration,
+                captionID: accepted.captionID,
+                utteranceID: accepted.utteranceID,
+                text: "input dead accepted correction"
+            ))
+            try await waitUntil { await translations.hasRequest(text: "input dead accepted correction") }
+            let savedCorrectionTask: Task<Void, Never> = try #require(
+                fixture.model.nativeCorrectionTasksSnapshotForTesting().first
+            )
+            heldCorrectionTask = savedCorrectionTask
+            let acceptedSource = fixture.model.nativeCorrectionSnapshotForTesting(captionID: accepted.captionID)?.sourceText
+            #expect(acceptedSource == "input dead accepted correction")
+
+            await driver.suspendNextStop()
+            fixture.model.finishNativeCaptureInputForTesting(
+                sourceID: accepted.sourceID,
+                error: .invalidAudioChunk
+            )
+            try await waitUntil { await driver.isStopSuspended() }
+            let inputState = try #require(fixture.model.nativeCaptureInputStateForTesting(sourceID: accepted.sourceID))
+            #expect(inputState.isConsumed)
+            #expect(inputState.terminationError == .invalidAudioChunk)
+            #expect(fixture.model.nativeAcceptedBindingStateForTesting.0 == 1)
+            #expect(fixture.model.nativeReadyIdentityForTesting(sourceID: accepted.sourceID) == ready)
+            #expect(heldCorrectionTask?.isCancelled == false)
+
+            await translations.release(text: "input dead accepted correction", result: "late translation after input death")
+            await heldCorrectionTask?.value
+            let afterHeldResult = try #require(fixture.model.nativeCorrectionSnapshotForTesting(captionID: accepted.captionID))
+            #expect(afterHeldResult.sourceText == "input dead accepted correction")
+            #expect(afterHeldResult.state == .pending)
+            #expect(afterHeldResult.translatedText == nil)
+
+            fixture.model.deliverNativeCaptionEventForTesting(RealtimeCaptionEventEnvelope(
+                sourceID: accepted.sourceID,
+                sourceToken: accepted.sourceToken,
+                captureGeneration: accepted.captureGeneration,
+                sourceAlias: ready.alias,
+                driverGeneration: ready.driverGeneration,
+                captionID: accepted.captionID,
+                utteranceID: accepted.utteranceID,
+                sourceLanguageID: accepted.sourceLanguageID,
+                targetLanguageID: accepted.targetLanguageID,
+                kind: .correctedText("stale event after input death")
+            ))
+            let staleEventRequestCount = await translations.requestCount(text: "stale event after input death")
+            #expect(staleEventRequestCount == 0)
+            let afterDeadInput = try #require(fixture.model.nativeCorrectionSnapshotForTesting(captionID: accepted.captionID))
+            #expect(afterDeadInput.sourceText == "input dead accepted correction")
+            #expect(afterDeadInput.state == .pending)
+            #expect(afterDeadInput.translatedText == nil)
+
+            await driver.resumeStop()
+            try await waitUntil(timeout: .seconds(5)) {
+                fixture.model.nativeAcceptedBindingsForTesting(sourceID: accepted.sourceID).isEmpty
+            }
+        } catch {
+            await cleanup()
+            throw error
+        }
+        await cleanup()
+    }
+
+    @Test func terminalNativeEventLeavesAcceptedCorrectionTranslationRunning() async throws {
+        let credentials = IntegrationNativeCredentialBackend(secret: "fake-secret")
+        let drivers = IntegrationNativeDriverBag()
+        let coordinator = NativeRealtimeSessionCoordinator(
+            credentialStore: RealtimeCredentialStore(backend: credentials),
+            driverFactory: { _, _, _ in
+                let driver = IntegrationNativeRealtimeDriver()
+                drivers.append(driver)
+                return driver
+            }
+        )
+        let fixture = makeFixture(
+            correctionSettings: configuredCorrectionSettings(isEnabled: false),
+            nativeRealtimeSettings: configuredNativeRealtimeSettings(enabledSourceIDs: [microphoneSource.id]),
+            nativeRealtimeSessionCoordinator: coordinator
+        )
+        defer { fixture.removeSettingsFile() }
+        let session = LiveTranscriptionSession()
+        session.setStartOperationForTesting { await session.beginRecognitionSessionForTesting() }
+        fixture.model.selectedSourceIDs = [fixture.microphone.id]
+        fixture.model.sourceLanguageOverrides[fixture.microphone.id] = "en"
+        fixture.model.sourceOutputLanguageOverrides[fixture.microphone.id] = "zh-Hans"
+        fixture.model.setSessionResourcePreparationOperationForTesting {}
+        fixture.model.setLiveTranscriptionSessionFactoryForTesting { session }
+        fixture.model.acknowledgeNativeRealtimeDisclosureForNextSession()
+        let translations = IntegrationNativeTranslationHarness()
+        fixture.model.setTranslationOperationForTesting { text, source, target in
+            if text == "terminal native correction" {
+                return try await translations.translate(text, source: source, target: target)
+            }
+            return "local translation for \(text)"
+        }
+        let startTask = Task { await fixture.model.startSession() }
+        func cleanup() async {
+            let correctionTasks = fixture.model.nativeCorrectionTasksSnapshotForTesting()
+            let translationTasks = fixture.model.captionTranslationTasksSnapshotForTesting()
+            let transferTasks = fixture.model.nativeCaptionTransferTasksSnapshotForTesting()
+            let displayTask = fixture.model.captionDisplayTaskSnapshotForTesting()
+            (correctionTasks + translationTasks + transferTasks).forEach { $0.cancel() }
+            displayTask?.cancel()
+            await translations.releaseAll()
+            fixture.model.stopSession()
+            await coordinator.stop()
+            await startTask.value
+            for task in correctionTasks + translationTasks + transferTasks { await task.value }
+            await displayTask?.value
+        }
+
+        do {
+            try await waitUntil { fixture.model.nativeReadyIdentityForTesting(sourceID: fixture.microphone.id) != nil }
+            let ready = try #require(fixture.model.nativeReadyIdentityForTesting(sourceID: fixture.microphone.id))
+            await session.beginLegacySampleMappingForTesting()
+            let pcm = try integrationRealtimeBuffer(samples: [0.25, -0.25])
+            #expect(await session.appendLegacyNormalizedBufferForTesting(pcm, preservesIdentity: true) == 0..<2)
+            #expect(await session.queueLegacyCommittedEmissionForTesting(
+                text: "terminal original local caption",
+                segments: [LegacySpeechSegmentTiming(timestamp: 0, duration: 2.0 / 16_000)]
+            ))
+            await session.deliverQueuedCommittedEmissionForTesting()
+            try await waitUntil { await fixture.model.nativeAcceptedMetadataForTesting(sourceID: fixture.microphone.id) != nil }
+            let accepted = try #require(await fixture.model.nativeAcceptedMetadataForTesting(sourceID: fixture.microphone.id))
+            let driver = try #require(drivers.all().first)
+            try await waitUntil {
+                await coordinator.captionCommitSucceededForTesting(sourceID: accepted.sourceID, captionID: accepted.captionID)
+            }
+
+            await driver.emit(.correctedText(
+                sourceAlias: ready.alias,
+                generation: ready.driverGeneration,
+                captionID: accepted.captionID,
+                utteranceID: accepted.utteranceID,
+                text: "terminal native correction"
+            ))
+            try await waitUntil { await translations.hasRequest(text: "terminal native correction") }
+            let correctionTask = try #require(fixture.model.nativeCorrectionTasksSnapshotForTesting().first)
+            await driver.emit(.utteranceCompleted(
+                sourceAlias: ready.alias,
+                generation: ready.driverGeneration,
+                captionID: accepted.captionID,
+                utteranceID: accepted.utteranceID
+            ))
+            try await waitUntil { fixture.model.nativeTerminalEventReceivedForTesting(captionID: accepted.captionID) }
+            #expect(correctionTask.isCancelled == false)
+            #expect(fixture.model.nativeCorrectionSnapshotForTesting(captionID: accepted.captionID)?.state == .pending)
+            await translations.release(text: "terminal native correction", result: "terminal correction translation")
+            await correctionTask.value
+            let snapshot = try #require(fixture.model.nativeCorrectionSnapshotForTesting(captionID: accepted.captionID))
+            #expect(snapshot.state == .ready)
+            #expect(snapshot.translatedText == "terminal correction translation")
+        } catch {
+            await cleanup()
+            throw error
+        }
+        await cleanup()
+    }
+
+    @Test func deinitializingAppCancelsHeldNativeCorrectionTranslation() async throws {
+        let credentials = IntegrationNativeCredentialBackend(secret: "fake-secret")
+        let drivers = IntegrationNativeDriverBag()
+        let coordinator = NativeRealtimeSessionCoordinator(
+            credentialStore: RealtimeCredentialStore(backend: credentials),
+            driverFactory: { _, _, _ in
+                let driver = IntegrationNativeRealtimeDriver()
+                drivers.append(driver)
+                return driver
+            }
+        )
+        var fixture: CorrectionFixture? = makeFixture(
+            correctionSettings: configuredCorrectionSettings(isEnabled: false),
+            nativeRealtimeSettings: configuredNativeRealtimeSettings(enabledSourceIDs: [microphoneSource.id]),
+            nativeRealtimeSessionCoordinator: coordinator,
+            refreshLanguageCatalogs: false,
+            sourceLanguageOverrides: [microphoneSource.id: "en"],
+            sourceOutputLanguageOverrides: [microphoneSource.id: "zh-Hans"]
+        )
+        let settingsURL = fixture!.settingsURL
+        defer { try? FileManager.default.removeItem(at: settingsURL) }
+        let weakModel = IntegrationWeakAppModelReference(fixture!.model)
+        let session = LiveTranscriptionSession()
+        session.setStartOperationForTesting { await session.beginRecognitionSessionForTesting() }
+        fixture!.model.selectedSourceIDs = [fixture!.microphone.id]
+        fixture!.model.setSessionResourcePreparationOperationForTesting {}
+        fixture!.model.setLiveTranscriptionSessionFactoryForTesting { session }
+        fixture!.model.acknowledgeNativeRealtimeDisclosureForNextSession()
+        let translations = IntegrationNativeTranslationHarness()
+        fixture!.model.setTranslationOperationForTesting { text, source, target in
+            if text == "deinit held native correction" {
+                return try await translations.translate(text, source: source, target: target)
+            }
+            return "local translation for \(text)"
+        }
+        var startModel: AppModel? = fixture!.model
+        let startTask = Task { await startModel?.startSession() }
+        var correctionTask: Task<Void, Never>?
+        var stage = "ready and accepted input"
+
+        do {
+            try await waitUntil { fixture!.model.nativeReadyIdentityForTesting(sourceID: fixture!.microphone.id) != nil }
+            let ready = try #require(fixture!.model.nativeReadyIdentityForTesting(sourceID: fixture!.microphone.id))
+            await startTask.value
+            startModel = nil
+            await session.beginLegacySampleMappingForTesting()
+            let pcm = try integrationRealtimeBuffer(samples: [0.25, -0.25])
+            #expect(await session.appendLegacyNormalizedBufferForTesting(pcm, preservesIdentity: true) == 0..<2)
+            #expect(await session.queueLegacyCommittedEmissionForTesting(
+                text: "deinit native original",
+                segments: [LegacySpeechSegmentTiming(timestamp: 0, duration: 2.0 / 16_000)]
+            ))
+            await session.deliverQueuedCommittedEmissionForTesting()
+            try await waitUntil { await fixture!.model.nativeAcceptedMetadataForTesting(sourceID: fixture!.microphone.id) != nil }
+            let accepted = try #require(await fixture!.model.nativeAcceptedMetadataForTesting(sourceID: fixture!.microphone.id))
+            try await waitUntil {
+                await coordinator.captionCommitSucceededForTesting(sourceID: accepted.sourceID, captionID: accepted.captionID)
+            }
+            stage = "original local translation and display tasks complete"
+            try await waitUntil {
+                fixture!.model.transcriptEntries.first(where: { $0.id == accepted.captionID })?.localSourceText
+                    == "deinit native original"
+            }
+            do {
+                let localTranslationTasks = fixture!.model.captionTranslationTasksSnapshotForTesting()
+                let localDisplayTask = fixture!.model.captionDisplayTaskSnapshotForTesting()
+                for task in localTranslationTasks { await task.value }
+                await localDisplayTask?.value
+                let archiveTask = fixture!.model.committedCaptionArchiveTaskSnapshotForTesting()
+                fixture!.model.cancelCommittedCaptionArchiveForTesting()
+                await archiveTask?.value
+            }
+            let driver = try #require(drivers.all().first)
+            stage = "native corrected translation held"
+            let readyTask = fixture!.model.nativeSourceReadyTaskSnapshotForTesting(sourceID: fixture!.microphone.id)
+            let transferTasks = fixture!.model.nativeCaptionTransferTasksSnapshotForTesting()
+            for task in transferTasks { await task.value }
+            await readyTask?.value
+            await driver.emit(.correctedText(
+                sourceAlias: ready.alias,
+                generation: ready.driverGeneration,
+                captionID: accepted.captionID,
+                utteranceID: accepted.utteranceID,
+                text: "deinit held native correction"
+            ))
+            try await waitUntil { await translations.hasRequest(text: "deinit held native correction") }
+            let savedCorrectionTask: Task<Void, Never> = try #require(
+                fixture!.model.nativeCorrectionTasksSnapshotForTesting().first
+            )
+            correctionTask = savedCorrectionTask
+            #expect(correctionTask?.isCancelled == false)
+            #expect(fixture!.model.nativeCorrectionSnapshotForTesting(captionID: accepted.captionID)?.state == .pending)
+
+            stage = "model deinit cancels held correction task"
+            fixture = nil
+            try await waitUntil(timeout: .seconds(5)) { weakModel.value == nil }
+            #expect(correctionTask?.isCancelled == true)
+            await translations.release(text: "deinit held native correction", result: "must-not-complete-after-deinit")
+            await correctionTask?.value
+            #expect(weakModel.value == nil)
+            #expect(correctionTask?.isCancelled == true)
+        } catch {
+            print("native correction deinit stage: \(stage); weak model alive=\(weakModel.value != nil), cancelled=\(correctionTask?.isCancelled ?? false)")
+            correctionTask?.cancel()
+            await translations.releaseAll()
+            if let model = fixture?.model {
+                let correctionTasks = model.nativeCorrectionTasksSnapshotForTesting()
+                let translationTasks = model.captionTranslationTasksSnapshotForTesting()
+                let transferTasks = model.nativeCaptionTransferTasksSnapshotForTesting()
+                let displayTask = model.captionDisplayTaskSnapshotForTesting()
+                (correctionTasks + translationTasks + transferTasks).forEach { $0.cancel() }
+                displayTask?.cancel()
+                model.stopSession()
+                await coordinator.stop()
+                await startTask.value
+                for task in correctionTasks + translationTasks + transferTasks { await task.value }
+                await displayTask?.value
+            }
+            await correctionTask?.value
+            throw error
+        }
+        await translations.releaseAll()
+        await coordinator.stop()
+        await correctionTask?.value
+    }
+
+    @Test func nativeCorrectionReadyBeforeFirstQueueWriteSurvivesBothWrites() async throws {
+        let credentials = IntegrationNativeCredentialBackend(secret: "fake-secret")
+        let drivers = IntegrationNativeDriverBag()
+        let coordinator = NativeRealtimeSessionCoordinator(
+            credentialStore: RealtimeCredentialStore(backend: credentials),
+            driverFactory: { _, _, _ in
+                let driver = IntegrationNativeRealtimeDriver()
+                drivers.append(driver)
+                return driver
+            }
+        )
+        let fixture = makeFixture(
+            correctionSettings: configuredCorrectionSettings(isEnabled: false),
+            nativeRealtimeSettings: configuredNativeRealtimeSettings(enabledSourceIDs: [microphoneSource.id]),
+            nativeRealtimeSessionCoordinator: coordinator
+        )
+        defer { fixture.removeSettingsFile() }
+        let session = LiveTranscriptionSession()
+        session.setStartOperationForTesting { await session.beginRecognitionSessionForTesting() }
+        fixture.model.selectedSourceIDs = [fixture.microphone.id]
+        fixture.model.sourceLanguageOverrides[fixture.microphone.id] = "en"
+        fixture.model.sourceOutputLanguageOverrides[fixture.microphone.id] = "zh-Hans"
+        fixture.model.setSessionResourcePreparationOperationForTesting {}
+        fixture.model.setLiveTranscriptionSessionFactoryForTesting { session }
+        fixture.model.acknowledgeNativeRealtimeDisclosureForNextSession()
+        let translations = IntegrationNativeTranslationHarness()
+        fixture.model.setTranslationOperationForTesting { text, source, target in
+            try await translations.translate(text, source: source, target: target)
+        }
+        let queueGate = AsyncTestGate()
+        fixture.model.pauseBeforeNextCaptionQueueInitialWriteForTesting {
+            await queueGate.suspend()
+        }
+        let startTask = Task { await fixture.model.startSession() }
+        func cleanup() async {
+            let translationTasks = fixture.model.captionTranslationTasksSnapshotForTesting()
+            let correctionTasks = fixture.model.nativeCorrectionTasksSnapshotForTesting()
+            let displayTask = fixture.model.captionDisplayTaskSnapshotForTesting()
+            let transferTasks = fixture.model.nativeCaptionTransferTasksSnapshotForTesting()
+            (translationTasks + correctionTasks + transferTasks).forEach { $0.cancel() }
+            displayTask?.cancel()
+            await queueGate.resume()
+            await translations.releaseAll()
+            fixture.model.stopSession()
+            await coordinator.stop()
+            await startTask.value
+            for task in translationTasks + correctionTasks + transferTasks { await task.value }
+            await displayTask?.value
+        }
+
+        var stage = "queue before first write"
+        var acceptedCaptionID: UUID?
+        do {
+            try await waitUntil { fixture.model.nativeReadyIdentityForTesting(sourceID: fixture.microphone.id) != nil }
+            await session.beginLegacySampleMappingForTesting()
+            let inputPCM = try integrationRealtimeBuffer(samples: [0.25, -0.25])
+            #expect(await session.appendLegacyNormalizedBufferForTesting(inputPCM, preservesIdentity: true) == 0..<2)
+            #expect(await session.queueLegacyCommittedEmissionForTesting(
+                text: "original-before-upsert",
+                segments: [LegacySpeechSegmentTiming(timestamp: 0, duration: 2.0 / 16_000)]
+            ))
+            await session.deliverQueuedCommittedEmissionForTesting()
+            try await queueGate.waitUntilSuspended(timeoutNanoseconds: 8_000_000_000)
+            try await waitUntil { await translations.hasRequest(text: "original-before-upsert") }
+            try await waitUntil {
+                await fixture.model.nativeAcceptedMetadataForTesting(sourceID: fixture.microphone.id) != nil
+            }
+            let accepted = try #require(await fixture.model.nativeAcceptedMetadataForTesting(sourceID: fixture.microphone.id))
+            acceptedCaptionID = accepted.captionID
+            let ready = try #require(fixture.model.nativeReadyIdentityForTesting(sourceID: fixture.microphone.id))
+            #expect(accepted.sourceToken == ready.sourceToken)
+            #expect(accepted.captureGeneration == ready.captureGeneration)
+            #expect(fixture.model.transcriptEntries.contains { $0.id == accepted.captionID } == false)
+            let driver = try #require(drivers.all().first)
+            try await waitUntil {
+                let committedCount = await driver.committedUtteranceCount()
+                let listening = await driver.isListeningForEvents()
+                return committedCount == 1 && listening
+            }
+            await driver.emit(.correctedText(
+                sourceAlias: ready.alias,
+                generation: ready.driverGeneration,
+                captionID: accepted.captionID,
+                utteranceID: accepted.utteranceID,
+                text: "corrected-before-upsert"
+            ))
+            stage = "corrected translation ready before first write"
+            try await waitUntil { await translations.hasRequest(text: "corrected-before-upsert") }
+            await translations.release(text: "corrected-before-upsert", result: "translated-before-upsert")
+            try await waitUntil {
+                fixture.model.nativeCorrectionSnapshotForTesting(captionID: accepted.captionID)?.state == .ready
+            }
+            #expect(fixture.model.transcriptEntries.contains { $0.id == accepted.captionID } == false)
+            stage = "first queue write uses native correction"
+            await queueGate.resume()
+            try await waitUntil {
+                fixture.model.transcriptEntries.first(where: { $0.id == accepted.captionID })?.sourceText
+                    == "corrected-before-upsert"
+            }
+            stage = "original translation second write"
+            await translations.release(text: "original-before-upsert", result: "translated-original-before-upsert")
+            try await waitUntil {
+                fixture.model.transcriptEntries.first(where: { $0.id == accepted.captionID })?.localTranslatedText
+                    == "translated-original-before-upsert"
+            }
+            let entry = try #require(fixture.model.transcriptEntries.first(where: { $0.id == accepted.captionID }))
+            #expect(entry.translatedText == "translated-before-upsert")
+            #expect(entry.localSourceText == "original-before-upsert")
+            #expect(entry.localTranslatedText == "translated-original-before-upsert")
+            #expect(fixture.model.overlayState?.sourceText == "corrected-before-upsert")
+            #expect(fixture.model.overlayState?.translatedText == "translated-before-upsert")
+        } catch {
+            let entry = acceptedCaptionID.flatMap { id in fixture.model.transcriptEntries.first(where: { $0.id == id }) }
+            print("nativeCorrection pre-upsert stage: \(stage); entry=\(String(describing: entry)); overlay=\(String(describing: fixture.model.overlayState?.sourceText))/\(String(describing: fixture.model.overlayState?.translatedText)); error: \(error)")
+            await cleanup()
+            throw error
+        }
+        await cleanup()
+    }
+
+    @Test func clearingTranscriptWhileOriginalNativeCaptionTranslationIsHeldPreservesAcceptedOverlay() async throws {
+        let credentials = IntegrationNativeCredentialBackend(secret: "fake-secret")
+        let drivers = IntegrationNativeDriverBag()
+        let coordinator = NativeRealtimeSessionCoordinator(
+            credentialStore: RealtimeCredentialStore(backend: credentials),
+            driverFactory: { _, _, _ in
+                let driver = IntegrationNativeRealtimeDriver()
+                drivers.append(driver)
+                return driver
+            }
+        )
+        let fixture = makeFixture(
+            correctionSettings: configuredCorrectionSettings(isEnabled: false),
+            nativeRealtimeSettings: configuredNativeRealtimeSettings(enabledSourceIDs: [microphoneSource.id]),
+            nativeRealtimeSessionCoordinator: coordinator
+        )
+        defer { fixture.removeSettingsFile() }
+        let session = LiveTranscriptionSession()
+        session.setStartOperationForTesting { await session.beginRecognitionSessionForTesting() }
+        fixture.model.selectedSourceIDs = [fixture.microphone.id]
+        fixture.model.sourceLanguageOverrides[fixture.microphone.id] = "en"
+        fixture.model.sourceOutputLanguageOverrides[fixture.microphone.id] = "zh-Hans"
+        fixture.model.setSessionResourcePreparationOperationForTesting {}
+        fixture.model.setLiveTranscriptionSessionFactoryForTesting { session }
+        fixture.model.acknowledgeNativeRealtimeDisclosureForNextSession()
+        let translations = IntegrationNativeTranslationHarness()
+        fixture.model.setTranslationOperationForTesting { text, source, target in
+            try await translations.translate(text, source: source, target: target)
+        }
+        let startTask = Task { await fixture.model.startSession() }
+        var originalTask: Task<Void, Never>?
+        var displayTask: Task<Void, Never>?
+        func cleanup() async {
+            let localTasks = fixture.model.captionTranslationTasksSnapshotForTesting()
+            let correctionTasks = fixture.model.nativeCorrectionTasksSnapshotForTesting()
+            let transferTasks = fixture.model.nativeCaptionTransferTasksSnapshotForTesting()
+            let display = fixture.model.captionDisplayTaskSnapshotForTesting()
+            (localTasks + correctionTasks + transferTasks).forEach { $0.cancel() }
+            display?.cancel()
+            await translations.releaseAll()
+            fixture.model.stopSession()
+            await coordinator.stop()
+            await startTask.value
+            for task in localTasks + correctionTasks + transferTasks { await task.value }
+            await originalTask?.value
+            await displayTask?.value
+            await display?.value
+        }
+
+        do {
+            try await waitUntil { fixture.model.nativeReadyIdentityForTesting(sourceID: fixture.microphone.id) != nil }
+            let ready = try #require(fixture.model.nativeReadyIdentityForTesting(sourceID: fixture.microphone.id))
+            await startTask.value
+            await session.beginLegacySampleMappingForTesting()
+            let pcm = try integrationRealtimeBuffer(samples: [0.25, -0.25])
+            #expect(await session.appendLegacyNormalizedBufferForTesting(pcm, preservesIdentity: true) == 0..<2)
+            #expect(await session.queueLegacyCommittedEmissionForTesting(
+                text: "clear-window original accepted caption",
+                segments: [LegacySpeechSegmentTiming(timestamp: 0, duration: 2.0 / 16_000)]
+            ))
+            await session.deliverQueuedCommittedEmissionForTesting()
+            try await waitUntil { await fixture.model.nativeAcceptedMetadataForTesting(sourceID: fixture.microphone.id) != nil }
+            let accepted = try #require(await fixture.model.nativeAcceptedMetadataForTesting(sourceID: fixture.microphone.id))
+            let savedOriginalTask: Task<Void, Never> = try #require(
+                fixture.model.captionTranslationTaskForTesting(captionID: accepted.captionID)
+            )
+            originalTask = savedOriginalTask
+            try await waitUntil { await translations.hasRequest(text: "clear-window original accepted caption") }
+            try await waitUntil {
+                fixture.model.transcriptEntries.first(where: { $0.id == accepted.captionID })?.localSourceText
+                    == "clear-window original accepted caption"
+            }
+            try await waitUntil { await coordinator.captionCommitSucceededForTesting(sourceID: accepted.sourceID, captionID: accepted.captionID) }
+            let driver = try #require(drivers.all().first)
+            await driver.emit(.correctedText(
+                sourceAlias: ready.alias,
+                generation: ready.driverGeneration,
+                captionID: accepted.captionID,
+                utteranceID: accepted.utteranceID,
+                text: "clear-window accepted corrected source"
+            ))
+            try await waitUntil { await translations.hasRequest(text: "clear-window accepted corrected source") }
+            await translations.release(text: "clear-window accepted corrected source", result: "clear-window accepted translation")
+            await fixture.model.nativeCorrectionTasksSnapshotForTesting().first?.value
+            try await waitUntil {
+                fixture.model.overlayState?.committedCaptionID == accepted.captionID
+                    && fixture.model.overlayState?.sourceText == "clear-window accepted corrected source"
+            }
+            let acceptedOverlaySource = fixture.model.overlayState?.sourceText
+            let acceptedOverlayTranslation = fixture.model.overlayState?.translatedText
+            fixture.model.clearTranscript()
+            #expect(fixture.model.transcriptEntries.isEmpty)
+            #expect(fixture.model.overlayState?.sourceText == acceptedOverlaySource)
+            #expect(fixture.model.overlayState?.translatedText == acceptedOverlayTranslation)
+
+            displayTask = fixture.model.captionDisplayTaskSnapshotForTesting()
+            await translations.release(text: "clear-window original accepted caption", result: "late original translation")
+            await originalTask?.value
+            try await waitUntil(timeout: .seconds(8)) {
+                fixture.model.transcriptEntries.first(where: { $0.id == accepted.captionID })?.localTranslatedText
+                    == "late original translation"
+            }
+            let lateEntry = try #require(fixture.model.transcriptEntries.first(where: { $0.id == accepted.captionID }))
+            #expect(lateEntry.sourceText == "clear-window accepted corrected source")
+            #expect(lateEntry.translatedText == "clear-window accepted translation")
+            #expect(fixture.model.overlayState?.committedCaptionID == accepted.captionID)
+            #expect(fixture.model.overlayState?.sourceText == "clear-window accepted corrected source")
+            #expect(fixture.model.overlayState?.translatedText == "clear-window accepted translation")
+            await displayTask?.value
+
+            await driver.emit(.utteranceCompleted(
+                sourceAlias: ready.alias,
+                generation: ready.driverGeneration,
+                captionID: accepted.captionID,
+                utteranceID: accepted.utteranceID
+            ))
+            try await waitUntil { await coordinator.inFlightCaptionIDForTesting(sourceID: accepted.sourceID) == nil }
+            #expect(await session.appendLegacyNormalizedBufferForTesting(pcm, preservesIdentity: true) == 2..<4)
+            #expect(await session.queueLegacyCommittedEmissionForTesting(
+                text: "clear-window pending original caption",
+                segments: [LegacySpeechSegmentTiming(timestamp: 2.0 / 16_000, duration: 2.0 / 16_000)]
+            ))
+            await session.deliverQueuedCommittedEmissionForTesting()
+            try await waitUntil { fixture.model.nativeAcceptedBindingsForTesting(sourceID: accepted.sourceID).count == 1 }
+            let pendingAccepted = try #require(fixture.model.nativeAcceptedBindingsForTesting(sourceID: accepted.sourceID).last)
+            let savedPendingOriginalTask: Task<Void, Never> = try #require(
+                fixture.model.captionTranslationTaskForTesting(captionID: pendingAccepted.captionID)
+            )
+            originalTask = savedPendingOriginalTask
+            try await waitUntil { await translations.hasRequest(text: "clear-window pending original caption") }
+            try await waitUntil {
+                fixture.model.transcriptEntries.first(where: { $0.id == pendingAccepted.captionID })?.localSourceText
+                    == "clear-window pending original caption"
+            }
+            try await waitUntil {
+                await coordinator.captionCommitSucceededForTesting(sourceID: accepted.sourceID, captionID: pendingAccepted.captionID)
+            }
+            await driver.emit(.correctedText(
+                sourceAlias: ready.alias,
+                generation: ready.driverGeneration,
+                captionID: pendingAccepted.captionID,
+                utteranceID: pendingAccepted.utteranceID,
+                text: "clear-window pending corrected source"
+            ))
+            try await waitUntil { await translations.hasRequest(text: "clear-window pending corrected source") }
+            let savedPendingCorrectionTask: Task<Void, Never> = try #require(
+                fixture.model.nativeCorrectionTasksSnapshotForTesting().first
+            )
+            #expect(fixture.model.nativeCorrectionSnapshotForTesting(captionID: pendingAccepted.captionID)?.state == .pending)
+            fixture.model.clearTranscript()
+            #expect(fixture.model.nativeAcceptedBindingsForTesting(sourceID: accepted.sourceID).isEmpty)
+            #expect(savedPendingCorrectionTask.isCancelled)
+            #expect(fixture.model.overlayState?.sourceText == "clear-window pending corrected source")
+            #expect(fixture.model.overlayState?.translatedText.isEmpty == true)
+            await translations.release(text: "clear-window pending corrected source", result: "must not resurrect")
+            await savedPendingCorrectionTask.value
+            displayTask = fixture.model.captionDisplayTaskSnapshotForTesting()
+            await translations.release(text: "clear-window pending original caption", result: "late pending original translation")
+            await savedPendingOriginalTask.value
+            try await waitUntil(timeout: .seconds(8)) {
+                fixture.model.transcriptEntries.first(where: { $0.id == pendingAccepted.captionID })?.localTranslatedText
+                    == "late pending original translation"
+            }
+            let pendingLateEntry = try #require(
+                fixture.model.transcriptEntries.first(where: { $0.id == pendingAccepted.captionID })
+            )
+            #expect(pendingLateEntry.sourceText == "clear-window pending corrected source")
+            #expect(pendingLateEntry.translatedText.isEmpty)
+            #expect(pendingLateEntry.nativeCorrectedTranslationState == .failed)
+            #expect(fixture.model.overlayState?.sourceText == "clear-window pending corrected source")
+            #expect(fixture.model.overlayState?.translatedText.isEmpty == true)
+        } catch {
+            await cleanup()
+            throw error
+        }
+        await cleanup()
+    }
+
+    @Test func preReadyNativeEventsFlushAgainstTrustedIdentityAndShareSourceBound() async throws {
+        let credentials = IntegrationNativeCredentialBackend(secret: "fake-secret")
+        let drivers = IntegrationNativeDriverBag()
+        let coordinator = NativeRealtimeSessionCoordinator(
+            credentialStore: RealtimeCredentialStore(backend: credentials),
+            driverFactory: { _, _, _ in
+                let driver = IntegrationNativeRealtimeDriver()
+                drivers.append(driver)
+                return driver
+            }
+        )
+        let fixture = makeFixture(
+            correctionSettings: configuredCorrectionSettings(isEnabled: false),
+            nativeRealtimeSettings: configuredNativeRealtimeSettings(enabledSourceIDs: [microphoneSource.id]),
+            nativeRealtimeSessionCoordinator: coordinator
+        )
+        defer { fixture.removeSettingsFile() }
+        let session = LiveTranscriptionSession()
+        session.setStartOperationForTesting { await session.beginRecognitionSessionForTesting() }
+        fixture.model.selectedSourceIDs = [fixture.microphone.id]
+        fixture.model.sourceLanguageOverrides[fixture.microphone.id] = "en"
+        fixture.model.sourceOutputLanguageOverrides[fixture.microphone.id] = "en"
+        fixture.model.setSessionResourcePreparationOperationForTesting {}
+        fixture.model.setLiveTranscriptionSessionFactoryForTesting { session }
+        fixture.model.acknowledgeNativeRealtimeDisclosureForNextSession()
+        let readyGate = AsyncTestGate()
+        fixture.model.pauseNextNativeSourceReadyHandlingForTesting { await readyGate.suspend() }
+        let startTask = Task { await fixture.model.startSession() }
+        func cleanup() async {
+            startTask.cancel()
+            let correctionTasks = fixture.model.nativeCorrectionTasksSnapshotForTesting()
+            let translationTasks = fixture.model.captionTranslationTasksSnapshotForTesting()
+            let transferTasks = fixture.model.nativeCaptionTransferTasksSnapshotForTesting()
+            let displayTask = fixture.model.captionDisplayTaskSnapshotForTesting()
+            let readyTask = fixture.model.nativeSourceReadyTaskSnapshotForTesting(sourceID: fixture.microphone.id)
+            (correctionTasks + translationTasks + transferTasks).forEach { $0.cancel() }
+            displayTask?.cancel()
+            readyTask?.cancel()
+            await readyGate.resume()
+            fixture.model.stopSession()
+            await coordinator.stop()
+            await startTask.value
+            await readyTask?.value
+            for task in correctionTasks + translationTasks + transferTasks { await task.value }
+            await displayTask?.value
+        }
+
+        var stage = "app ready callback held"
+        var captionIDs: [UUID] = []
+        do {
+            try await readyGate.waitUntilSuspended(timeoutNanoseconds: 8_000_000_000)
+            #expect(fixture.model.nativeReadyIdentityForTesting(sourceID: fixture.microphone.id) == nil)
+            await startTask.value
+            try await waitUntil { fixture.model.registeredLiveSessionForTesting(sourceID: fixture.microphone.id) === session }
+            let driver = try #require(drivers.all().first)
+            try await waitUntil { await driver.isListeningForEvents() }
+            let alias = try #require(await driver.startedAliases().first)
+            let generation = try #require(await driver.startedGenerations().first)
+
+            await session.beginLegacySampleMappingForTesting()
+            let pcm = try integrationRealtimeBuffer(samples: [0.25, -0.25])
+            #expect(await session.appendLegacyNormalizedBufferForTesting(pcm, preservesIdentity: true) == 0..<2)
+            #expect(await session.queueLegacyCommittedEmissionForTesting(
+                text: "pre-ready original A",
+                segments: [LegacySpeechSegmentTiming(timestamp: 0, duration: 2.0 / 16_000)]
+            ))
+            await session.deliverQueuedCommittedEmissionForTesting()
+            try await waitUntil { await fixture.model.nativeAcceptedMetadataForTesting(sourceID: fixture.microphone.id) != nil }
+            let first = try #require(await fixture.model.nativeAcceptedMetadataForTesting(sourceID: fixture.microphone.id))
+            captionIDs.append(first.captionID)
+            #expect(await session.appendLegacyNormalizedBufferForTesting(pcm, preservesIdentity: true) == 2..<4)
+            #expect(await session.queueLegacyCommittedEmissionForTesting(
+                text: "a completely separate second utterance about tomorrow",
+                segments: [LegacySpeechSegmentTiming(timestamp: 2.0 / 16_000, duration: 2.0 / 16_000)]
+            ))
+            await session.deliverQueuedCommittedEmissionForTesting()
+            try await waitUntil { fixture.model.nativeAcceptedBindingsForTesting(sourceID: first.sourceID).count == 2 }
+            let second = try #require(fixture.model.nativeAcceptedBindingsForTesting(sourceID: first.sourceID).last)
+            captionIDs.append(second.captionID)
+            try await waitUntil {
+                await coordinator.captionCommitSucceededForTesting(sourceID: first.sourceID, captionID: first.captionID)
+            }
+            #expect(fixture.model.nativeAcceptedReadyIdentityForTesting(captionID: first.captionID) == nil)
+
+            stage = "real provider corrected event arrives before App trusted-ready callback"
+            await driver.emit(.correctedText(
+                sourceAlias: alias,
+                generation: generation,
+                captionID: first.captionID,
+                utteranceID: first.utteranceID,
+                text: "pre-ready corrected A"
+            ))
+            try await waitUntil { fixture.model.nativeEarlyEventCountForTesting(sourceID: first.sourceID) == 1 }
+            fixture.model.deliverNativeCaptionEventForTesting(RealtimeCaptionEventEnvelope(
+                sourceID: "different-source-id",
+                sourceToken: first.sourceToken,
+                captureGeneration: first.captureGeneration,
+                sourceAlias: alias,
+                driverGeneration: generation,
+                captionID: first.captionID,
+                utteranceID: first.utteranceID,
+                sourceLanguageID: first.sourceLanguageID,
+                targetLanguageID: first.targetLanguageID,
+                kind: .correctedText("wrong source identity")
+            ))
+            #expect(fixture.model.nativeEarlyEventCountForTesting(sourceID: first.sourceID) == 1)
+            let wrongAliasEvent = RealtimeCaptionEventEnvelope(
+                sourceID: first.sourceID,
+                sourceToken: first.sourceToken,
+                captureGeneration: first.captureGeneration,
+                sourceAlias: "untrusted-wrong-alias",
+                driverGeneration: generation,
+                captionID: first.captionID,
+                utteranceID: first.utteranceID,
+                sourceLanguageID: first.sourceLanguageID,
+                targetLanguageID: first.targetLanguageID,
+                kind: .correctedText("must be ignored")
+            )
+            fixture.model.deliverNativeCaptionEventForTesting(wrongAliasEvent)
+            let wrongGenerationTerminal = RealtimeCaptionEventEnvelope(
+                sourceID: first.sourceID,
+                sourceToken: first.sourceToken,
+                captureGeneration: first.captureGeneration,
+                sourceAlias: alias,
+                driverGeneration: generation &+ 1,
+                captionID: first.captionID,
+                utteranceID: first.utteranceID,
+                sourceLanguageID: first.sourceLanguageID,
+                targetLanguageID: first.targetLanguageID,
+                kind: .utteranceCompleted
+            )
+            fixture.model.deliverNativeCaptionEventForTesting(wrongGenerationTerminal)
+            fixture.model.deliverNativeCaptionEventForTesting(RealtimeCaptionEventEnvelope(
+                sourceID: first.sourceID,
+                sourceToken: UUID(),
+                captureGeneration: first.captureGeneration,
+                sourceAlias: alias,
+                driverGeneration: generation,
+                captionID: first.captionID,
+                utteranceID: first.utteranceID,
+                sourceLanguageID: first.sourceLanguageID,
+                targetLanguageID: first.targetLanguageID,
+                kind: .correctedText("wrong token")
+            ))
+            fixture.model.deliverNativeCaptionEventForTesting(RealtimeCaptionEventEnvelope(
+                sourceID: first.sourceID,
+                sourceToken: first.sourceToken,
+                captureGeneration: first.captureGeneration &+ 1,
+                sourceAlias: alias,
+                driverGeneration: generation,
+                captionID: first.captionID,
+                utteranceID: first.utteranceID,
+                sourceLanguageID: first.sourceLanguageID,
+                targetLanguageID: first.targetLanguageID,
+                kind: .correctedText("wrong capture generation")
+            ))
+            fixture.model.deliverNativeCaptionEventForTesting(RealtimeCaptionEventEnvelope(
+                sourceID: first.sourceID,
+                sourceToken: first.sourceToken,
+                captureGeneration: first.captureGeneration,
+                sourceAlias: alias,
+                driverGeneration: generation,
+                captionID: first.captionID,
+                utteranceID: "wrong-utterance-id",
+                sourceLanguageID: first.sourceLanguageID,
+                targetLanguageID: first.targetLanguageID,
+                kind: .correctedText("wrong utterance")
+            ))
+            fixture.model.deliverNativeCaptionEventForTesting(RealtimeCaptionEventEnvelope(
+                sourceID: first.sourceID,
+                sourceToken: first.sourceToken,
+                captureGeneration: first.captureGeneration,
+                sourceAlias: alias,
+                driverGeneration: generation,
+                captionID: first.captionID,
+                utteranceID: first.utteranceID,
+                sourceLanguageID: "fr",
+                targetLanguageID: first.targetLanguageID,
+                kind: .correctedText("wrong source language")
+            ))
+            fixture.model.deliverNativeCaptionEventForTesting(RealtimeCaptionEventEnvelope(
+                sourceID: first.sourceID,
+                sourceToken: first.sourceToken,
+                captureGeneration: first.captureGeneration,
+                sourceAlias: alias,
+                driverGeneration: generation,
+                captionID: first.captionID,
+                utteranceID: first.utteranceID,
+                sourceLanguageID: first.sourceLanguageID,
+                targetLanguageID: "ja",
+                kind: .correctedText("wrong target language")
+            ))
+            fixture.model.deliverNativeCaptionEventForTesting(RealtimeCaptionEventEnvelope(
+                sourceID: first.sourceID,
+                sourceToken: first.sourceToken,
+                captureGeneration: first.captureGeneration,
+                sourceAlias: alias,
+                driverGeneration: generation,
+                captionID: second.captionID,
+                utteranceID: first.utteranceID,
+                sourceLanguageID: first.sourceLanguageID,
+                targetLanguageID: first.targetLanguageID,
+                kind: .correctedText("wrong caption identity")
+            ))
+            for index in 0..<5 {
+                fixture.model.deliverNativeCaptionEventForTesting(RealtimeCaptionEventEnvelope(
+                    sourceID: first.sourceID,
+                    sourceToken: first.sourceToken,
+                    captureGeneration: first.captureGeneration,
+                    sourceAlias: alias,
+                    driverGeneration: generation,
+                    captionID: first.captionID,
+                    utteranceID: first.utteranceID,
+                    sourceLanguageID: first.sourceLanguageID,
+                    targetLanguageID: first.targetLanguageID,
+                    kind: .suggestion("suggestion-\(index)")
+                ))
+            }
+            try await waitUntil { fixture.model.nativeEarlyEventCountForTesting(sourceID: first.sourceID) == 8 }
+            #expect(fixture.model.transcriptEntries.first(where: { $0.id == first.captionID })?.sourceText
+                == "pre-ready original A")
+
+            stage = "valid terminal frees coordinator FIFO but cannot exceed early-event cap"
+            await driver.emit(.utteranceCompleted(
+                sourceAlias: alias,
+                generation: generation,
+                captionID: first.captionID,
+                utteranceID: first.utteranceID
+            ))
+            try await waitUntil {
+                await coordinator.inFlightCaptionIDForTesting(sourceID: first.sourceID) != first.captionID
+            }
+            #expect(fixture.model.nativeEarlyEventCountForTesting(sourceID: first.sourceID) == 8)
+
+            stage = "source-wide cap rejects a ninth event for the sibling caption"
+            fixture.model.deliverNativeCaptionEventForTesting(RealtimeCaptionEventEnvelope(
+                sourceID: second.sourceID,
+                sourceToken: second.sourceToken,
+                captureGeneration: second.captureGeneration,
+                sourceAlias: alias,
+                driverGeneration: generation,
+                captionID: second.captionID,
+                utteranceID: second.utteranceID,
+                sourceLanguageID: second.sourceLanguageID,
+                targetLanguageID: second.targetLanguageID,
+                kind: .correctedText("ninth event must be dropped")
+            ))
+            #expect(fixture.model.nativeEarlyEventCountForTesting(sourceID: first.sourceID) == 8)
+            let secondBeforeReady = fixture.model.nativeCorrectionSnapshotForTesting(captionID: second.captionID)
+            #expect(secondBeforeReady?.state == NativeCorrectedTranslationState.none)
+            #expect(secondBeforeReady?.sourceText == nil)
+
+            stage = "trusted-ready callback flushes and revalidates each stored identity"
+            let readyTask = try #require(
+                fixture.model.nativeSourceReadyTaskSnapshotForTesting(sourceID: first.sourceID)
+            )
+            await readyGate.resume()
+            await readyTask.value
+            try await waitUntil { fixture.model.nativeReadyIdentityForTesting(sourceID: first.sourceID) != nil }
+            try await waitUntil {
+                fixture.model.transcriptEntries.first(where: { $0.id == first.captionID })?.sourceText
+                    == "pre-ready corrected A"
+            }
+            #expect(fixture.model.nativeTerminalEventReceivedForTesting(captionID: first.captionID) == false)
+            #expect(fixture.model.nativeAcceptedBindingsForTesting(sourceID: second.sourceID)
+                .contains(where: { $0.captionID == second.captionID }))
+            let secondAfterReady = fixture.model.nativeCorrectionSnapshotForTesting(captionID: second.captionID)
+            #expect(secondAfterReady?.state == NativeCorrectedTranslationState.none)
+            #expect(secondAfterReady?.sourceText == nil)
+        } catch {
+            print("pre-ready native event stage: \(stage); ids=\(captionIDs); early=\(fixture.model.nativeEarlyEventCountForTesting(sourceID: fixture.microphone.id)); error: \(error)")
+            await cleanup()
+            throw error
+        }
+        await cleanup()
+    }
+
+    @Test(arguments: [false, true])
+    func refreshTranslationPreservesNativeEffectiveCaptionAfterSourceRevocation(
+        clearTranscriptAfterRevocation: Bool
+    ) async throws {
+        let credentials = IntegrationNativeCredentialBackend(secret: "fake-secret")
+        let drivers = IntegrationNativeDriverBag()
+        let coordinator = NativeRealtimeSessionCoordinator(
+            credentialStore: RealtimeCredentialStore(backend: credentials),
+            driverFactory: { _, _, _ in
+                let driver = IntegrationNativeRealtimeDriver()
+                drivers.append(driver)
+                return driver
+            }
+        )
+        let fixture = makeFixture(
+            correctionSettings: configuredCorrectionSettings(isEnabled: false),
+            nativeRealtimeSettings: configuredNativeRealtimeSettings(enabledSourceIDs: [microphoneSource.id]),
+            nativeRealtimeSessionCoordinator: coordinator
+        )
+        defer { fixture.removeSettingsFile() }
+        let session = LiveTranscriptionSession()
+        session.setStartOperationForTesting { await session.beginRecognitionSessionForTesting() }
+        fixture.model.selectedSourceIDs = [fixture.microphone.id]
+        fixture.model.sourceLanguageOverrides[fixture.microphone.id] = "en"
+        fixture.model.sourceOutputLanguageOverrides[fixture.microphone.id] = "zh-Hans"
+        fixture.model.setSessionResourcePreparationOperationForTesting {}
+        fixture.model.setLiveTranscriptionSessionFactoryForTesting { session }
+        fixture.model.acknowledgeNativeRealtimeDisclosureForNextSession()
+        let translations = IntegrationNativeTranslationHarness()
+        fixture.model.setTranslationOperationForTesting { text, source, target in
+            try await translations.translate(text, source: source, target: target)
+        }
+        let startTask = Task { await fixture.model.startSession() }
+        var heldRefreshTask: Task<Void, Never>?
+        var heldCorrectionTask: Task<Void, Never>?
+        func cleanup() async {
+            startTask.cancel()
+            heldRefreshTask?.cancel()
+            heldCorrectionTask?.cancel()
+            let translationTasks = fixture.model.captionTranslationTasksSnapshotForTesting()
+            let correctionTasks = fixture.model.nativeCorrectionTasksSnapshotForTesting()
+            let transferTasks = fixture.model.nativeCaptionTransferTasksSnapshotForTesting()
+            let refreshTask = fixture.model.captionRefreshTaskSnapshotForTesting()
+            let displayTask = fixture.model.captionDisplayTaskSnapshotForTesting()
+            (translationTasks + correctionTasks + transferTasks).forEach { $0.cancel() }
+            refreshTask?.cancel()
+            displayTask?.cancel()
+            await translations.releaseAll()
+            fixture.model.stopSession()
+            await coordinator.stop()
+            await startTask.value
+            for task in translationTasks + correctionTasks + transferTasks { await task.value }
+            await heldRefreshTask?.value
+            await heldCorrectionTask?.value
+            await refreshTask?.value
+            await displayTask?.value
+        }
+
+        var stage = "trusted-ready and accepted caption"
+        do {
+            try await waitUntil { fixture.model.nativeReadyIdentityForTesting(sourceID: fixture.microphone.id) != nil }
+            await session.beginLegacySampleMappingForTesting()
+            let inputPCM = try integrationRealtimeBuffer(samples: [0.25, -0.25])
+            #expect(await session.appendLegacyNormalizedBufferForTesting(inputPCM, preservesIdentity: true) == 0..<2)
+            #expect(await session.queueLegacyCommittedEmissionForTesting(
+                text: "refresh original live utterance",
+                segments: [LegacySpeechSegmentTiming(timestamp: 0, duration: 2.0 / 16_000)]
+            ))
+            await session.deliverQueuedCommittedEmissionForTesting()
+            try await waitUntil { await fixture.model.nativeAcceptedMetadataForTesting(sourceID: fixture.microphone.id) != nil }
+            let accepted = try #require(await fixture.model.nativeAcceptedMetadataForTesting(sourceID: fixture.microphone.id))
+            try await waitUntil {
+                await coordinator.captionCommitSucceededForTesting(sourceID: accepted.sourceID, captionID: accepted.captionID)
+            }
+            let driver = try #require(drivers.all().first)
+            let ready = try #require(fixture.model.nativeAcceptedReadyIdentityForTesting(captionID: accepted.captionID))
+
+            stage = "complete initial local translation and display"
+            try await waitUntil { await translations.hasRequest(text: "refresh original live utterance") }
+            await translations.release(text: "refresh original live utterance", result: "old target translation")
+            try await waitUntil { fixture.model.overlayState?.committedCaptionID == accepted.captionID }
+
+            stage = "accept native correction and its local translation"
+            await driver.emit(.correctedText(
+                sourceAlias: ready.alias,
+                generation: ready.driverGeneration,
+                captionID: accepted.captionID,
+                utteranceID: accepted.utteranceID,
+                text: "refresh corrected live utterance"
+            ))
+            try await waitUntil { await translations.hasRequest(text: "refresh corrected live utterance") }
+            let savedCorrectionTask: Task<Void, Never> = try #require(
+                fixture.model.nativeCorrectionTasksSnapshotForTesting().first
+            )
+            heldCorrectionTask = savedCorrectionTask
+            await translations.release(text: "refresh corrected live utterance", result: "corrected target translation")
+            try await waitUntil {
+                fixture.model.nativeCorrectionSnapshotForTesting(captionID: accepted.captionID)?.translatedText
+                    == "corrected target translation"
+            }
+            #expect(fixture.model.overlayState?.translatedText == "corrected target translation")
+
+            stage = "hold refresh translation before source revocation"
+            let previousCount = await translations.requestCount(text: "refresh original live utterance")
+            fixture.model.refreshCaptionTranslationsForTesting()
+            try await waitUntil {
+                await translations.requestCount(text: "refresh original live utterance") > previousCount
+            }
+            let savedRefreshTask: Task<Void, Never> = try #require(
+                fixture.model.captionRefreshTaskSnapshotForTesting()
+            )
+            heldRefreshTask = savedRefreshTask
+            var settings = fixture.model.nativeRealtimeSettings
+            settings.enabledSourceIDs = []
+            fixture.model.nativeRealtimeSettings = settings
+            try await waitUntil {
+                fixture.model.nativeAcceptedReadyIdentityForTesting(captionID: accepted.captionID) == nil
+            }
+            #expect(fixture.model.nativeCorrectionSnapshotForTesting(captionID: accepted.captionID) == nil)
+            if clearTranscriptAfterRevocation {
+                fixture.model.clearTranscript()
+                #expect(fixture.model.transcriptEntries.isEmpty)
+                #expect(fixture.model.overlayState?.committedCaptionID == accepted.captionID)
+                #expect(fixture.model.overlayState?.sourceText == "refresh corrected live utterance")
+                #expect(fixture.model.overlayState?.translatedText == "corrected target translation")
+            }
+            await translations.release(text: "refresh original live utterance", result: "pending-list refresh target")
+            await translations.release(text: "refresh original live utterance", result: "stale refresh target")
+            await heldRefreshTask?.value
+            let entry = try #require(fixture.model.transcriptEntries.first(where: { $0.id == accepted.captionID }))
+            #expect(entry.sourceText == "refresh corrected live utterance")
+            #expect(entry.translatedText == "corrected target translation")
+            if clearTranscriptAfterRevocation {
+                #expect(entry.nativeCorrectedTranslationState == .ready)
+                #expect(entry.localSourceText == "refresh original live utterance")
+                #expect(entry.localTranslatedText == "stale refresh target")
+            }
+            #expect(fixture.model.overlayState?.committedCaptionID == accepted.captionID)
+            #expect(fixture.model.overlayState?.sourceText == "refresh corrected live utterance")
+            #expect(fixture.model.overlayState?.translatedText == "corrected target translation")
+        } catch {
+            print("refresh native caption stage: \(stage); error: \(error)")
+            await cleanup()
+            throw error
+        }
+        await cleanup()
+    }
+
+    @Test func revokedNativeCorrectionKeepsExactHistoryWhenOriginalTranslationArrivesLate() async throws {
+        let credentials = IntegrationNativeCredentialBackend(secret: "fake-secret")
+        let drivers = IntegrationNativeDriverBag()
+        let coordinator = NativeRealtimeSessionCoordinator(
+            credentialStore: RealtimeCredentialStore(backend: credentials),
+            driverFactory: { _, _, _ in
+                let driver = IntegrationNativeRealtimeDriver()
+                drivers.append(driver)
+                return driver
+            }
+        )
+        let fixture = makeFixture(
+            correctionSettings: configuredCorrectionSettings(isEnabled: false),
+            nativeRealtimeSettings: configuredNativeRealtimeSettings(enabledSourceIDs: [microphoneSource.id]),
+            nativeRealtimeSessionCoordinator: coordinator
+        )
+        defer { fixture.removeSettingsFile() }
+        let session = LiveTranscriptionSession()
+        session.setStartOperationForTesting { await session.beginRecognitionSessionForTesting() }
+        fixture.model.selectedSourceIDs = [fixture.microphone.id]
+        fixture.model.sourceLanguageOverrides[fixture.microphone.id] = "en"
+        fixture.model.sourceOutputLanguageOverrides[fixture.microphone.id] = "zh-Hans"
+        fixture.model.setSessionResourcePreparationOperationForTesting {}
+        fixture.model.setLiveTranscriptionSessionFactoryForTesting { session }
+        fixture.model.acknowledgeNativeRealtimeDisclosureForNextSession()
+        let translations = IntegrationNativeTranslationHarness()
+        fixture.model.setTranslationOperationForTesting { text, source, target in
+            try await translations.translate(text, source: source, target: target)
+        }
+        let startTask = Task { await fixture.model.startSession() }
+        var revokedCorrectionTask: Task<Void, Never>?
+        var heldOriginalTranslationTask: Task<Void, Never>?
+        func cleanup() async {
+            let correctionTasks = fixture.model.nativeCorrectionTasksSnapshotForTesting()
+            revokedCorrectionTask?.cancel()
+            heldOriginalTranslationTask?.cancel()
+            let translationTasks = fixture.model.captionTranslationTasksSnapshotForTesting()
+            let transferTasks = fixture.model.nativeCaptionTransferTasksSnapshotForTesting()
+            let displayTask = fixture.model.captionDisplayTaskSnapshotForTesting()
+            (correctionTasks + translationTasks + transferTasks).forEach { $0.cancel() }
+            displayTask?.cancel()
+            await translations.releaseAll()
+            fixture.model.stopSession()
+            await coordinator.stop()
+            await startTask.value
+            for task in correctionTasks + translationTasks + transferTasks { await task.value }
+            await revokedCorrectionTask?.value
+            await heldOriginalTranslationTask?.value
+            await displayTask?.value
+        }
+
+        var stage = "trusted ready and first original translation held"
+        var firstCaptionID: UUID?
+        do {
+            try await waitUntil { fixture.model.nativeReadyIdentityForTesting(sourceID: fixture.microphone.id) != nil }
+            await startTask.value
+            await session.beginLegacySampleMappingForTesting()
+            let inputPCM = try integrationRealtimeBuffer(samples: [0.25, -0.25])
+            #expect(await session.appendLegacyNormalizedBufferForTesting(inputPCM, preservesIdentity: true) == 0..<2)
+            #expect(await session.queueLegacyCommittedEmissionForTesting(
+                text: "revoked-original-A",
+                segments: [LegacySpeechSegmentTiming(timestamp: 0, duration: 2.0 / 16_000)]
+            ))
+            await session.deliverQueuedCommittedEmissionForTesting()
+            try await waitUntil { await translations.hasRequest(text: "revoked-original-A") }
+            try await waitUntil { await fixture.model.nativeAcceptedMetadataForTesting(sourceID: fixture.microphone.id) != nil }
+            let accepted = try #require(await fixture.model.nativeAcceptedMetadataForTesting(sourceID: fixture.microphone.id))
+            firstCaptionID = accepted.captionID
+            let savedOriginalTranslationTask: Task<Void, Never> = try #require(
+                fixture.model.captionTranslationTaskForTesting(captionID: accepted.captionID)
+            )
+            heldOriginalTranslationTask = savedOriginalTranslationTask
+            let ready = try #require(fixture.model.nativeReadyIdentityForTesting(sourceID: fixture.microphone.id))
+            try await waitUntil {
+                fixture.model.transcriptEntries.first(where: { $0.id == accepted.captionID })?.localSourceText
+                    == "revoked-original-A"
+            }
+            let driver = try #require(drivers.all().first)
+            try await waitUntil {
+                let count = await driver.committedUtteranceCount()
+                let listening = await driver.isListeningForEvents()
+                return count == 1 && listening
+            }
+            stage = "native corrected source accepted with its translation pending"
+            await driver.emit(.correctedText(
+                sourceAlias: ready.alias,
+                generation: ready.driverGeneration,
+                captionID: accepted.captionID,
+                utteranceID: accepted.utteranceID,
+                text: "revoked-corrected-A"
+            ))
+            try await waitUntil { await translations.hasRequest(text: "revoked-corrected-A") }
+            let savedRevokedCorrectionTask: Task<Void, Never> = try #require(
+                fixture.model.nativeCorrectionTasksSnapshotForTesting().first
+            )
+            revokedCorrectionTask = savedRevokedCorrectionTask
+            #expect(fixture.model.nativeCorrectionSnapshotForTesting(captionID: accepted.captionID)?.state == .pending)
+
+            stage = "source revocation preserves accepted correction identity facts"
+            var settings = fixture.model.nativeRealtimeSettings
+            settings.enabledSourceIDs = []
+            fixture.model.nativeRealtimeSettings = settings
+            try await waitUntil {
+                fixture.model.nativeCorrectionSnapshotForTesting(captionID: accepted.captionID) == nil
+            }
+            #expect(revokedCorrectionTask?.isCancelled == true)
+            #expect(fixture.model.transcriptEntries.first(where: { $0.id == accepted.captionID })?.sourceText
+                == "revoked-corrected-A")
+
+            stage = "next caption advances queue and archives exact first caption"
+            #expect(await session.appendLegacyNormalizedBufferForTesting(inputPCM, preservesIdentity: true) == 2..<4)
+            #expect(await session.queueLegacyCommittedEmissionForTesting(
+                text: "revoked-next-caption-B",
+                segments: [LegacySpeechSegmentTiming(timestamp: 2.0 / 16_000, duration: 2.0 / 16_000)]
+            ))
+            await session.deliverQueuedCommittedEmissionForTesting()
+            try await waitUntil(timeout: .seconds(5)) {
+                guard let id = fixture.model.overlayState?.committedCaptionID,
+                      let firstCaptionID else { return false }
+                return id != firstCaptionID
+            }
+            try await waitUntil {
+                fixture.model.overlayState?.history.contains(where: { $0.id == accepted.captionID }) == true
+            }
+            let currentBeforeLateResult = try #require(fixture.model.overlayState)
+            let currentCaptionBeforeLateResult = try #require(
+                fixture.model.transcriptEntries.first(where: { $0.id == currentBeforeLateResult.committedCaptionID })
+            )
+            let historyBeforeClear = try #require(
+                currentBeforeLateResult.history.first(where: { $0.id == accepted.captionID })
+            )
+            #expect(historyBeforeClear.sourceText == "revoked-corrected-A")
+            #expect(historyBeforeClear.translatedText.isEmpty)
+
+            stage = "clear keeps the current overlay and exact corrected history source"
+            fixture.model.clearTranscript()
+            #expect(fixture.model.transcriptEntries.isEmpty)
+            let overlayAfterClear = try #require(fixture.model.overlayState)
+            #expect(overlayAfterClear.committedCaptionID == currentBeforeLateResult.committedCaptionID)
+            #expect(overlayAfterClear.captionEpoch == currentBeforeLateResult.captionEpoch)
+            #expect(overlayAfterClear.sourceText == currentBeforeLateResult.sourceText)
+            #expect(overlayAfterClear.translatedText == currentBeforeLateResult.translatedText)
+            let historyAfterClear = try #require(
+                overlayAfterClear.history.first(where: { $0.id == accepted.captionID })
+            )
+            #expect(historyAfterClear.sourceText == "revoked-corrected-A")
+            #expect(historyAfterClear.translatedText.isEmpty)
+
+            stage = "original translation arrives after clear without corrupting retained native history"
+            await translations.release(text: "revoked-original-A", result: "local-original-translation-A")
+            await heldOriginalTranslationTask?.value
+            let history = try #require(fixture.model.overlayState?.history.first(where: { $0.id == accepted.captionID }))
+            #expect(history.sourceText == "revoked-corrected-A")
+            #expect(history.translatedText.isEmpty)
+            let currentAfterLateResult = try #require(fixture.model.overlayState)
+            #expect(fixture.model.transcriptEntries.isEmpty)
+            #expect(currentAfterLateResult.committedCaptionID == currentBeforeLateResult.committedCaptionID)
+            #expect(currentAfterLateResult.captionEpoch == currentBeforeLateResult.captionEpoch)
+            #expect(currentAfterLateResult.sourceText == currentBeforeLateResult.sourceText)
+            #expect(currentAfterLateResult.translatedText == currentBeforeLateResult.translatedText)
+            #expect(currentCaptionBeforeLateResult.id == currentBeforeLateResult.committedCaptionID)
+        } catch {
+            let entry = firstCaptionID.flatMap { id in fixture.model.transcriptEntries.first(where: { $0.id == id }) }
+            print("revoked native late translation stage: \(stage); entry=\(String(describing: entry)); history=\(String(describing: fixture.model.overlayState?.history)); error: \(error)")
+            await cleanup()
+            throw error
+        }
+        await cleanup()
+    }
+
+    @Test func latestNativeCorrectionRevisionWinsWhenTranslationsReturnInReverseOrder() async throws {
+        let credentials = IntegrationNativeCredentialBackend(secret: "fake-secret")
+        let drivers = IntegrationNativeDriverBag()
+        let coordinator = NativeRealtimeSessionCoordinator(
+            credentialStore: RealtimeCredentialStore(backend: credentials),
+            driverFactory: { _, _, _ in
+                let driver = IntegrationNativeRealtimeDriver()
+                drivers.append(driver)
+                return driver
+            }
+        )
+        let fixture = makeFixture(
+            correctionSettings: configuredCorrectionSettings(isEnabled: false),
+            nativeRealtimeSettings: configuredNativeRealtimeSettings(enabledSourceIDs: [microphoneSource.id]),
+            nativeRealtimeSessionCoordinator: coordinator
+        )
+        defer { fixture.removeSettingsFile() }
+        let session = LiveTranscriptionSession()
+        session.setStartOperationForTesting { await session.beginRecognitionSessionForTesting() }
+        fixture.model.selectedSourceIDs = [fixture.microphone.id]
+        fixture.model.sourceLanguageOverrides[fixture.microphone.id] = "en"
+        fixture.model.sourceOutputLanguageOverrides[fixture.microphone.id] = "zh-Hans"
+        fixture.model.setSessionResourcePreparationOperationForTesting {}
+        fixture.model.setLiveTranscriptionSessionFactoryForTesting { session }
+        fixture.model.acknowledgeNativeRealtimeDisclosureForNextSession()
+        let translations = IntegrationNativeTranslationHarness()
+        fixture.model.setTranslationOperationForTesting { text, source, target in
+            try await translations.translate(text, source: source, target: target)
+        }
+        let startTask = Task { await fixture.model.startSession() }
+        var staleTranslationTask: Task<Void, Never>?
+        func cleanup() async {
+            let translationTasks = fixture.model.captionTranslationTasksSnapshotForTesting()
+            let correctionTasks = fixture.model.nativeCorrectionTasksSnapshotForTesting()
+            let displayTask = fixture.model.captionDisplayTaskSnapshotForTesting()
+            let transferTasks = fixture.model.nativeCaptionTransferTasksSnapshotForTesting()
+            (translationTasks + correctionTasks + transferTasks).forEach { $0.cancel() }
+            staleTranslationTask?.cancel()
+            displayTask?.cancel()
+            await translations.releaseAll()
+            fixture.model.stopSession()
+            await coordinator.stop()
+            await startTask.value
+            for task in translationTasks + correctionTasks + transferTasks { await task.value }
+            await staleTranslationTask?.value
+            await displayTask?.value
+        }
+
+        var stage = "original translation held after first upsert"
+        var acceptedCaptionID: UUID?
+        do {
+            try await waitUntil { fixture.model.nativeReadyIdentityForTesting(sourceID: fixture.microphone.id) != nil }
+            await session.beginLegacySampleMappingForTesting()
+            let inputPCM = try integrationRealtimeBuffer(samples: [0.25, -0.25])
+            #expect(await session.appendLegacyNormalizedBufferForTesting(inputPCM, preservesIdentity: true) == 0..<2)
+            #expect(await session.queueLegacyCommittedEmissionForTesting(
+                text: "original-revision-test",
+                segments: [LegacySpeechSegmentTiming(timestamp: 0, duration: 2.0 / 16_000)]
+            ))
+            await session.deliverQueuedCommittedEmissionForTesting()
+            try await waitUntil { await fixture.model.nativeAcceptedMetadataForTesting(sourceID: fixture.microphone.id) != nil }
+            let accepted = try #require(await fixture.model.nativeAcceptedMetadataForTesting(sourceID: fixture.microphone.id))
+            acceptedCaptionID = accepted.captionID
+            let ready = try #require(fixture.model.nativeReadyIdentityForTesting(sourceID: fixture.microphone.id))
+            #expect(accepted.sourceToken == ready.sourceToken)
+            #expect(accepted.captureGeneration == ready.captureGeneration)
+            try await waitUntil { await translations.hasRequest(text: "original-revision-test") }
+            try await waitUntil {
+                fixture.model.transcriptEntries.first(where: { $0.id == accepted.captionID })?.localSourceText
+                    == "original-revision-test"
+            }
+            let driver = try #require(drivers.all().first)
+            try await waitUntil {
+                let committedCount = await driver.committedUtteranceCount()
+                let listening = await driver.isListeningForEvents()
+                return committedCount == 1 && listening
+            }
+            await driver.emit(.correctedText(
+                sourceAlias: ready.alias,
+                generation: ready.driverGeneration,
+                captionID: accepted.captionID,
+                utteranceID: accepted.utteranceID,
+                text: "correction-revision-A"
+            ))
+            try await waitUntil { await translations.hasRequest(text: "correction-revision-A") }
+            staleTranslationTask = fixture.model.nativeCorrectionTasksSnapshotForTesting().first
+            await driver.emit(.correctedText(
+                sourceAlias: ready.alias,
+                generation: ready.driverGeneration,
+                captionID: accepted.captionID,
+                utteranceID: accepted.utteranceID,
+                text: "correction-revision-B"
+            ))
+            stage = "revision B translation ready before A"
+            try await waitUntil { await translations.hasRequest(text: "correction-revision-B") }
+            await translations.release(text: "correction-revision-B", result: "translation-revision-B")
+            try await waitUntil {
+                fixture.model.nativeCorrectionSnapshotForTesting(captionID: accepted.captionID)?.translatedText
+                    == "translation-revision-B"
+            }
+            await translations.release(text: "correction-revision-A", result: "translation-revision-A")
+            await staleTranslationTask?.value
+            stage = "revision A released last"
+            let snapshot = try #require(fixture.model.nativeCorrectionSnapshotForTesting(captionID: accepted.captionID))
+            #expect(snapshot.sourceText == "correction-revision-B")
+            #expect(snapshot.translatedText == "translation-revision-B")
+            #expect(snapshot.state == .ready)
+            let entry = try #require(fixture.model.transcriptEntries.first(where: { $0.id == accepted.captionID }))
+            #expect(entry.sourceText == "correction-revision-B")
+            #expect(entry.translatedText == "translation-revision-B")
+            #expect(entry.localSourceText == "original-revision-test")
+        } catch {
+            let entry = acceptedCaptionID.flatMap { id in fixture.model.transcriptEntries.first(where: { $0.id == id }) }
+            print("native correction revision stage: \(stage); entry=\(String(describing: entry)); error: \(error)")
+            await cleanup()
+            throw error
+        }
+        await cleanup()
+    }
+
+    @Test func restartCancelsHeldNativeCorrectionBeforeOldDriverStopCompletes() async throws {
+        let credentials = IntegrationNativeCredentialBackend(secret: "fake-secret")
+        let drivers = IntegrationNativeDriverBag()
+        let coordinator = NativeRealtimeSessionCoordinator(
+            credentialStore: RealtimeCredentialStore(backend: credentials),
+            driverFactory: { _, _, _ in
+                let driver = IntegrationNativeRealtimeDriver()
+                drivers.append(driver)
+                return driver
+            }
+        )
+        let fixture = makeFixture(
+            correctionSettings: configuredCorrectionSettings(isEnabled: false),
+            nativeRealtimeSettings: configuredNativeRealtimeSettings(enabledSourceIDs: [microphoneSource.id]),
+            nativeRealtimeSessionCoordinator: coordinator
+        )
+        defer { fixture.removeSettingsFile() }
+        fixture.model.selectedSourceIDs = [fixture.microphone.id]
+        fixture.model.sourceLanguageOverrides[fixture.microphone.id] = "en"
+        fixture.model.sourceOutputLanguageOverrides[fixture.microphone.id] = "zh-Hans"
+        fixture.model.setSessionResourcePreparationOperationForTesting {}
+        var sessions: [LiveTranscriptionSession] = []
+        fixture.model.setLiveTranscriptionSessionFactoryForTesting {
+            let session = LiveTranscriptionSession()
+            session.setStartOperationForTesting { await session.beginRecognitionSessionForTesting() }
+            sessions.append(session)
+            return session
+        }
+        fixture.model.acknowledgeNativeRealtimeDisclosureForNextSession()
+        let translations = IntegrationNativeTranslationHarness()
+        fixture.model.setTranslationOperationForTesting { text, source, target in
+            try await translations.translate(text, source: source, target: target)
+        }
+        let startTask = Task { await fixture.model.startSession() }
+        var restartTask: Task<Void, Never>?
+        var heldDriver: IntegrationNativeRealtimeDriver?
+        var correctionTask: Task<Void, Never>?
+        func cleanup() async {
+            startTask.cancel()
+            restartTask?.cancel()
+            let correctionTasks = fixture.model.nativeCorrectionTasksSnapshotForTesting()
+            let localTasks = fixture.model.captionTranslationTasksSnapshotForTesting()
+            let transferTasks = fixture.model.nativeCaptionTransferTasksSnapshotForTesting()
+            let displayTask = fixture.model.captionDisplayTaskSnapshotForTesting()
+            (correctionTasks + localTasks + transferTasks).forEach { $0.cancel() }
+            correctionTask?.cancel()
+            displayTask?.cancel()
+            await heldDriver?.resumeStop()
+            await translations.releaseAll()
+            fixture.model.stopSession()
+            await coordinator.stop()
+            await startTask.value
+            await restartTask?.value
+            for task in correctionTasks + localTasks + transferTasks { await task.value }
+            await correctionTask?.value
+            await displayTask?.value
+        }
+
+        var stage = "first trusted ready source"
+        do {
+            try await waitUntil { fixture.model.nativeReadyIdentityForTesting(sourceID: fixture.microphone.id) != nil }
+            await startTask.value
+            let session = try #require(sessions.first)
+            await session.beginLegacySampleMappingForTesting()
+            let pcm = try integrationRealtimeBuffer(samples: [0.25, -0.25])
+            #expect(await session.appendLegacyNormalizedBufferForTesting(pcm, preservesIdentity: true) == 0..<2)
+            #expect(await session.queueLegacyCommittedEmissionForTesting(
+                text: "restart-original-held",
+                segments: [LegacySpeechSegmentTiming(timestamp: 0, duration: 2.0 / 16_000)]
+            ))
+            await session.deliverQueuedCommittedEmissionForTesting()
+            try await waitUntil { await fixture.model.nativeAcceptedMetadataForTesting(sourceID: fixture.microphone.id) != nil }
+            let accepted = try #require(await fixture.model.nativeAcceptedMetadataForTesting(sourceID: fixture.microphone.id))
+            let ready = try #require(fixture.model.nativeReadyIdentityForTesting(sourceID: fixture.microphone.id))
+            let driver = try #require(drivers.all().first)
+            try await waitUntil {
+                let count = await driver.committedUtteranceCount()
+                let listening = await driver.isListeningForEvents()
+                return count == 1 && listening
+            }
+            await driver.emit(.correctedText(
+                sourceAlias: ready.alias,
+                generation: ready.driverGeneration,
+                captionID: accepted.captionID,
+                utteranceID: accepted.utteranceID,
+                text: "restart-correction-held"
+            ))
+            try await waitUntil { await translations.hasRequest(text: "restart-correction-held") }
+            let savedCorrectionTask: Task<Void, Never> = try #require(
+                fixture.model.nativeCorrectionTasksSnapshotForTesting().first
+            )
+            correctionTask = savedCorrectionTask
+            #expect(!correctionTask!.isCancelled)
+            #expect(fixture.model.nativeCorrectionSnapshotForTesting(captionID: accepted.captionID)?.state == .pending)
+
+            stage = "restart blocks while stopping the old driver"
+            await driver.suspendNextStop()
+            heldDriver = driver
+            restartTask = Task { await fixture.model.startSession() }
+            try await waitUntil { await driver.isStopSuspended() }
+            #expect(correctionTask!.isCancelled)
+            #expect(fixture.model.nativeCorrectionTasksSnapshotForTesting().isEmpty)
+            #expect(fixture.model.nativeCorrectionSnapshotForTesting(captionID: accepted.captionID) == nil)
+            await translations.release(text: "restart-correction-held", result: "must-not-resurrect-after-restart")
+            await correctionTask?.value
+            await heldDriver?.resumeStop()
+            await restartTask?.value
+            #expect(fixture.model.nativeCorrectionSnapshotForTesting(captionID: accepted.captionID) == nil)
+        } catch {
+            print("native stop cancellation stage: \(stage); error: \(error)")
+            await cleanup()
+            throw error
+        }
+        await cleanup()
+    }
+
     @Test func acceptedFinalBeforeNativeInputCreationStaysLocalAndIsNotReplayed() async throws {
         let credentials = IntegrationNativeCredentialBackend(secret: "fake-secret")
         let coordinator = NativeRealtimeSessionCoordinator(
@@ -538,7 +2186,7 @@ import Testing
         )
         defer { fixture.removeSettingsFile() }
         fixture.model.sourceLanguageOverrides[fixture.microphone.id] = "en"
-        fixture.model.sourceOutputLanguageOverrides[fixture.microphone.id] = "en"
+        fixture.model.sourceOutputLanguageOverrides[fixture.microphone.id] = "zh-Hans"
         fixture.model.selectedSourceIDs = [fixture.microphone.id]
         fixture.model.setSessionResourcePreparationOperationForTesting {}
         fixture.model.acknowledgeNativeRealtimeDisclosureForNextSession()
@@ -547,6 +2195,13 @@ import Testing
         fixture.model.setLiveTranscriptionSessionFactoryForTesting { session }
         let translationGate = AsyncTestGate()
         fixture.model.pauseCaptionTranslationForTesting { await translationGate.suspend() }
+        let nativeTranslations = IntegrationNativeTranslationHarness()
+        fixture.model.setTranslationOperationForTesting { text, source, target in
+            if text == "capacity active correction first record" {
+                return try await nativeTranslations.translate(text, source: source, target: target)
+            }
+            return "native translated: \(text)"
+        }
         let startTask = Task { await fixture.model.startSession() }
         func cleanup() async {
             let translationTasks = fixture.model.captionTranslationTasksSnapshotForTesting()
@@ -590,6 +2245,8 @@ import Testing
             try await waitUntil(timeout: .seconds(5)) { await driver.isListeningForEvents() }
             var firstBinding: RealtimeAcceptedCaptionMetadata?
             var firstEightBindings: [RealtimeAcceptedCaptionMetadata] = []
+            var firstTerminalWithoutCorrection: RealtimeAcceptedCaptionMetadata?
+            var activeCorrectionTask: Task<Void, Never>?
             var firstProvenance: RecognizedAudioProvenance?
             var firstEvictableBinding: RealtimeAcceptedCaptionMetadata?
             for index in 0...128 {
@@ -617,7 +2274,7 @@ import Testing
                     fixture.model.localCaptionWasEnqueuedForTesting(text)
                 }
                 activePhase = "binding admission"
-                let bindings = fixture.model.nativeAcceptedBindingsForTesting(sourceID: fixture.microphone.id)
+                var bindings = fixture.model.nativeAcceptedBindingsForTesting(sourceID: fixture.microphone.id)
                 if index < 128 {
                     try await waitUntil(timeout: .seconds(5)) {
                         fixture.model.nativeAcceptedBindingsForTesting(sourceID: fixture.microphone.id).count == index + 1
@@ -639,18 +2296,36 @@ import Testing
                                 captionID: binding.captionID
                             )
                         }
+                        if index == 0 {
+                            await driver.emit(.correctedText(
+                                sourceAlias: ready.alias,
+                                generation: ready.driverGeneration,
+                                captionID: binding.captionID,
+                                utteranceID: binding.utteranceID,
+                                text: "capacity active correction first record"
+                            ))
+                            try await waitUntil(timeout: .seconds(5)) {
+                                await nativeTranslations.hasRequest(text: "capacity active correction first record")
+                            }
+                            activeCorrectionTask = fixture.model.nativeCorrectionTasksSnapshotForTesting().first
+                            #expect(activeCorrectionTask?.isCancelled == false)
+                        }
                         await driver.emit(.utteranceCompleted(
                             sourceAlias: ready.alias,
                             generation: ready.driverGeneration,
                             captionID: binding.captionID,
                             utteranceID: binding.utteranceID
                         ))
-                        activePhase = "provider completion delivery"
+                        activePhase = "trusted provider completion delivery"
+                        try await waitUntil(timeout: .seconds(5)) {
+                            fixture.model.nativeTerminalEventReceivedForTesting(captionID: binding.captionID)
+                        }
                         try await waitUntil(timeout: .seconds(5)) {
                             await coordinator.inFlightCaptionIDForTesting(sourceID: fixture.microphone.id) == nil
                         }
                         firstEightBindings.append(binding)
                         if index == 0 { firstBinding = binding }
+                        if index == 1 { firstTerminalWithoutCorrection = binding }
                     } else {
                         activePhase = "local-only coordinator disposition"
                         try await waitUntil(timeout: .seconds(5)) {
@@ -665,10 +2340,19 @@ import Testing
                     }
                     fixture.model.finalizePendingLocalCaptionForTesting(captionID: binding.captionID, translation: "")
                 } else {
+                    let latestCaptionID = try #require(fixture.model.localCaptionIDForTesting(sourceText: text))
+                    try await waitUntil(timeout: .seconds(5)) {
+                        let latest = fixture.model.nativeAcceptedBindingsForTesting(sourceID: fixture.microphone.id)
+                        return latest.count == 128 && latest.last?.captionID == latestCaptionID
+                    }
+                    bindings = fixture.model.nativeAcceptedBindingsForTesting(sourceID: fixture.microphone.id)
                     #expect(bindings.count == 128)
                     #expect(firstBinding.map { bindings.contains($0) } == true)
-                    #expect(firstEightBindings.allSatisfy { bindings.contains($0) })
-                    #expect(firstEvictableBinding.map { !bindings.contains($0) } == true)
+                    #expect(firstEightBindings.dropFirst(2).allSatisfy { bindings.contains($0) })
+                    #expect(firstTerminalWithoutCorrection.map { !bindings.contains($0) } == true)
+                    #expect(firstEvictableBinding.map { bindings.contains($0) } == true)
+                    #expect(activeCorrectionTask?.isCancelled == false)
+                    #expect(fixture.model.nativeCorrectionSnapshotForTesting(captionID: firstBinding!.captionID)?.state == .pending)
                     #expect(fixture.model.localCaptionWasEnqueuedForTesting(text))
                 }
             }
@@ -1134,6 +2818,10 @@ import Testing
         fixture.model.sourceOutputLanguageOverrides[fixture.microphone.id] = "en"
         fixture.model.setSessionResourcePreparationOperationForTesting {}
         fixture.model.acknowledgeNativeRealtimeDisclosureForNextSession()
+        let translationHarness = IntegrationNativeTranslationHarness()
+        fixture.model.setTranslationOperationForTesting { text, source, target in
+            try await translationHarness.translate(text, source: source, target: target)
+        }
         let applicationSession = LiveTranscriptionSession()
         let microphoneSession = LiveTranscriptionSession()
         applicationSession.setStartOperationForTesting {
@@ -1158,14 +2846,15 @@ import Testing
             let allDrivers = drivers.all()
             for driver in allDrivers { await driver.resumeStart() }
             await startTask.value
-            let translations = fixture.model.captionTranslationTasksSnapshotForTesting()
+            let translationTasks = fixture.model.captionTranslationTasksSnapshotForTesting()
             let transfers = fixture.model.nativeCaptionTransferTasksSnapshotForTesting()
             let display = fixture.model.captionDisplayTaskSnapshotForTesting()
-            (translations + transfers).forEach { $0.cancel() }
+            (translationTasks + transfers).forEach { $0.cancel() }
             display?.cancel()
+            await translationHarness.releaseAll()
             fixture.model.stopSession()
             await coordinator.stop()
-            for task in translations + transfers { await task.value }
+            for task in translationTasks + transfers { await task.value }
             await display?.value
         }
 
@@ -1194,6 +2883,28 @@ import Testing
             #expect(accepted.sourceToken == ready.sourceToken)
             #expect(accepted.captureGeneration == ready.captureGeneration)
             #expect(fixture.model.nativeAcceptedReadyIdentityForTesting(captionID: accepted.captionID) == ready)
+            #expect(await completion.isResolved() == false)
+            let microphoneDriver = try #require(drivers.driver(for: .microphone))
+            try await waitUntil {
+                await coordinator.captionCommitSucceededForTesting(
+                    sourceID: fixture.microphone.id,
+                    captionID: accepted.captionID
+                )
+            }
+            await microphoneDriver.emit(.correctedText(
+                sourceAlias: ready.alias,
+                generation: ready.driverGeneration,
+                captionID: accepted.captionID,
+                utteranceID: accepted.utteranceID,
+                text: "ready sibling corrected"
+            ))
+            try await waitUntil {
+                fixture.model.transcriptEntries.first(where: { $0.id == accepted.captionID })?.sourceText
+                    == "ready sibling corrected"
+            }
+            #expect(fixture.model.transcriptEntries.first(where: { $0.id == accepted.captionID })?.localSourceText
+                == "ready sibling final")
+            #expect(await translationHarness.requestCount(text: "ready sibling corrected") == 0)
             #expect(await completion.isResolved() == false)
         } catch {
             await cleanup()
@@ -1224,10 +2935,17 @@ import Testing
         fixture.model.selectedSourceIDs = [fixture.application.id, fixture.microphone.id]
         for sourceID in [fixture.application.id, fixture.microphone.id] {
             fixture.model.sourceLanguageOverrides[sourceID] = "en"
-            fixture.model.sourceOutputLanguageOverrides[sourceID] = "en"
+            fixture.model.sourceOutputLanguageOverrides[sourceID] = sourceID == fixture.microphone.id ? "zh-Hans" : "en"
         }
         fixture.model.setSessionResourcePreparationOperationForTesting {}
         fixture.model.acknowledgeNativeRealtimeDisclosureForNextSession()
+        let translations = IntegrationNativeTranslationHarness()
+        fixture.model.setTranslationOperationForTesting { text, source, target in
+            if text == "microphone correction across sibling opt-out" {
+                return try await translations.translate(text, source: source, target: target)
+            }
+            return "local translation for \(text)"
+        }
         let applicationSession = LiveTranscriptionSession()
         let microphoneSession = LiveTranscriptionSession()
         applicationSession.setStartOperationForTesting { await applicationSession.beginRecognitionSessionForTesting() }
@@ -1239,15 +2957,21 @@ import Testing
             return sessions[nextSessionIndex]
         }
         var heldApplicationDriver: IntegrationNativeRealtimeDriver?
+        var heldSiblingCorrectionTask: Task<Void, Never>?
         func cleanup() async {
+            let correctionTasks = fixture.model.nativeCorrectionTasksSnapshotForTesting()
             let translationTasks = fixture.model.captionTranslationTasksSnapshotForTesting()
+            let transferTasks = fixture.model.nativeCaptionTransferTasksSnapshotForTesting()
             let displayTask = fixture.model.captionDisplayTaskSnapshotForTesting()
-            translationTasks.forEach { $0.cancel() }
+            (correctionTasks + translationTasks + transferTasks).forEach { $0.cancel() }
+            heldSiblingCorrectionTask?.cancel()
             displayTask?.cancel()
             await heldApplicationDriver?.resumeStop()
+            await translations.releaseAll()
             fixture.model.stopSession()
             await coordinator.stop()
-            for task in translationTasks { await task.value }
+            for task in correctionTasks + translationTasks + transferTasks { await task.value }
+            await heldSiblingCorrectionTask?.value
             await displayTask?.value
         }
         do {
@@ -1265,6 +2989,26 @@ import Testing
                 await fixture.model.nativeAcceptedMetadataForTesting(sourceID: fixture.microphone.id) != nil
             }
             let beforeOptOut = try #require(fixture.model.nativeAcceptedBindingsForTesting(sourceID: fixture.microphone.id).last)
+            let microphoneDriver = try #require(drivers.driver(for: .microphone))
+            try await waitUntil {
+                await coordinator.captionCommitSucceededForTesting(
+                    sourceID: fixture.microphone.id,
+                    captionID: beforeOptOut.captionID
+                )
+            }
+            let ready = try #require(fixture.model.nativeAcceptedReadyIdentityForTesting(captionID: beforeOptOut.captionID))
+            await microphoneDriver.emit(.correctedText(
+                sourceAlias: ready.alias,
+                generation: ready.driverGeneration,
+                captionID: beforeOptOut.captionID,
+                utteranceID: beforeOptOut.utteranceID,
+                text: "microphone correction across sibling opt-out"
+            ))
+            try await waitUntil { await translations.hasRequest(text: "microphone correction across sibling opt-out") }
+            let savedSiblingCorrectionTask: Task<Void, Never> = try #require(
+                fixture.model.nativeCorrectionTasksSnapshotForTesting().first
+            )
+            heldSiblingCorrectionTask = savedSiblingCorrectionTask
             await applicationDriver.suspendNextStop()
             heldApplicationDriver = applicationDriver
             var settings = fixture.model.nativeRealtimeSettings
@@ -1274,6 +3018,16 @@ import Testing
             try await waitUntil { await applicationDriver.isStopSuspended() }
             #expect(fixture.model.nativeReadyIdentityForTesting(sourceID: fixture.microphone.id) != nil)
             #expect(fixture.model.nativeAcceptedBindingsForTesting(sourceID: fixture.microphone.id).contains(beforeOptOut))
+            #expect(fixture.model.nativeAcceptedReadyIdentityForTesting(captionID: beforeOptOut.captionID)?.sourceID == fixture.microphone.id)
+            #expect(heldSiblingCorrectionTask?.isCancelled == false)
+            await translations.release(
+                text: "microphone correction across sibling opt-out",
+                result: "healthy microphone translated correction"
+            )
+            try await waitUntil {
+                fixture.model.nativeCorrectionSnapshotForTesting(captionID: beforeOptOut.captionID)?.translatedText
+                    == "healthy microphone translated correction"
+            }
             #expect(fixture.model.nativeAcceptedReadyIdentityForTesting(captionID: beforeOptOut.captionID)?.sourceID == fixture.microphone.id)
             #expect(await microphoneSession.appendLegacyNormalizedBufferForTesting(inputPCM, preservesIdentity: true) == 2..<4)
             #expect(await microphoneSession.queueLegacyCommittedEmissionForTesting(
@@ -1342,6 +3096,127 @@ import Testing
 
         fixture.model.stopSession()
         await coordinator.stop()
+    }
+
+    @Test func nativeAcceptedCaptionOriginalTranslationDoesNotBecomeLegacyCorrectionAfterModeSwitch() async throws {
+        let credentials = IntegrationNativeCredentialBackend(secret: "fake-secret")
+        let drivers = IntegrationNativeDriverBag()
+        let coordinator = NativeRealtimeSessionCoordinator(
+            credentialStore: RealtimeCredentialStore(backend: credentials),
+            driverFactory: { _, _, _ in
+                let driver = IntegrationNativeRealtimeDriver()
+                drivers.append(driver)
+                return driver
+            }
+        )
+        let fixture = makeFixture(
+            correctionSettings: configuredCorrectionSettings(isEnabled: false),
+            nativeRealtimeSettings: configuredNativeRealtimeSettings(enabledSourceIDs: [microphoneSource.id]),
+            nativeRealtimeSessionCoordinator: coordinator
+        )
+        defer { fixture.removeSettingsFile() }
+        let session = LiveTranscriptionSession()
+        session.setStartOperationForTesting { await session.beginRecognitionSessionForTesting() }
+        fixture.model.selectedSourceIDs = [fixture.microphone.id]
+        fixture.model.sourceLanguageOverrides[fixture.microphone.id] = "en"
+        fixture.model.sourceOutputLanguageOverrides[fixture.microphone.id] = "zh-Hans"
+        fixture.model.setSessionResourcePreparationOperationForTesting {}
+        fixture.model.setLiveTranscriptionSessionFactoryForTesting { session }
+        fixture.model.acknowledgeNativeRealtimeDisclosureForNextSession()
+        let translations = IntegrationNativeTranslationHarness()
+        fixture.model.setTranslationOperationForTesting { text, source, target in
+            if text == "native mode caption held before local translation" || text == "native corrected for legacy switch" {
+                return try await translations.translate(text, source: source, target: target)
+            }
+            return "local translation for \(text)"
+        }
+        let startTask = Task { await fixture.model.startSession() }
+        var heldOriginalTask: Task<Void, Never>?
+        var heldCorrectionTask: Task<Void, Never>?
+        var originalDisplayTask: Task<Void, Never>?
+        func cleanup() async {
+            let correctionTasks = fixture.model.nativeCorrectionTasksSnapshotForTesting()
+            let localTasks = fixture.model.captionTranslationTasksSnapshotForTesting()
+            let transferTasks = fixture.model.nativeCaptionTransferTasksSnapshotForTesting()
+            let displayTask = fixture.model.captionDisplayTaskSnapshotForTesting()
+            heldOriginalTask?.cancel()
+            heldCorrectionTask?.cancel()
+            (correctionTasks + localTasks + transferTasks).forEach { $0.cancel() }
+            displayTask?.cancel()
+            await translations.releaseAll()
+            fixture.model.stopSession()
+            await coordinator.stop()
+            await startTask.value
+            for task in correctionTasks + localTasks + transferTasks { await task.value }
+            await heldOriginalTask?.value
+            await heldCorrectionTask?.value
+            await originalDisplayTask?.value
+            await displayTask?.value
+        }
+
+        do {
+            try await waitUntil { fixture.model.nativeReadyIdentityForTesting(sourceID: fixture.microphone.id) != nil }
+            let ready = try #require(fixture.model.nativeReadyIdentityForTesting(sourceID: fixture.microphone.id))
+            await startTask.value
+            await session.beginLegacySampleMappingForTesting()
+            let pcm = try integrationRealtimeBuffer(samples: [0.25, -0.25])
+            #expect(await session.appendLegacyNormalizedBufferForTesting(pcm, preservesIdentity: true) == 0..<2)
+            #expect(await session.queueLegacyCommittedEmissionForTesting(
+                text: "native mode caption held before local translation",
+                segments: [LegacySpeechSegmentTiming(timestamp: 0, duration: 2.0 / 16_000)]
+            ))
+            await session.deliverQueuedCommittedEmissionForTesting()
+            try await waitUntil { await fixture.model.nativeAcceptedMetadataForTesting(sourceID: fixture.microphone.id) != nil }
+            let accepted = try #require(await fixture.model.nativeAcceptedMetadataForTesting(sourceID: fixture.microphone.id))
+            try await waitUntil { await translations.hasRequest(text: "native mode caption held before local translation") }
+            let savedOriginalTask: Task<Void, Never> = try #require(
+                fixture.model.captionTranslationTaskForTesting(captionID: accepted.captionID)
+            )
+            heldOriginalTask = savedOriginalTask
+            let driver = try #require(drivers.all().first)
+            try await waitUntil { await coordinator.captionCommitSucceededForTesting(sourceID: accepted.sourceID, captionID: accepted.captionID) }
+            await driver.emit(.correctedText(
+                sourceAlias: ready.alias,
+                generation: ready.driverGeneration,
+                captionID: accepted.captionID,
+                utteranceID: accepted.utteranceID,
+                text: "native corrected for legacy switch"
+            ))
+            try await waitUntil { await translations.hasRequest(text: "native corrected for legacy switch") }
+            let savedCorrectionTask: Task<Void, Never> = try #require(
+                fixture.model.nativeCorrectionTasksSnapshotForTesting().first
+            )
+            heldCorrectionTask = savedCorrectionTask
+            await translations.release(text: "native corrected for legacy switch", result: "native corrected translation")
+            await heldCorrectionTask?.value
+            #expect(fixture.model.transcriptEntries.first(where: { $0.id == accepted.captionID })?.sourceText
+                == "native corrected for legacy switch")
+
+            var nativeSettings = fixture.model.nativeRealtimeSettings
+            nativeSettings.enabledSourceIDs = []
+            fixture.model.nativeRealtimeSettings = nativeSettings
+            try await waitUntil { fixture.model.nativeCorrectionSnapshotForTesting(captionID: accepted.captionID) == nil }
+            fixture.model.correction.settings = configuredCorrectionSettings()
+            try await waitUntil { await session.correctionAudioCaptureEnabledForTesting() }
+
+            let savedDisplayTask: Task<Void, Never> = try #require(
+                fixture.model.captionDisplayTaskSnapshotForTesting()
+            )
+            originalDisplayTask = savedDisplayTask
+            await translations.release(text: "native mode caption held before local translation", result: "late original translation")
+            await heldOriginalTask?.value
+            try await waitUntil(timeout: .seconds(8)) {
+                !fixture.model.pendingCaptionIDsForTesting.contains(accepted.captionID)
+            }
+            await originalDisplayTask?.value
+            #expect(!fixture.model.submittedCorrectionCaptionIDsForTesting.contains(accepted.captionID))
+            let legacyCorrectionCallCount = await fixture.responder.callCount()
+            #expect(legacyCorrectionCallCount == 0)
+        } catch {
+            await cleanup()
+            throw error
+        }
+        await cleanup()
     }
 
     @Test func switchingNativeSourceToLegacyWaitsForNativeStopWithoutBlockingSibling() async throws {
@@ -1581,6 +3456,140 @@ import Testing
 
         fixture.model.stopSession()
         await coordinator.stop()
+    }
+
+    @Test func nativeConfigurationEditsRevokeHeldAcceptedCorrectionAndOldEvents() async throws {
+        enum Setting: String, CaseIterable {
+            case profile
+            case region
+            case credentialReference
+            case qwenWorkspaceID
+        }
+
+        func verify(_ setting: Setting) async throws {
+            let credentials = IntegrationNativeCredentialBackend(secret: "fake-secret")
+            let drivers = IntegrationNativeDriverBag()
+            let coordinator = NativeRealtimeSessionCoordinator(
+                credentialStore: RealtimeCredentialStore(backend: credentials),
+                driverFactory: { _, _, _ in
+                    let driver = IntegrationNativeRealtimeDriver()
+                    drivers.append(driver)
+                    return driver
+                }
+            )
+            let fixture = makeFixture(
+                correctionSettings: configuredCorrectionSettings(isEnabled: false),
+                nativeRealtimeSettings: configuredNativeRealtimeSettings(enabledSourceIDs: [microphoneSource.id]),
+                nativeRealtimeSessionCoordinator: coordinator
+            )
+            defer { fixture.removeSettingsFile() }
+            let session = LiveTranscriptionSession()
+            session.setStartOperationForTesting { await session.beginRecognitionSessionForTesting() }
+            fixture.model.selectedSourceIDs = [fixture.microphone.id]
+            fixture.model.sourceLanguageOverrides[fixture.microphone.id] = "en"
+            fixture.model.sourceOutputLanguageOverrides[fixture.microphone.id] = "zh-Hans"
+            fixture.model.setSessionResourcePreparationOperationForTesting {}
+            fixture.model.setLiveTranscriptionSessionFactoryForTesting { session }
+            fixture.model.acknowledgeNativeRealtimeDisclosureForNextSession()
+            let translations = IntegrationNativeTranslationHarness()
+            let correctionText = "config-held correction for \(setting.rawValue)"
+            let staleEventText = "config-stale event for \(setting.rawValue)"
+            fixture.model.setTranslationOperationForTesting { text, source, target in
+                if text == correctionText || text == staleEventText {
+                    return try await translations.translate(text, source: source, target: target)
+                }
+                return "local translation for \(text)"
+            }
+            let startTask = Task { await fixture.model.startSession() }
+            var capturedCorrectionTask: Task<Void, Never>?
+            func cleanup() async {
+                startTask.cancel()
+                let correctionTasks = fixture.model.nativeCorrectionTasksSnapshotForTesting()
+                let localTasks = fixture.model.captionTranslationTasksSnapshotForTesting()
+                let transferTasks = fixture.model.nativeCaptionTransferTasksSnapshotForTesting()
+                let displayTask = fixture.model.captionDisplayTaskSnapshotForTesting()
+                (correctionTasks + localTasks + transferTasks).forEach { $0.cancel() }
+                displayTask?.cancel()
+                await translations.releaseAll()
+                fixture.model.stopSession()
+                await coordinator.stop()
+                await startTask.value
+                for task in correctionTasks + localTasks + transferTasks { await task.value }
+                await capturedCorrectionTask?.value
+                await displayTask?.value
+            }
+
+            do {
+                try await waitUntil { fixture.model.nativeReadyIdentityForTesting(sourceID: fixture.microphone.id) != nil }
+                let ready = try #require(fixture.model.nativeReadyIdentityForTesting(sourceID: fixture.microphone.id))
+                await startTask.value
+                await session.beginLegacySampleMappingForTesting()
+                let pcm = try integrationRealtimeBuffer(samples: [0.25, -0.25])
+                #expect(await session.appendLegacyNormalizedBufferForTesting(pcm, preservesIdentity: true) == 0..<2)
+                let originalText = "config original caption for \(setting.rawValue)"
+                #expect(await session.queueLegacyCommittedEmissionForTesting(
+                    text: originalText,
+                    segments: [LegacySpeechSegmentTiming(timestamp: 0, duration: 2.0 / 16_000)]
+                ))
+                await session.deliverQueuedCommittedEmissionForTesting()
+                try await waitUntil { await fixture.model.nativeAcceptedMetadataForTesting(sourceID: fixture.microphone.id) != nil }
+                let accepted = try #require(await fixture.model.nativeAcceptedMetadataForTesting(sourceID: fixture.microphone.id))
+                try await waitUntil { await coordinator.captionCommitSucceededForTesting(sourceID: accepted.sourceID, captionID: accepted.captionID) }
+                let driver = try #require(drivers.all().first)
+                await driver.emit(.correctedText(
+                    sourceAlias: ready.alias,
+                    generation: ready.driverGeneration,
+                    captionID: accepted.captionID,
+                    utteranceID: accepted.utteranceID,
+                    text: correctionText
+                ))
+                try await waitUntil { await translations.hasRequest(text: correctionText) }
+                let savedCorrectionTask: Task<Void, Never> = try #require(
+                    fixture.model.nativeCorrectionTasksSnapshotForTesting().first
+                )
+                capturedCorrectionTask = savedCorrectionTask
+                #expect(fixture.model.transcriptEntries.first(where: { $0.id == accepted.captionID })?.sourceText == correctionText)
+
+                var settings = fixture.model.nativeRealtimeSettings
+                switch setting {
+                case .profile: settings.profile = .openAI
+                case .region: settings.region = .singapore
+                case .credentialReference: settings.credentialReference = "replacement-native-key"
+                case .qwenWorkspaceID: settings.qwenWorkspaceID = "replacement-workspace"
+                }
+                fixture.model.nativeRealtimeSettings = settings
+                #expect(capturedCorrectionTask?.isCancelled == true)
+                try await waitUntil { fixture.model.nativeAcceptedBindingsForTesting(sourceID: accepted.sourceID).isEmpty }
+                await translations.release(text: correctionText, result: "stale corrected translation")
+                await capturedCorrectionTask?.value
+                fixture.model.deliverNativeCaptionEventForTesting(RealtimeCaptionEventEnvelope(
+                    sourceID: accepted.sourceID,
+                    sourceToken: accepted.sourceToken,
+                    captureGeneration: accepted.captureGeneration,
+                    sourceAlias: ready.alias,
+                    driverGeneration: ready.driverGeneration,
+                    captionID: accepted.captionID,
+                    utteranceID: accepted.utteranceID,
+                    sourceLanguageID: accepted.sourceLanguageID,
+                    targetLanguageID: accepted.targetLanguageID,
+                    kind: .correctedText(staleEventText)
+                ))
+                #expect(await translations.requestCount(text: staleEventText) == 0)
+                #expect(fixture.model.nativeCorrectionSnapshotForTesting(captionID: accepted.captionID) == nil)
+                #expect(fixture.model.transcriptEntries.first(where: { $0.id == accepted.captionID })?.sourceText == correctionText)
+                #expect(fixture.model.transcriptEntries.first(where: { $0.id == accepted.captionID })?.translatedText.isEmpty == true)
+                #expect(await credentials.lookupCount() == 1)
+                #expect(await driver.startedAliases().count == 1)
+            } catch {
+                await cleanup()
+                throw error
+            }
+            await cleanup()
+        }
+
+        for setting in Setting.allCases {
+            try await verify(setting)
+        }
     }
 
     @Test func nativeProfileChangeDuringCredentialLookupRevokesUndisclosedStartup() async throws {
@@ -2700,21 +4709,29 @@ import Testing
             return microphoneEnabled && applicationEnabled
         }
 
-        let microphoneCaptionID = fixture.model.commitLocalCaptionForTesting(
-            source: fixture.microphone,
-            original: "mic local",
-            translation: "mic translation",
-            audioWAVData: sampleWAV
-        )
         let applicationCaptionID = fixture.model.commitLocalCaptionForTesting(
             source: fixture.application,
             original: "app local",
             translation: "app translation",
             audioWAVData: sampleWAV
         )
+        try await waitUntil { await fixture.responder.callCount() == 1 }
+        let microphoneCaptionID = fixture.model.commitLocalCaptionForTesting(
+            source: fixture.microphone,
+            original: "mic local",
+            translation: "mic translation",
+            audioWAVData: sampleWAV
+        )
         try await waitUntil { await fixture.responder.callCount() == 2 }
-        try await fixture.responder.associateNextCall(with: microphoneCaptionID)
-        try await fixture.responder.associateNextCall(with: applicationCaptionID)
+        #expect(await fixture.responder.startedSourceIDs() == [fixture.application.id, fixture.microphone.id])
+        try await fixture.responder.associateNextCall(
+            with: microphoneCaptionID,
+            sourceID: fixture.microphone.id
+        )
+        try await fixture.responder.associateNextCall(
+            with: applicationCaptionID,
+            sourceID: fixture.application.id
+        )
 
         fixture.model.setCorrectionEnabled(false, for: fixture.microphone)
         try await waitUntil {
@@ -2836,15 +4853,29 @@ private struct CorrectionFixture {
 }
 
 @MainActor
+private final class IntegrationWeakAppModelReference {
+    weak var value: AppModel?
+
+    init(_ model: AppModel) {
+        value = model
+    }
+}
+
+@MainActor
 private func makeFixture(
     correctionSettings: CorrectionSettings = configuredCorrectionSettings(),
     nativeRealtimeSettings: NativeRealtimeSettings = .default,
-    nativeRealtimeSessionCoordinator: NativeRealtimeSessionCoordinator? = nil
+    nativeRealtimeSessionCoordinator: NativeRealtimeSessionCoordinator? = nil,
+    refreshLanguageCatalogs: Bool = true,
+    sourceLanguageOverrides: [String: String] = [:],
+    sourceOutputLanguageOverrides: [String: String] = [:]
 ) -> CorrectionFixture {
     let settingsURL = makeSettingsURL()
     let store = SettingsStore(fileURL: settingsURL)
     var appSettings = makeAppSettings(correction: correctionSettings)
     appSettings.nativeRealtime = nativeRealtimeSettings
+    appSettings.sourceLanguageOverrides = sourceLanguageOverrides
+    appSettings.sourceOutputLanguageOverrides = sourceOutputLanguageOverrides
     store.save(appSettings)
     let responder = IntegrationHeldCorrectionResponder()
     let correction = RealtimeCorrectionCoordinator(settings: correctionSettings, responder: responder)
@@ -2857,7 +4888,8 @@ private func makeFixture(
             microphones: [microphone]
         ),
         correction: correction,
-        nativeRealtimeSessionCoordinator: nativeRealtimeSessionCoordinator
+        nativeRealtimeSessionCoordinator: nativeRealtimeSessionCoordinator,
+        refreshLanguageCatalogs: refreshLanguageCatalogs
     )
     return CorrectionFixture(
         settingsURL: settingsURL,
@@ -2954,6 +4986,52 @@ private actor IntegrationAsyncSignal {
     private var resolved = false
     func resolve() { resolved = true }
     func isResolved() -> Bool { resolved }
+}
+
+private actor IntegrationNativeTranslationHarness {
+    private enum ReleasedResult {
+        case value(String?)
+    }
+
+    private var seenRequests: [(text: String, source: String, target: String)] = []
+    private var continuations: [String: [CheckedContinuation<String?, Never>]] = [:]
+    private var releasedResults: [String: [ReleasedResult]] = [:]
+    private var releaseAllWasCalled = false
+
+    func translate(_ text: String, source: String, target: String) async throws -> String? {
+        seenRequests.append((text, source, target))
+        if releaseAllWasCalled { return nil }
+        if var results = releasedResults[text], !results.isEmpty {
+            let result = results.removeFirst()
+            releasedResults[text] = results
+            if case .value(let value) = result { return value }
+        }
+        return await withCheckedContinuation { continuations[text, default: []].append($0) }
+    }
+
+    func hasRequest(text: String) -> Bool { seenRequests.contains { $0.text == text } }
+
+    func requestCount(text: String) -> Int { seenRequests.filter { $0.text == text }.count }
+
+    func release(text: String, result: String?) {
+        guard !releaseAllWasCalled else { return }
+        if var pending = continuations[text], !pending.isEmpty {
+            let continuation = pending.removeFirst()
+            continuations[text] = pending
+            continuation.resume(returning: result)
+        } else {
+            releasedResults[text, default: []].append(.value(result))
+        }
+    }
+
+    func releaseAll() {
+        releaseAllWasCalled = true
+        let pending = continuations
+        continuations.removeAll()
+        for continuations in pending.values {
+            for continuation in continuations { continuation.resume(returning: nil) }
+        }
+    }
 }
 
 private final class IntegrationNativeCaptionDispositionBag: @unchecked Sendable {
@@ -3252,11 +5330,13 @@ actor IntegrationHeldCorrectionResponder: CorrectionResponding {
                 return sourceID
             }
         ))
-        return try await withCheckedThrowingContinuation { continuationRegistry.append($0) }
+        return try await withCheckedThrowingContinuation {
+            continuationRegistry.append(sourceID: sourceID, continuation: $0)
+        }
     }
 
-    func associateNextCall(with captionID: UUID) throws {
-        try continuationRegistry.associateNext(with: captionID)
+    func associateNextCall(with captionID: UUID, sourceID: String? = nil) throws {
+        try continuationRegistry.associateNext(with: captionID, sourceID: sourceID)
     }
 
     @discardableResult
@@ -3292,33 +5372,34 @@ actor IntegrationHeldCorrectionResponder: CorrectionResponding {
 
 private final class HeldCorrectionContinuationRegistry: @unchecked Sendable {
     private let lock = NSLock()
-    private var unbound: [CheckedContinuation<CorrectionProviderOutput, Error>] = []
+    private var unbound: [(sourceID: String, continuation: CheckedContinuation<CorrectionProviderOutput, Error>)] = []
     private var bound: [UUID: CheckedContinuation<CorrectionProviderOutput, Error>] = [:]
 
     deinit {
         cancelAll()
     }
 
-    func append(_ continuation: CheckedContinuation<CorrectionProviderOutput, Error>) {
+    func append(sourceID: String, continuation: CheckedContinuation<CorrectionProviderOutput, Error>) {
         lock.lock()
-        unbound.append(continuation)
+        unbound.append((sourceID: sourceID, continuation: continuation))
         lock.unlock()
     }
 
-    func associateNext(with captionID: UUID) throws {
+    func associateNext(with captionID: UUID, sourceID: String?) throws {
         lock.lock()
         defer { lock.unlock() }
-        guard bound[captionID] == nil, unbound.isEmpty == false else {
+        guard bound[captionID] == nil,
+              let index = unbound.firstIndex(where: { sourceID == nil || $0.sourceID == sourceID }) else {
             throw IntegrationNoHeldCorrectionCall()
         }
-        bound[captionID] = unbound.removeFirst()
+        bound[captionID] = unbound.remove(at: index).continuation
     }
 
     func release(captionID: UUID, output: CorrectionProviderOutput) -> Bool {
         lock.lock()
         var continuation = bound.removeValue(forKey: captionID)
         if continuation == nil, bound.isEmpty, unbound.count == 1 {
-            continuation = unbound.removeFirst()
+            continuation = unbound.removeFirst().continuation
         }
         lock.unlock()
         guard let continuation else {
@@ -3330,7 +5411,7 @@ private final class HeldCorrectionContinuationRegistry: @unchecked Sendable {
 
     func cancelAll() {
         lock.lock()
-        let continuations = unbound + Array(bound.values)
+        let continuations = unbound.map(\.continuation) + Array(bound.values)
         unbound.removeAll()
         bound.removeAll()
         lock.unlock()

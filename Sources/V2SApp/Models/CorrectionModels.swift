@@ -76,6 +76,7 @@ struct TranscriptEntry: Identifiable, Equatable {
     var localTranslatedText: String
     var correctedSourceText: String?
     var correctedTranslatedText: String?
+    var nativeCorrectedTranslationState: NativeCorrectedTranslationState
     var timestamp: Date
 
     var sourceText: String {
@@ -83,7 +84,15 @@ struct TranscriptEntry: Identifiable, Equatable {
     }
 
     var translatedText: String {
-        effectiveText(correctedTranslatedText, fallingBackTo: localTranslatedText)
+        switch nativeCorrectedTranslationState {
+        case .none:
+            break
+        case .pending, .failed:
+            return ""
+        case .ready:
+            return correctedTranslatedText ?? ""
+        }
+        return effectiveText(correctedTranslatedText, fallingBackTo: localTranslatedText)
     }
 
     init(
@@ -96,6 +105,7 @@ struct TranscriptEntry: Identifiable, Equatable {
         localTranslatedText: String,
         correctedSourceText: String? = nil,
         correctedTranslatedText: String? = nil,
+        nativeCorrectedTranslationState: NativeCorrectedTranslationState = .none,
         timestamp: Date = Date()
     ) {
         self.id = id
@@ -107,6 +117,7 @@ struct TranscriptEntry: Identifiable, Equatable {
         self.localTranslatedText = localTranslatedText
         self.correctedSourceText = correctedSourceText
         self.correctedTranslatedText = correctedTranslatedText
+        self.nativeCorrectedTranslationState = nativeCorrectedTranslationState
         self.timestamp = timestamp
     }
 
@@ -135,4 +146,11 @@ struct TranscriptEntry: Identifiable, Equatable {
         }
         return correction
     }
+}
+
+enum NativeCorrectedTranslationState: Equatable, Sendable {
+    case none
+    case pending
+    case ready
+    case failed
 }
